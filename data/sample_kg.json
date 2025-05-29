@@ -1,0 +1,13 @@
+{
+  "schema_description": "这是一个关于公司内部实体和关系的简化知识图谱。\n节点类型包括：\n- Person (人): 属性例如 name (姓名, String类型, 唯一)。\n- Product (产品): 属性例如 name (产品名称, String类型, 唯一)。\n- Region (区域): 属性例如 name (区域名称, String类型, 唯一, 如 '华东', '华北')。\n- Project (项目): 属性例如 name (项目名称, String类型, 唯一)。\n- Document (文档): 属性例如 id (文档ID, String类型, 唯一), content (内容摘要, String类型)。\n- SalesAmount (销售额记录): 属性例如 numeric_amount (数字金额, Float类型), unit (单位, String类型, 如 '万元'), period (时期, String类型, 如 '2024年第一季度')。\n\n关系类型包括：\n- WORKS_ON (人参与项目): (Person)-[:WORKS_ON]->(Project)。\n- AUTHORED_BY (文档由人撰写): (Document)-[:AUTHORED_BY]->(Person)。\n- LOCATED_IN (实体位于区域): 例如 (Person)-[:LOCATED_IN]->(Region)。\n- HAS_SALES_PRODUCT (区域销售了产品): (Region)-[:HAS_SALES_PRODUCT]->(Product)。\n- HAS_SALES_AMOUNT (区域有销售额记录): (Region)-[:HAS_SALES_AMOUNT]->(SalesAmount)。\n- RELATED_TO (实体间相关): 例如 (Product)-[:RELATED_TO]->(Document)。",
+  "data_summary": "知识图谱中包含以下关键事实：\n- 人物：张三、李四、王五。\n- 产品：新产品A、产品B。\n- 区域：华东、华北。\n- 项目：项目X。\n- 关系：张三参与项目X，李四参与项目X。华东区域有新产品A的销售额。新产品A的发布文档是doc_product_launch。华东区域2024年第一季度销售额为46.5万元，华北区域2024年第一季度销售额为36.5万元。",
+  "facts": [
+    {"subject": "张三", "relation": "WORKS_ON", "object": "项目X", "type": "person_project"},
+    {"subject": "李四", "relation": "WORKS_ON", "object": "项目X", "type": "person_project"},
+    {"subject": "王五", "relation": "PROPOSED_IDEA", "object": "预算优化", "type": "person_idea"}, 
+    {"subject": "华东", "relation": "HAS_SALES_PRODUCT", "object": "新产品A", "type": "region_product"},
+    {"subject": "新产品A", "relation": "RELATED_TO", "object": "doc_product_launch", "type": "product_document"},
+    {"subject": "华东", "relation": "HAS_SALES_AMOUNT", "object": "46.5万元", "type": "region_sales_amount", "period": "2024年第一季度"},
+    {"subject": "华北", "relation": "HAS_SALES_AMOUNT", "object": "36.5万元", "type": "region_sales_amount", "period": "2024年第一季度"}
+  ]
+}

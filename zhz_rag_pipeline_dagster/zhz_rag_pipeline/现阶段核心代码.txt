@@ -1,0 +1,1137 @@
+--- START OF FILE __init__.py ---# zhz_rag_pipeline/__init__.py
+# This file makes Python treat the directory as a package.
+# You can also define a __version__ or import key modules here if needed.--- END OF FILE __init__.py ---
+
+--- START OF FILE definitions.py ---# zhz_rag_pipeline/definitions.py
+import dagster as dg
+
+from .ingestion_assets import all_ingestion_assets
+from .processing_assets import all_processing_assets
+from .resources import (
+    SentenceTransformerResource, SentenceTransformerResourceConfig,
+    ChromaDBResource, ChromaDBResourceConfig,
+    SGLangAPIResource, SGLangAPIResourceConfig,
+    Neo4jResource, Neo4jResourceConfig # <--- 导入新的Neo4j Resource和Config
+)
+
+all_project_assets = all_ingestion_assets + all_processing_assets
+
+defs = dg.Definitions(
+    assets=all_project_assets,
+    resources={
+        "embedder": SentenceTransformerResource(
+            model_name_or_path=SentenceTransformerResourceConfig().model_name_or_path
+        ),
+        "chroma_db": ChromaDBResource(
+            collection_name=ChromaDBResourceConfig().collection_name,
+            persist_directory=ChromaDBResourceConfig().persist_directory
+        ),
+        "sglang_api": SGLangAPIResource(
+            api_url=SGLangAPIResourceConfig().api_url,
+            default_temperature=SGLangAPIResourceConfig().default_temperature,
+            default_max_new_tokens=SGLangAPIResourceConfig().default_max_new_tokens
+        ),
+        "neo4j_res": Neo4jResource( 
+            uri=Neo4jResourceConfig().uri,
+            user=Neo4jResourceConfig().user,
+            password=Neo4jResourceConfig().password,
+            database=Neo4jResourceConfig().database
+        )
+    }
+)--- END OF FILE definitions.py ---
+
+--- START OF FILE ingestion_assets.py ---# zhz_rag_pipeline/ingestion_assets.py
+import dagster as dg
+import os
+from typing import List, Dict, Any, Union
+
+# 从我们新建的pydantic模型文件中导入
+from .pydantic_models_dagster import LoadedDocumentOutput, ParsedDocumentOutput
+
+class LoadDocumentsConfig(dg.Config):
+    documents_directory: str = "/home/zhz/zhz_agent/zhz_agent_data_source" # 请确保这是您实际的测试数据目录
+    allowed_extensions: List[str] = [".txt"]
+
+@dg.asset(
+    name="raw_documents",
+    description="Loads raw documents from a specified directory.",
+    group_name="ingestion" # 给资产分组
+)
+def load_documents_asset(
+    context: dg.AssetExecutionContext, 
+    config: LoadDocumentsConfig
+) -> List[LoadedDocumentOutput]:
+    
+    loaded_docs: List[LoadedDocumentOutput] = []
+    target_directory = config.documents_directory
+    allowed_exts = tuple(config.allowed_extensions) 
+
+    context.log.info(f"Scanning directory: {target_directory} for files with extensions: {allowed_exts}")
+
+    if not os.path.isdir(target_directory):
+        context.log.error(f"Directory not found: {target_directory}")
+        return loaded_docs
+
+    for filename in os.listdir(target_directory):
+        file_path = os.path.join(target_directory, filename)
+        if os.path.isfile(file_path):
+            file_name_lower = filename.lower()
+            file_extension = os.path.splitext(file_name_lower)[1]
+
+            if file_extension in allowed_exts:
+                context.log.info(f"Found matching file: {file_path}")
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    doc_output = LoadedDocumentOutput(
+                        document_path=file_path,
+                        file_type=file_extension,
+                        raw_content=content,
+                        metadata={
+                            "filename": filename,
+                            "source_directory": target_directory,
+                            "size_bytes": os.path.getsize(file_path)
+                        }
+                    )
+                    loaded_docs.append(doc_output)
+                    context.log.info(f"Successfully loaded and created output for: {file_path}")
+                except Exception as e:
+                    context.log.error(f"Failed to read or process file {file_path}: {e}")
+            else:
+                context.log.debug(f"Skipping file with non-allowed extension: {file_path}")
+        else:
+            context.log.debug(f"Skipping non-file item: {file_path}")
+            
+    if not loaded_docs:
+        context.log.warning(f"No matching documents found in {target_directory}")
+
+    if loaded_docs:
+        context.add_output_metadata(
+            metadata={
+                "num_documents_loaded": len(loaded_docs),
+                "first_document_path": loaded_docs[0].document_path if loaded_docs else "N/A"
+            }
+        )
+    return loaded_docs
+
+
+@dg.asset(
+    name="parsed_documents",
+    description="Parses loaded documents into text and extracts basic structure.",
+    group_name="ingestion", # 也属于摄入组
+    deps=[load_documents_asset] 
+)
+def parse_document_asset(
+    context: dg.AssetExecutionContext, 
+    raw_documents: List[LoadedDocumentOutput] 
+) -> List[ParsedDocumentOutput]: 
+    
+    parsed_docs: List[ParsedDocumentOutput] = []
+    context.log.info(f"Received {len(raw_documents)} documents to parse.")
+
+    for doc_input in raw_documents:
+        context.log.info(f"Parsing document: {doc_input.document_path} (Type: {doc_input.file_type})")
+        parsed_text_content = ""
+        
+        try:
+            if doc_input.file_type == ".txt":
+                if isinstance(doc_input.raw_content, bytes):
+                    parsed_text_content = doc_input.raw_content.decode('utf-8')
+                elif isinstance(doc_input.raw_content, str):
+                    parsed_text_content = doc_input.raw_content
+                else:
+                    # 抛出更具体的错误或记录并跳过
+                    context.log.error(f"Unexpected raw_content type for .txt file: {type(doc_input.raw_content)} in {doc_input.document_path}")
+                    parsed_text_content = f"[Error: Unexpected content type {type(doc_input.raw_content)}]"
+
+            # TODO: Add parsers for other file types like .pdf, .docx here
+            # elif doc_input.file_type == ".pdf":
+            #     parsed_text_content = "[PDF parsing not yet implemented]"
+            #     context.log.warning(f"PDF parsing not yet implemented for {doc_input.document_path}")
+            else:
+                parsed_text_content = f"[Unsupported file type: {doc_input.file_type}]"
+                context.log.warning(f"Unsupported file type '{doc_input.file_type}' for parsing: {doc_input.document_path}")
+
+            parsed_output = ParsedDocumentOutput(
+                parsed_text=parsed_text_content,
+                # document_structure is None by default
+                original_metadata=doc_input.metadata 
+            )
+            parsed_docs.append(parsed_output)
+            context.log.info(f"Successfully (or with placeholder) parsed: {doc_input.document_path}")
+
+        except Exception as e:
+            context.log.error(f"Failed to parse document {doc_input.document_path}: {e}")
+            parsed_output = ParsedDocumentOutput(
+                parsed_text=f"[Error parsing document: {str(e)}]",
+                original_metadata=doc_input.metadata
+            )
+            parsed_docs.append(parsed_output)
+
+    if parsed_docs:
+        context.add_output_metadata(
+            metadata={
+                "num_documents_parsed": len(parsed_docs),
+                "first_parsed_doc_filename": parsed_docs[0].original_metadata.get("filename", "N/A") if parsed_docs else "N/A"
+            }
+        )
+    return parsed_docs
+
+all_ingestion_assets = [load_documents_asset, parse_document_asset]--- END OF FILE ingestion_assets.py ---
+
+--- START OF FILE processing_assets.py ---# zhz_rag_pipeline/processing_assets.py
+import dagster as dg
+from typing import List, Dict, Any, Optional
+import uuid
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# 从我们新建的pydantic模型文件中导入
+from .resources import SentenceTransformerResource, ChromaDBResource, SGLangAPIResource, Neo4jResource
+from .pydantic_models_dagster import ChunkOutput, ParsedDocumentOutput, EmbeddingOutput,KGTripleSetOutput, ExtractedEntity
+
+import jieba
+import bm25s
+import pickle # 用于序列化和反序列化BM25模型
+import numpy as np # bm25s 内部可能使用，或者我们构建语料库时可能用到
+import os
+
+class TextChunkerConfig(dg.Config):
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    # separators: Optional[List[str]] = None # 可选的自定义分隔符
+
+@dg.asset(
+    name="text_chunks",
+    description="Cleans and chunks parsed documents into smaller text segments.",
+    group_name="processing", # 属于处理组
+    deps=["parsed_documents"] # 依赖上一个资产的name
+)
+def clean_chunk_text_asset(
+    context: dg.AssetExecutionContext,
+    config: TextChunkerConfig,
+    parsed_documents: List[ParsedDocumentOutput] 
+) -> List[ChunkOutput]: 
+    
+    all_chunks: List[ChunkOutput] = []
+    context.log.info(f"Received {len(parsed_documents)} parsed documents to clean and chunk.")
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
+        # length_function=len, # 默认
+        # add_start_index=True, # 如果需要块的起始索引
+        # separators=config.separators if config.separators else None # 使用配置的分隔符
+    )
+
+    for parsed_doc in parsed_documents:
+        # 使用原始文件名作为文档ID，如果不存在则生成UUID
+        doc_id_from_meta = parsed_doc.original_metadata.get("filename")
+        if not doc_id_from_meta:
+            doc_id_from_meta = parsed_doc.original_metadata.get("document_path", str(uuid.uuid4()))
+            context.log.warning(f"Filename not found in metadata for a document, using path or UUID: {doc_id_from_meta}")
+        
+        source_dir = parsed_doc.original_metadata.get('source_directory', 'Unknown_Source_Dir')
+        context.log.info(f"Processing document: {doc_id_from_meta} (from {source_dir})")
+
+        cleaned_text = parsed_doc.parsed_text.strip()
+
+        if not cleaned_text or cleaned_text.startswith("[Unsupported file type:") or cleaned_text.startswith("[Error parsing document:"):
+            context.log.warning(f"Document {doc_id_from_meta} has no valid content or was unsupported/errored in parsing, skipping chunking.")
+            continue
+        
+        try:
+            chunks_text_list = text_splitter.split_text(cleaned_text)
+            context.log.info(f"Document {doc_id_from_meta} split into {len(chunks_text_list)} chunks.")
+
+            for i, chunk_text_content in enumerate(chunks_text_list):
+                chunk_meta = parsed_doc.original_metadata.copy() 
+                chunk_meta.update({
+                    "chunk_number": i + 1,
+                    "total_chunks_for_doc": len(chunks_text_list),
+                    "chunk_char_length": len(chunk_text_content),
+                })
+
+                chunk_output = ChunkOutput( # chunk_id 会在 ChunkOutput 的 __init__ 中自动生成
+                    chunk_text=chunk_text_content,
+                    source_document_id=doc_id_from_meta, # 使用从元数据获取的文档ID
+                    chunk_metadata=chunk_meta
+                )
+                all_chunks.append(chunk_output)
+        
+        except Exception as e:
+            context.log.error(f"Failed to chunk document {doc_id_from_meta}: {e}")
+            
+    if all_chunks:
+        context.add_output_metadata(
+            metadata={
+                "total_chunks_generated": len(all_chunks),
+                "first_chunk_doc_id": all_chunks[0].source_document_id if all_chunks else "N/A"
+            }
+        )
+    else:
+        context.log.warning("No chunks were generated from the input documents.")
+        
+    return all_chunks
+
+all_processing_assets = [clean_chunk_text_asset]
+
+# --- 新增：EmbeddingGenerationAgent (实现为 Asset) ---
+@dg.asset(
+    name="text_embeddings",
+    description="Generates vector embeddings for text chunks using a SentenceTransformer model.",
+    group_name="processing",
+    deps=["text_chunks"] # 依赖上一个资产的name
+)
+def generate_embeddings_asset(
+    context: dg.AssetExecutionContext,
+    text_chunks: List[ChunkOutput], # 输入是上游资产的输出列表
+    embedder: SentenceTransformerResource # <--- 注入我们定义的Resource
+) -> List[EmbeddingOutput]:
+    
+    all_embeddings: List[EmbeddingOutput] = []
+    context.log.info(f"Received {len(text_chunks)} text chunks to generate embeddings for.")
+
+    if not text_chunks:
+        context.log.warning("No text chunks received, skipping embedding generation.")
+        return all_embeddings
+
+    # 提取所有块的文本内容进行批量编码
+    chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks]
+    
+    try:
+        context.log.info(f"Starting batch embedding generation for {len(chunk_texts_to_encode)} texts...")
+        # 使用Resource的encode方法
+        vectors = embedder.encode(chunk_texts_to_encode) 
+        context.log.info(f"Successfully generated {len(vectors)} embedding vectors.")
+
+        if len(vectors) != len(text_chunks):
+            # 这是一个预期外的情况，应该记录严重错误
+            context.log.error(f"Mismatch in number of chunks ({len(text_chunks)}) and generated vectors ({len(vectors)}). Aborting.")
+            # 可以在这里抛出异常来使资产失败
+            raise ValueError("Embedding generation resulted in a mismatched number of vectors.")
+
+        for i, chunk_input in enumerate(text_chunks):
+            embedding_output = EmbeddingOutput(
+                chunk_id=chunk_input.chunk_id,
+                chunk_text=chunk_input.chunk_text,
+                embedding_vector=vectors[i],
+                embedding_model_name=embedder.model_name_or_path, # 从Resource获取模型名
+                original_chunk_metadata=chunk_input.chunk_metadata
+            )
+            all_embeddings.append(embedding_output)
+        
+        context.log.info(f"All {len(all_embeddings)} embeddings prepared.")
+
+    except Exception as e:
+        context.log.error(f"Failed to generate embeddings: {e}")
+        # 根据策略，可以选择让资产失败，或者返回空列表/部分结果
+        # 这里我们选择抛出异常，让资产运行失败，以便调查
+        raise
+
+    if all_embeddings:
+        context.add_output_metadata(
+            metadata={
+                "total_embeddings_generated": len(all_embeddings),
+                "embedding_model_used": embedder.model_name_or_path,
+                "first_chunk_id_embedded": all_embeddings[0].chunk_id if all_embeddings else "N/A"
+            }
+        )
+    return all_embeddings
+
+# --- 新增：VectorStorageAgent (实现为 Asset) ---
+@dg.asset(
+    name="vector_store_embeddings",
+    description="Stores text embeddings into a ChromaDB vector store.",
+    group_name="indexing", # 新的分组
+    deps=["text_embeddings"] # 依赖上一个资产的name
+)
+def vector_storage_asset(
+    context: dg.AssetExecutionContext,
+    text_embeddings: List[EmbeddingOutput], # 输入是上游资产的输出列表
+    chroma_db: ChromaDBResource # <--- 注入ChromaDB Resource
+) -> None: # 这个资产通常只执行操作，不产生新的可传递数据资产，所以返回None
+    
+    context.log.info(f"Received {len(text_embeddings)} embeddings to store in ChromaDB.")
+
+    if not text_embeddings:
+        context.log.warning("No embeddings received, nothing to store.")
+        # 可以在这里添加一个 AssetMaterialization 来记录这个空操作
+        context.add_output_metadata(metadata={"num_embeddings_stored": 0, "status": "No data to store"})
+        return
+
+    ids_to_store: List[str] = []
+    embeddings_to_store: List[List[float]] = []
+    metadatas_to_store: List[Dict[str, Any]] = []
+
+    for emb_output in text_embeddings: # emb_output 是 EmbeddingOutput 类型
+        ids_to_store.append(emb_output.chunk_id) 
+        embeddings_to_store.append(emb_output.embedding_vector)
+        
+        simple_metadata = {}
+        for key, value in emb_output.original_chunk_metadata.items(): # 从原始块元数据开始
+            if isinstance(value, (str, int, float, bool)):
+                simple_metadata[key] = value
+            else:
+                simple_metadata[key] = str(value) 
+        
+        simple_metadata["chunk_text"] = emb_output.chunk_text # <--- 直接从emb_output获取
+
+        metadatas_to_store.append(simple_metadata)
+
+    try:
+        chroma_db.add_embeddings(
+            ids=ids_to_store,
+            embeddings=embeddings_to_store,
+            metadatas=metadatas_to_store
+        )
+        context.log.info(f"Successfully stored/updated {len(ids_to_store)} embeddings in ChromaDB.")
+        
+        # 记录物化信息
+        context.add_output_metadata(
+            metadata={
+                "num_embeddings_stored": len(ids_to_store),
+                "collection_name": chroma_db.collection_name,
+                "status": "Success"
+            }
+        )
+    except Exception as e:
+        context.log.error(f"Failed to store embeddings in ChromaDB: {e}")
+        context.add_output_metadata(
+            metadata={
+                "num_embeddings_stored": 0,
+                "collection_name": chroma_db.collection_name,
+                "status": f"Failed: {str(e)}"
+            }
+        )
+        raise # 让资产失败
+
+
+# --- 新增：定义 KeywordIndexAgent 的配置 Pydantic 模型 ---
+class BM25IndexConfig(dg.Config): # <--- 将这个类定义放在这里
+    index_file_path: str = "/home/zhz/dagster_home/bm25_index/rag_bm25_index.pkl"
+
+# --- 新增：KeywordIndexAgent (实现为 Asset) ---
+@dg.asset(
+    name="keyword_index",
+    description="Builds and persists a BM25 keyword index from text chunks.",
+    group_name="indexing",
+    deps=["text_chunks"] 
+)
+def keyword_index_asset(
+    context: dg.AssetExecutionContext,
+    config: BM25IndexConfig, # <--- 现在这里应该能正确引用了
+    text_chunks: List[ChunkOutput] 
+) -> None:
+    
+    context.log.info(f"Received {len(text_chunks)} text chunks to build BM25 index.")
+
+    if not text_chunks:
+        context.log.warning("No text chunks received, skipping BM25 index building.")
+        context.add_output_metadata(metadata={"num_documents_indexed": 0, "status": "No data"})
+        return
+
+    # 1. 准备语料库 (corpus) 和文档ID列表
+    corpus_texts: List[str] = []
+    document_ids: List[str] = [] # 用于后续可能通过ID检索原始块
+
+    for chunk in text_chunks:
+        corpus_texts.append(chunk.chunk_text)
+        document_ids.append(chunk.chunk_id) # 使用 chunk_id 作为文档标识
+
+    # 2. 使用jieba进行中文分词
+    context.log.info("Tokenizing corpus using jieba...")
+    # if config.user_dict_path and os.path.exists(config.user_dict_path):
+    #     jieba.load_userdict(config.user_dict_path)
+    #     context.log.info(f"Loaded user dictionary from: {config.user_dict_path}")
+    
+    # jieba.enable_parallel(4) # 可选：启用并行分词，如果文本量大
+    corpus_tokenized = [list(jieba.cut_for_search(text)) for text in corpus_texts]
+    # jieba.disable_parallel() # 可选：关闭并行
+    context.log.info(f"Tokenization complete. Example tokenized doc (first 10 tokens of first doc): {corpus_tokenized[0][:10] if corpus_tokenized else 'N/A'}")
+
+    # 3. 初始化并训练 BM25s 模型
+    # bm25s.BM25() 构造函数接受一个已经分词的语料库
+    context.log.info("Initializing and fitting BM25s model...")
+    try:
+        # bm25s 的 BM25 类直接在初始化时处理语料库
+        bm25_model = bm25s.BM25(corpus=corpus_tokenized) # 直接传递分词后的语料库
+        # 或者，如果bm25s期望numpy数组或特定格式，需要转换
+        # ret = bm25s.BM25()
+        # ret.index(corpus_tokenized) # 有些库是这样用
+        # 我们需要查阅 bm25s 的确切用法，假设 BM25(corpus=...) 是正确的
+        context.log.info("BM25s model fitted successfully.")
+    except Exception as e:
+        context.log.error(f"Failed to initialize or fit BM25s model: {e}")
+        # 根据错误类型，可能需要检查 corpus_tokenized 的格式
+        raise # 让资产失败以便调查
+
+    # 4. 持久化存储 BM25 模型/索引和文档ID列表
+    index_path = config.index_file_path
+    index_dir = os.path.dirname(index_path)
+    if not os.path.exists(index_dir):
+        os.makedirs(index_dir, exist_ok=True)
+        context.log.info(f"Created directory for BM25 index: {index_dir}")
+
+    try:
+        context.log.info(f"Saving BM25 model and document IDs to: {index_path}")
+        # bm25s 对象本身可能可以直接pickle，或者它有自己的保存方法
+        # 我们先尝试直接pickle模型，如果bm25s有save/load方法更好
+        # 同时保存 document_ids 列表，因为检索时返回的是索引，我们需要映射回原始ID
+        with open(index_path, 'wb') as f_out:
+            pickle.dump({"model": bm25_model, "doc_ids": document_ids}, f_out)
+        context.log.info("BM25 model and document IDs saved successfully.")
+        
+        context.add_output_metadata(
+            metadata={
+                "num_documents_indexed": len(corpus_texts),
+                "index_file_path": index_path,
+                "status": "Success"
+            }
+        )
+    except Exception as e:
+        context.log.error(f"Failed to save BM25 model or document IDs: {e}")
+        context.add_output_metadata(
+            metadata={
+                "num_documents_indexed": 0,
+                "status": f"Failed to save index: {str(e)}"
+            }
+        )
+        raise
+
+# 知识图谱
+DEFAULT_KG_EXTRACTION_SCHEMA = { # <--- 覆盖这里的整个字典
+    "type": "object",
+    "properties": {
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "提取到的实体原文"},
+                    "label": {"type": "string", "description": "实体类型 (例如: PERSON, ORGANIZATION, TASK)"}
+                },
+                "required": ["text", "label"]
+            },
+            "description": "从文本中提取出的实体列表。"
+        },
+        "relations": { # <--- 新增/确保这部分存在且正确
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "head_entity_text": {"type": "string", "description": "头实体的文本"},
+                    "head_entity_label": {"type": "string", "description": "头实体的类型 (例如: PERSON, TASK)"},
+                    "relation_type": {"type": "string", "description": "关系类型 (例如: WORKS_AT, ASSIGNED_TO)"},
+                    "tail_entity_text": {"type": "string", "description": "尾实体的文本"},
+                    "tail_entity_label": {"type": "string", "description": "尾实体的类型 (例如: ORGANIZATION, PERSON)"}
+                },
+                "required": ["head_entity_text", "head_entity_label", "relation_type", "tail_entity_text", "tail_entity_label"]
+            },
+            "description": "从文本中提取出的关系三元组列表。"
+        }
+    },
+    "required": ["entities", "relations"] # <--- 确保 "relations" 也在这里
+}
+
+class KGExtractionConfig(dg.Config):
+    extraction_prompt_template: str = ( # <--- 覆盖这里的整个多行字符串
+        "你是一个信息抽取助手。请从以下提供的文本中抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体。\n"
+        "同时，请抽取出以下两种关系：\n"
+        "1. WORKS_AT (当一个人在一个组织工作时，例如：PERSON WORKS_AT ORGANIZATION)\n"
+        "2. ASSIGNED_TO (当一个任务分配给一个人时，例如：TASK ASSIGNED_TO PERSON)\n\n"
+        "请严格按照以下JSON格式进行输出，不要包含任何额外的解释或Markdown标记：\n"
+        "{{\n"
+        "  \"entities\": [\n"
+        "    {{\"text\": \"实体1原文\", \"label\": \"实体1类型\"}},\n"
+        "    ...\n"
+        "  ],\n"
+        "  \"relations\": [\n"
+        "    {{\"head_entity_text\": \"头实体文本\", \"head_entity_label\": \"头实体类型\", \"relation_type\": \"关系类型\", \"tail_entity_text\": \"尾实体文本\", \"tail_entity_label\": \"尾实体类型\"}},\n"
+        "    ...\n"
+        "  ]\n"
+        "}}\n"
+        "如果文本中没有可抽取的实体或关系，请返回一个空的对应列表 (例如 {{\"entities\": [], \"relations\": []}})。\n\n"
+        "示例文本1：'项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。'\n"
+        "期望JSON输出1：\n"
+        "{{\n"
+        "  \"entities\": [\n"
+        "    {{\"text\": \"项目Alpha的文档编写任务\", \"label\": \"TASK\"}},\n"
+        "    {{\"text\": \"张三\", \"label\": \"PERSON\"}},\n"
+        "    {{\"text\": \"谷歌\", \"label\": \"ORGANIZATION\"}}\n"
+        "  ],\n"
+        "  \"relations\": [\n"
+        "    {{\"head_entity_text\": \"项目Alpha的文档编写任务\", \"head_entity_label\": \"TASK\", \"relation_type\": \"ASSIGNED_TO\", \"tail_entity_text\": \"张三\", \"tail_entity_label\": \"PERSON\"}},\n"
+        "    {{\"head_entity_text\": \"张三\", \"head_entity_label\": \"PERSON\", \"relation_type\": \"WORKS_AT\", \"tail_entity_text\": \"谷歌\", \"tail_entity_label\": \"ORGANIZATION\"}}\n"
+        "  ]\n"
+        "}}\n\n"
+        "文本：\n"
+        "\"{text_to_extract}\"\n\n"
+        "JSON输出："
+    )
+    sglang_model_name: str = "Qwen2.5-3B-Instruct_via_SGLang" # 保持不变
+
+# --- 新增：KGExtractionAgent (实现为 Asset) ---
+@dg.asset(
+    name="kg_extractions",
+    description="Extracts entities (and potentially relations) from text chunks for knowledge graph construction.",
+    group_name="kg_building", 
+    deps=["text_chunks"] 
+)
+async def kg_extraction_asset( 
+    context: dg.AssetExecutionContext,
+    config: KGExtractionConfig,
+    text_chunks: List[ChunkOutput],
+    sglang_api: SGLangAPIResource 
+) -> List[KGTripleSetOutput]:
+    
+    all_kg_outputs: List[KGTripleSetOutput] = []
+    context.log.info(f"Received {len(text_chunks)} text chunks for KG extraction.")
+
+    if not text_chunks:
+        context.log.warning("No text chunks received, skipping KG extraction.")
+        context.add_output_metadata(metadata={"num_chunks_processed": 0, "total_entities_extracted": 0, "total_relations_extracted": 0}) # <--- 修改：添加 total_relations_extracted
+        return all_kg_outputs
+
+    total_entities_count = 0
+    total_relations_count = 0 # <--- 新增：用于计数关系
+    for i, chunk in enumerate(text_chunks):
+        context.log.info(f"Extracting KG from chunk {i+1}/{len(text_chunks)} (ID: {chunk.chunk_id})")
+        
+        prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
+        
+        try:
+            structured_response = await sglang_api.generate_structured_output(
+                prompt=prompt,
+                json_schema=DEFAULT_KG_EXTRACTION_SCHEMA 
+            )
+            context.log.debug(f"SGLang structured response for chunk {chunk.chunk_id}: {structured_response}")
+
+            entities_data = structured_response.get("entities", [])
+            extracted_entities_list: List[ExtractedEntity] = []
+            if isinstance(entities_data, list):
+                for entity_dict in entities_data:
+                    if isinstance(entity_dict, dict) and "text" in entity_dict and "label" in entity_dict:
+                        extracted_entities_list.append(ExtractedEntity(**entity_dict))
+                    else:
+                        context.log.warning(f"Skipping malformed entity data in chunk {chunk.chunk_id}: {entity_dict}")
+            else:
+                context.log.warning(f"'entities' field in SGLang response for chunk {chunk.chunk_id} is not a list: {entities_data}")
+            
+            total_entities_count += len(extracted_entities_list)
+
+            # --- 新增/修改：解析关系数据 ---
+            relations_data = structured_response.get("relations", []) # <--- 获取 relations 字段
+            extracted_relations_list: List[ExtractedRelation] = []
+            if isinstance(relations_data, list):
+                for rel_dict in relations_data:
+                    # 确保所有必需的键都存在于rel_dict中
+                    if (isinstance(rel_dict, dict) and
+                        all(key in rel_dict for key in ["head_entity_text", "head_entity_label", 
+                                                        "relation_type", "tail_entity_text", "tail_entity_label"])):
+                        extracted_relations_list.append(ExtractedRelation(**rel_dict))
+                    else:
+                        context.log.warning(f"Skipping malformed relation data in chunk {chunk.chunk_id}: {rel_dict}")
+            else:
+                context.log.warning(f"'relations' field in SGLang response for chunk {chunk.chunk_id} is not a list: {relations_data}")
+            
+            total_relations_count += len(extracted_relations_list) # <--- 累加关系计数
+            # --- 关系数据解析结束 ---
+            
+            kg_output = KGTripleSetOutput(
+                chunk_id=chunk.chunk_id,
+                extracted_entities=extracted_entities_list,
+                extracted_relations=extracted_relations_list, # <--- 传递提取的关系
+                extraction_model_name=config.sglang_model_name,
+                original_chunk_metadata=chunk.chunk_metadata
+            )
+            all_kg_outputs.append(kg_output)
+
+        except Exception as e:
+            context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}")
+            all_kg_outputs.append(KGTripleSetOutput(
+                chunk_id=chunk.chunk_id,
+                extraction_model_name=config.sglang_model_name,
+                original_chunk_metadata={"error": str(e), **chunk.chunk_metadata}
+            ))
+            
+    context.add_output_metadata(
+        metadata={
+            "num_chunks_processed": len(text_chunks),
+            "total_entities_extracted": total_entities_count,
+            "total_relations_extracted": total_relations_count, # <--- 修改：添加新的元数据字段
+            "status": "Success" if len(all_kg_outputs) == len(text_chunks) else "Partial Success"
+        }
+    )
+    return all_kg_outputs
+
+# --- 新增：GraphStorageAgent (实现为 Asset) ---
+@dg.asset(
+    name="knowledge_graph_nodes", # 初期我们只存储节点
+    description="Stores extracted entities as nodes in Neo4j knowledge graph.",
+    group_name="kg_building",
+    deps=["kg_extractions"] 
+)
+def graph_storage_asset(
+    context: dg.AssetExecutionContext,
+    kg_extractions: List[KGTripleSetOutput], # 输入是上游资产的输出列表
+    neo4j_res: Neo4jResource # 注入Neo4j Resource
+) -> None: # 这个资产主要执行写操作
+    
+    context.log.info(f"Received {len(kg_extractions)} KG extraction sets to store in Neo4j.")
+
+    if not kg_extractions:
+        context.log.warning("No KG extractions received, nothing to store in Neo4j.")
+        context.add_output_metadata(metadata={"nodes_created_or_merged": 0, "status": "No data"})
+        return
+    queries_to_execute: List[tuple[str, Dict[str, Any]]] = []
+    total_nodes_processed = 0
+
+    for kg_output_set in kg_extractions:
+        for entity in kg_output_set.extracted_entities:
+            total_nodes_processed += 1
+            query = "MERGE (e:ExtractedEntity {text: $text}) ON CREATE SET e.label = $label, e.created_at = timestamp() ON MATCH SET e.label = $label, e.updated_at = timestamp() RETURN id(e)"
+            params = {"text": entity.text, "label": entity.label.upper()} # 标签转为大写
+            
+            queries_to_execute.append((query, params))
+
+    if not queries_to_execute:
+        context.log.info("No valid entities found to store in Neo4j.")
+        context.add_output_metadata(metadata={"nodes_created_or_merged": 0, "status": "No entities to store"})
+        return
+
+    try:
+        context.log.info(f"Executing {len(queries_to_execute)} MERGE operations for entities in Neo4j...")
+        neo4j_res.execute_write_queries(queries_to_execute)
+        context.log.info("Successfully stored/merged entities in Neo4j.")
+        
+        context.add_output_metadata(
+            metadata={
+                "nodes_created_or_merged": total_nodes_processed, # 或实际执行成功的查询数
+                "status": "Success"
+            }
+        )
+    except Exception as e:
+        context.log.error(f"Failed to store entities in Neo4j: {e}")
+        context.add_output_metadata(
+            metadata={
+                "nodes_created_or_merged": 0,
+                "status": f"Failed: {str(e)}"
+            }
+        )
+        raise
+
+
+# --- 新增：GraphStorageAgent (关系部分，实现为 Asset) ---
+@dg.asset(
+    name="knowledge_graph_relations", # 新资产的名称
+    description="Creates relationships in Neo4j based on extracted KG data.",
+    group_name="kg_building",
+    deps=["kg_extractions", "knowledge_graph_nodes"] # <--- 依赖关系提取和节点已创建
+    # 注意：knowledge_graph_nodes 是我们之前创建的用于存储实体节点的资产的名称。
+    # 请确保这个名称与您项目中实际的节点存储资产名称一致。
+    # 如果您的节点存储资产名称不同，请修改这里的 "knowledge_graph_nodes"。
+)
+def graph_relations_storage_asset( # 函数名可以与资产名不同，但清晰起见可以类似
+    context: dg.AssetExecutionContext,
+    kg_extractions: List[KGTripleSetOutput], # 输入来自 kg_extractions 资产
+    neo4j_res: Neo4jResource # 注入Neo4j Resource
+) -> None: 
+    
+    context.log.info(f"Received {len(kg_extractions)} KG extraction sets to create relations in Neo4j.")
+
+    if not kg_extractions:
+        context.log.warning("No KG extractions received, nothing to store for relations.")
+        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No data"}) # <--- 修改元数据键名
+        return
+
+    queries_to_execute: List[tuple[str, Dict[str, Any]]] = []
+    relations_processed_count = 0 # <--- 用于计数实际尝试创建的关系
+
+    for kg_output_set in kg_extractions:
+        for rel in kg_output_set.extracted_relations:
+            relations_processed_count += 1
+            
+            # 我们期望的关系类型是 "WORKS_AT" 和 "ASSIGNED_TO"
+            # 确保关系类型是有效的，并且符合我们期望处理的类型
+            if rel.relation_type not in ["WORKS_AT", "ASSIGNED_TO"]: 
+                context.log.warning(f"Skipping unknown or unsupported relation type: '{rel.relation_type}' "
+                                    f"between '{rel.head_entity_text}' and '{rel.tail_entity_text}'.")
+                continue
+
+            # 构建Cypher查询
+            # 我们假设节点是通过 :ExtractedEntity {text: $text, label: $label_attr} 来唯一识别的
+            # 其中 $label_attr 是存储在节点上的 'label' 属性 (例如 'PERSON', 'ORGANIZATION')
+            query = (
+                f"MATCH (h:ExtractedEntity {{text: $head_text, label: $head_label_attr}}), "
+                f"(t:ExtractedEntity {{text: $tail_text, label: $tail_label_attr}}) "
+                f"MERGE (h)-[r:{rel.relation_type}]->(t) " # 动态构建关系类型
+                f"ON CREATE SET r.created_at = timestamp(), r.source_chunk_id = $source_chunk_id " # <--- 添加 source_chunk_id
+                f"ON MATCH SET r.updated_at = timestamp(), r.source_chunk_id = $source_chunk_id "
+                f"RETURN type(r)"
+            )
+            params = {
+                "head_text": rel.head_entity_text,
+                "head_label_attr": rel.head_entity_label.upper(), # 匹配节点上存储的label属性
+                "tail_text": rel.tail_entity_text,
+                "tail_label_attr": rel.tail_entity_label.upper(), # 匹配节点上存储的label属性
+                "source_chunk_id": kg_output_set.chunk_id # <--- 添加参数
+            }
+            queries_to_execute.append((query, params))
+            
+    if not queries_to_execute:
+        context.log.info("No valid relations found to create in Neo4j after filtering.")
+        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No valid relations to create"})
+        return
+        
+    try:
+        context.log.info(f"Executing {len(queries_to_execute)} MERGE operations for relations in Neo4j...")
+        neo4j_res.execute_write_queries(queries_to_execute)
+        # Neo4j Python驱动的tx.run()不直接返回受影响的行数，
+        # 我们这里用 len(queries_to_execute) 作为成功执行的估计值
+        # 更精确的做法是检查每个 tx.run() 的结果摘要，但这会使批量操作复杂化
+        context.log.info(f"Successfully executed MERGE operations for {len(queries_to_execute)} relations in Neo4j.")
+        
+        context.add_output_metadata(
+            metadata={
+                "relations_created_or_merged": len(queries_to_execute), 
+                "status": "Success"
+            }
+        )
+    except Exception as e:
+        context.log.error(f"Failed to create relations in Neo4j: {e}")
+        context.add_output_metadata(
+            metadata={
+                "relations_created_or_merged": 0,
+                "status": f"Failed: {str(e)}"
+            }
+        )
+        raise
+
+# --- 更新 all_processing_assets 列表 ---
+# 假设您之前的节点存储资产名为 knowledge_graph_nodes_asset
+# 如果不是，请替换为正确的名称
+all_processing_assets = [
+    clean_chunk_text_asset, 
+    generate_embeddings_asset, 
+    vector_storage_asset,
+    keyword_index_asset,
+    kg_extraction_asset,
+    knowledge_graph_nodes_asset, # <--- 确保这是您节点存储资产的正确名称
+    graph_relations_storage_asset # <--- 添加新的关系存储资产
+]--- END OF FILE processing_assets.py ---
+
+--- START OF FILE pydantic_models_dagster.py ---# zhz_rag_pipeline/pydantic_models_dagster.py
+from typing import List, Dict, Any, Union, Optional
+from pydantic import BaseModel
+import uuid
+
+class LoadedDocumentOutput(BaseModel):
+    document_path: str
+    file_type: str
+    raw_content: Union[str, bytes]
+    metadata: Dict[str, Any]
+
+class ParsedDocumentOutput(BaseModel):
+    parsed_text: str
+    document_structure: Optional[Dict[str, Any]] = None
+    original_metadata: Dict[str, Any]
+
+class ChunkOutput(BaseModel):
+    chunk_id: str = "" 
+    chunk_text: str
+    source_document_id: str 
+    chunk_metadata: Dict[str, Any]
+
+    def __init__(self, **data: Any):
+        if 'chunk_id' not in data or not data['chunk_id']:
+            data['chunk_id'] = str(uuid.uuid4())
+        super().__init__(**data)
+
+class EmbeddingOutput(BaseModel):
+    chunk_id: str 
+    chunk_text: str 
+    embedding_vector: List[float]
+    embedding_model_name: str 
+    original_chunk_metadata: Dict[str, Any]
+
+class ExtractedEntity(BaseModel):
+    text: str 
+    label: str 
+
+class ExtractedRelation(BaseModel):
+    head_entity_text: str
+    head_entity_label: str # 例如 "PERSON"
+    relation_type: str    # 例如 "WORKS_AT"
+    tail_entity_text: str
+    tail_entity_label: str # 例如 "ORGANIZATION"
+
+class KGTripleSetOutput(BaseModel):
+    chunk_id: str 
+    extracted_entities: List[ExtractedEntity] = []
+    extracted_relations: List[ExtractedRelation] = [] 
+    extraction_model_name: str 
+    original_chunk_metadata: Dict[str, Any]--- END OF FILE pydantic_models_dagster.py ---
+
+--- START OF FILE resources.py ---# zhz_rag_pipeline/resources.py
+import dagster as dg
+from sentence_transformers import SentenceTransformer
+import chromadb
+from chromadb.config import Settings # 用于更细致的配置
+from typing import List, Dict, Any, Union, Optional
+import logging
+import httpx # 需要导入 httpx
+import asyncio # 如果SGLang调用是异步的
+import json
+from neo4j import GraphDatabase, Driver, Result # 导入neo4j驱动相关类
+
+
+# 定义Resource的配置模型 (如果需要的话，例如模型路径)
+class SentenceTransformerResourceConfig(dg.Config):
+    model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5" # 默认模型路径
+    # device: str = "cpu" # 可以添加设备配置，如 "cuda"
+
+# 定义Resource
+class SentenceTransformerResource(dg.ConfigurableResource):
+    model_name_or_path: str # 从配置中获取
+    # device: str # 从配置中获取
+    
+    _model: SentenceTransformer = None # 私有变量存储加载的模型实例
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        """
+        在Dagster进程启动或资源首次被需要时调用，用于加载模型。
+        """
+        context.log.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}")
+        try:
+            # self._model = SentenceTransformer(self.model_name_or_path, device=self.device)
+            self._model = SentenceTransformer(self.model_name_or_path) # 暂时不指定device，让库自动选择
+            context.log.info("SentenceTransformer model initialized successfully.")
+        except Exception as e:
+            context.log.error(f"Failed to initialize SentenceTransformer model: {e}")
+            raise
+
+    def encode(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
+        """
+        使用加载的模型对文本列表进行编码。
+        """
+        if self._model is None:
+            # 理论上 setup_for_execution 应该已经运行了
+            # 但作为后备，或者如果资源没有被正确初始化
+            raise RuntimeError("SentenceTransformer model is not initialized. Call setup_for_execution first or ensure resource is configured.")
+        
+        # sentence-transformers的encode方法返回numpy数组，我们将其转换为list
+        embeddings_np = self._model.encode(texts, batch_size=batch_size, convert_to_tensor=False) # convert_to_tensor=False 直接返回numpy
+        return [emb.tolist() for emb in embeddings_np]
+
+# 定义ChromaDB Resource的配置模型
+class ChromaDBResourceConfig(dg.Config):
+    # path: Optional[str] = "/home/zhz/dagster_home/chroma_db" # 持久化存储路径
+    # host: Optional[str] = None # 如果连接远程ChromaDB服务器
+    # port: Optional[int] = None
+    collection_name: str = "rag_documents" # 默认集合名称
+    # settings: Optional[Dict[str, Any]] = None # 高级Chroma设置
+    # 使用更具体的持久化路径配置
+    persist_directory: str = "/home/zhz/dagster_home/chroma_data" # 推荐的持久化目录
+
+# 定义ChromaDB Resource
+class ChromaDBResource(dg.ConfigurableResource):
+    collection_name: str
+    persist_directory: str
+
+    _client: chromadb.Client = None
+    _collection: chromadb.Collection = None
+    _logger: logging.Logger = None # <--- 新增：用于存储logger实例
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = dg.get_dagster_logger() # <--- 新增：获取Dagster logger
+        # self._logger = logging.getLogger(f"ChromaDBResource.{self.collection_name}") # 或者使用标准的Python logger
+
+        self._logger.info(f"Initializing ChromaDB client and collection '{self.collection_name}'...")
+        self._logger.info(f"ChromaDB data will be persisted to: {self.persist_directory}")
+        try:
+            self._client = chromadb.PersistentClient(path=self.persist_directory)
+            self._collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+            )
+            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized successfully. Item count: {self._collection.count()}")
+        except Exception as e:
+            self._logger.error(f"Failed to initialize ChromaDB: {e}")
+            raise
+
+    def add_embeddings(self, ids: List[str], embeddings: List[List[float]], metadatas: List[Dict[str, Any]] = None):
+        if self._collection is None:
+            # 可以在这里也用 self._logger 记录错误，或者直接抛出异常
+            self._logger.error("ChromaDB collection is not initialized. Cannot add embeddings.")
+            raise RuntimeError("ChromaDB collection is not initialized.")
+        
+        if not (len(ids) == len(embeddings) and (metadatas is None or len(ids) == len(metadatas))):
+            self._logger.error("Length mismatch for ids, embeddings, or metadatas.")
+            raise ValueError("Length of ids, embeddings, and metadatas (if provided) must be the same.")
+
+        if not ids:
+            self._logger.info("No ids provided to add_embeddings, skipping.")
+            return
+
+        self._logger.info(f"Adding/updating {len(ids)} embeddings to ChromaDB collection '{self.collection_name}'...") # <--- 修改：使用 self._logger
+        self._collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas
+        )
+        self._logger.info(f"Embeddings added/updated. Collection count now: {self._collection.count()}") # <--- 修改：使用 self._logger
+
+    def query_embeddings(self, query_embeddings: List[List[float]], n_results: int = 5) -> chromadb.QueryResult:
+        if self._collection is None:
+            self._logger.error("ChromaDB collection is not initialized. Cannot query embeddings.")
+            raise RuntimeError("ChromaDB collection is not initialized.")
+        # query方法本身可能没有太多需要日志记录的，除非你想记录查询参数或结果数量
+        self._logger.debug(f"Querying ChromaDB collection '{self.collection_name}' with {len(query_embeddings)} vectors, n_results={n_results}.")
+        return self._collection.query(
+            query_embeddings=query_embeddings,
+            n_results=n_results
+        )
+    
+# 定义SGLang Resource的配置模型
+class SGLangAPIResourceConfig(dg.Config):
+    api_url: str = "http://127.0.0.1:30000/generate"
+    default_temperature: float = 0.1
+    default_max_new_tokens: int = 512 # 根据KG提取的典型输出长度调整
+    # default_stop_tokens: List[str] = ["<|im_end|>"] # 可以设默认停止标记
+
+# 定义SGLang Resource
+class SGLangAPIResource(dg.ConfigurableResource):
+    api_url: str
+    default_temperature: float
+    default_max_new_tokens: int
+    # default_stop_tokens: List[str]
+
+    _logger: logging.Logger = None
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = dg.get_dagster_logger()
+        self._logger.info(f"SGLangAPIResource configured with API URL: {self.api_url}")
+        # 这里不需要实际的连接或初始化，因为是无状态的HTTP API调用
+
+    async def generate_structured_output(
+        self, 
+        prompt: str, 
+        json_schema: Dict[str, Any],
+        temperature: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
+        # stop_tokens: Optional[List[str]] = None # 可选
+    ) -> Dict[str, Any]: # 期望返回解析后的JSON字典
+        
+        temp_to_use = temperature if temperature is not None else self.default_temperature
+        tokens_to_use = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
+        # stop_to_use = stop_tokens if stop_tokens is not None else self.default_stop_tokens
+
+        payload = {
+            "text": prompt,
+            "sampling_params": {
+                "temperature": temp_to_use,
+                "max_new_tokens": tokens_to_use,
+                # "stop": stop_to_use, # 根据模型调整
+                "stop": ["<|im_end|>"], # 假设Qwen
+                "json_schema": json.dumps(json_schema) # 确保传递JSON字符串
+            }
+        }
+        self._logger.debug(f"Sending request to SGLang. Prompt (start): {prompt[:100]}... Schema: {json.dumps(json_schema)}")
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client: # 增加超时时间
+                response = await client.post(self.api_url, json=payload)
+                response.raise_for_status()
+                
+                response_json = response.json()
+                generated_text = response_json.get("text", "").strip()
+                
+                self._logger.debug(f"SGLang raw response text: {generated_text}")
+                # 尝试解析
+                try:
+                    parsed_output = json.loads(generated_text)
+                    return parsed_output
+                except json.JSONDecodeError as e:
+                    self._logger.error(f"Failed to decode SGLang JSON output: {generated_text}. Error: {e}")
+                    raise ValueError(f"SGLang output was not valid JSON: {generated_text}") from e
+
+        except httpx.HTTPStatusError as e:
+            self._logger.error(f"SGLang API HTTP error: {e.response.status_code} - {e.response.text}")
+            raise
+        except httpx.RequestError as e:
+            self._logger.error(f"SGLang API request error: {e}")
+            raise
+        except Exception as e:
+            self._logger.error(f"Unexpected error during SGLang call: {e}")
+            raise
+
+# 定义Neo4j Resource的配置模型
+class Neo4jResourceConfig(dg.Config):
+    uri: str = "bolt://localhost:7687" # 从您的 .env 文件获取
+    user: str = "neo4j"                 # 从您的 .env 文件获取
+    password: str = "zhz199276"          # 从您的 .env 文件获取
+    database: str = "neo4j"             # 默认数据库，可以配置
+
+# 定义Neo4j Resource
+class Neo4jResource(dg.ConfigurableResource):
+    uri: str
+    user: str
+    password: str
+    database: str
+
+    _driver: Driver = None # Neo4j驱动实例
+    _logger: logging.Logger = None
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = dg.get_dagster_logger()
+        self._logger.info(f"Initializing Neo4j Driver for URI: {self.uri}, Database: {self.database}")
+        try:
+            self._driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
+            # 验证连接 (可选但推荐)
+            with self._driver.session(database=self.database) as session:
+                session.run("RETURN 1").consume() # 一个简单的查询来测试连接
+            self._logger.info("Neo4j Driver initialized and connection verified successfully.")
+        except Exception as e:
+            self._logger.error(f"Failed to initialize Neo4j Driver or verify connection: {e}")
+            raise
+
+    def execute_query(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Result:
+        """
+        执行一个Cypher查询并返回结果。
+        """
+        if self._driver is None:
+            self._logger.error("Neo4j Driver is not initialized.")
+            raise RuntimeError("Neo4j Driver is not initialized.")
+        
+        self._logger.debug(f"Executing Neo4j query: {query} with parameters: {parameters}")
+        with self._driver.session(database=self.database) as session:
+            result = session.run(query, parameters)
+            return result # 返回 Result 对象，调用方可以处理
+
+    def execute_write_queries(self, queries_with_params: List[tuple[str, Dict[str, Any]]]):
+        """
+        在单个事务中执行多个写操作查询。
+        queries_with_params: 一个元组列表，每个元组是 (cypher_query_string, parameters_dict)
+        """
+        if self._driver is None:
+            self._logger.error("Neo4j Driver is not initialized.")
+            raise RuntimeError("Neo4j Driver is not initialized.")
+
+        with self._driver.session(database=self.database) as session:
+            with session.begin_transaction() as tx:
+                for query, params in queries_with_params:
+                    self._logger.debug(f"Executing in transaction: {query} with params: {params}")
+                    tx.run(query, params)
+                tx.commit()
+        self._logger.info(f"Executed {len(queries_with_params)} write queries in a transaction.")
+
+
+    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        """
+        在Dagster进程结束时关闭Neo4j驱动程序。
+        """
+        if self._driver is not None:
+            self._logger.info("Closing Neo4j Driver.")
+            self._driver.close()
+            self._driver = None--- END OF FILE resources.py ---
+

@@ -1,0 +1,27 @@
+[
+  {
+    "id": "doc_sales_q1",
+    "content": "2024年第一季度销售报告显示，华东区域销售额增长最快，达到46.5万元，主要得益于新产品A的推出。华北区域总销售额为36.5万元，但利润率有所下降。",
+    "metadata": {"source": "Q1_Sales_Report.xlsx", "date": "2024-04-15", "type": "sales_report"}
+  },
+  {
+    "id": "doc_hr_policy",
+    "content": "公司最新人力资源政策规定，员工每年享有15天带薪年假，病假需提供医生证明。弹性工作制适用于部分岗位，需部门经理批准。",
+    "metadata": {"source": "HR_Policy_2024.pdf", "date": "2024-01-01", "type": "HR_policy"}
+  },
+  {
+    "id": "doc_it_security",
+    "content": "IT安全指南强调，所有员工必须定期更换密码，并启用双因素认证。任何可疑邮件应立即报告给IT部门。",
+    "metadata": {"source": "IT_Security_Guide.docx", "date": "2023-11-20", "type": "IT_guideline"}
+  },
+  {
+    "id": "doc_meeting_notes",
+    "content": "周例会纪要：讨论了项目X的进度，张三负责市场调研，李四负责技术开发。王五提出了关于预算优化的建议。下周将进行客户演示。",
+    "metadata": {"source": "Weekly_Meeting_2024-05-10.txt", "date": "2024-05-10", "type": "meeting_notes"}
+  },
+  {
+    "id": "doc_product_launch",
+    "content": "新产品A的发布取得了巨大成功，市场反馈积极。预计将在下半年推出产品B，进一步扩大市场份额。",
+    "metadata": {"source": "Product_Launch_Review.pptx", "date": "2024-05-01", "type": "product_review"}
+  }
+]
