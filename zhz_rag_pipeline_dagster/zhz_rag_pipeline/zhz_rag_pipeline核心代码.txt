@@ -187,8 +187,15 @@ import uuid
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # 从我们新建的pydantic模型文件中导入
+from .pydantic_models_dagster import ( # <--- 修改这里的导入列表
+    ChunkOutput, 
+    ParsedDocumentOutput, 
+    EmbeddingOutput,
+    KGTripleSetOutput, 
+    ExtractedEntity,
+    ExtractedRelation # <--- 新增 ExtractedRelation 的导入
+)
 from .resources import SentenceTransformerResource, ChromaDBResource, SGLangAPIResource, Neo4jResource
-from .pydantic_models_dagster import ChunkOutput, ParsedDocumentOutput, EmbeddingOutput,KGTripleSetOutput, ExtractedEntity
 
 import jieba
 import bm25s
@@ -408,10 +415,10 @@ def vector_storage_asset(
 
 
 # --- 新增：定义 KeywordIndexAgent 的配置 Pydantic 模型 ---
-class BM25IndexConfig(dg.Config): # <--- 将这个类定义放在这里
-    index_file_path: str = "/home/zhz/dagster_home/bm25_index/rag_bm25_index.pkl"
+class BM25IndexConfig(dg.Config): 
+    index_file_path: str = "/home/zhz/dagster_home/bm25_index_data/"
 
-# --- 新增：KeywordIndexAgent (实现为 Asset) ---
+# --- 修改：KeywordIndexAgent (实现为 Asset) ---
 @dg.asset(
     name="keyword_index",
     description="Builds and persists a BM25 keyword index from text chunks.",
@@ -420,80 +427,82 @@ class BM25IndexConfig(dg.Config): # <--- 将这个类定义放在这里
 )
 def keyword_index_asset(
     context: dg.AssetExecutionContext,
-    config: BM25IndexConfig, # <--- 现在这里应该能正确引用了
+    config: BM25IndexConfig,
     text_chunks: List[ChunkOutput] 
 ) -> None:
     
     context.log.info(f"Received {len(text_chunks)} text chunks to build BM25 index.")
 
     if not text_chunks:
+        # ... (无数据处理不变) ...
         context.log.warning("No text chunks received, skipping BM25 index building.")
         context.add_output_metadata(metadata={"num_documents_indexed": 0, "status": "No data"})
         return
 
-    # 1. 准备语料库 (corpus) 和文档ID列表
-    corpus_texts: List[str] = []
-    document_ids: List[str] = [] # 用于后续可能通过ID检索原始块
+    corpus_texts: List[str] = [chunk.chunk_text for chunk in text_chunks]
+    document_ids: List[str] = [chunk.chunk_id for chunk in text_chunks] # 我们仍然需要保存这个映射
 
-    for chunk in text_chunks:
-        corpus_texts.append(chunk.chunk_text)
-        document_ids.append(chunk.chunk_id) # 使用 chunk_id 作为文档标识
-
-    # 2. 使用jieba进行中文分词
     context.log.info("Tokenizing corpus using jieba...")
-    # if config.user_dict_path and os.path.exists(config.user_dict_path):
-    #     jieba.load_userdict(config.user_dict_path)
-    #     context.log.info(f"Loaded user dictionary from: {config.user_dict_path}")
-    
-    # jieba.enable_parallel(4) # 可选：启用并行分词，如果文本量大
-    corpus_tokenized = [list(jieba.cut_for_search(text)) for text in corpus_texts]
-    # jieba.disable_parallel() # 可选：关闭并行
-    context.log.info(f"Tokenization complete. Example tokenized doc (first 10 tokens of first doc): {corpus_tokenized[0][:10] if corpus_tokenized else 'N/A'}")
+    # 使用jieba分词，但bm25s有自己的tokenize函数，可以接受自定义分词器，或者直接处理分词后的列表
+    # 为了与bm25s的tokenize函数配合，我们可以先用jieba分好，再传给bm25s的tokenizer
+    # 或者，如果bm25s的默认分词或其Tokenizer类能满足中文需求，可以直接用。
+    # 为了简单且利用jieba，我们先分词
+    corpus_tokenized_jieba = [list(jieba.cut_for_search(text)) for text in corpus_texts]
+    context.log.info(f"Jieba tokenization complete. Example: {corpus_tokenized_jieba[0][:10] if corpus_tokenized_jieba else 'N/A'}")
 
-    # 3. 初始化并训练 BM25s 模型
-    # bm25s.BM25() 构造函数接受一个已经分词的语料库
-    context.log.info("Initializing and fitting BM25s model...")
+    context.log.info("Initializing BM25s model and indexing corpus...")
     try:
-        # bm25s 的 BM25 类直接在初始化时处理语料库
-        bm25_model = bm25s.BM25(corpus=corpus_tokenized) # 直接传递分词后的语料库
-        # 或者，如果bm25s期望numpy数组或特定格式，需要转换
-        # ret = bm25s.BM25()
-        # ret.index(corpus_tokenized) # 有些库是这样用
-        # 我们需要查阅 bm25s 的确切用法，假设 BM25(corpus=...) 是正确的
-        context.log.info("BM25s model fitted successfully.")
+        # 根据bm25s文档，先创建BM25对象，然后调用index方法
+        bm25_model = bm25s.BM25() # 可以传入k1, b等参数
+        # .index() 方法接受已经分词的语料库 (list of list of str)
+        bm25_model.index(corpus_tokenized_jieba)
+        context.log.info("BM25s model indexed successfully.")
     except Exception as e:
-        context.log.error(f"Failed to initialize or fit BM25s model: {e}")
-        # 根据错误类型，可能需要检查 corpus_tokenized 的格式
-        raise # 让资产失败以便调查
+        context.log.error(f"Failed to initialize or index with BM25s model: {e}")
+        raise
 
-    # 4. 持久化存储 BM25 模型/索引和文档ID列表
-    index_path = config.index_file_path
-    index_dir = os.path.dirname(index_path)
-    if not os.path.exists(index_dir):
-        os.makedirs(index_dir, exist_ok=True)
-        context.log.info(f"Created directory for BM25 index: {index_dir}")
+    index_directory = config.index_file_path # 这应该是一个目录路径
+
+    if not os.path.exists(index_directory):
+        os.makedirs(index_directory, exist_ok=True)
+        context.log.info(f"Created directory for BM25 index: {index_directory}")
 
     try:
-        context.log.info(f"Saving BM25 model and document IDs to: {index_path}")
-        # bm25s 对象本身可能可以直接pickle，或者它有自己的保存方法
-        # 我们先尝试直接pickle模型，如果bm25s有save/load方法更好
-        # 同时保存 document_ids 列表，因为检索时返回的是索引，我们需要映射回原始ID
-        with open(index_path, 'wb') as f_out:
-            pickle.dump({"model": bm25_model, "doc_ids": document_ids}, f_out)
-        context.log.info("BM25 model and document IDs saved successfully.")
+        context.log.info(f"Saving BM25 model to directory: {index_directory}")
+        # 使用bm25s的save方法，它会将多个文件保存到该目录下
+        # 它会自动保存词汇表 (vocab.index.json) 和其他必要文件
+        bm25_model.save(
+            index_directory,
+            # 文件名参数是可选的，bm25s有默认文件名，例如：
+            # data_name="data.csc.index.npy",
+            # indices_name="indices.csc.index.npy",
+            # indptr_name="indptr.csc.index.npy",
+            # vocab_name="vocab.index.json", 
+            # params_name="params.index.json"
+        )
+        context.log.info(f"BM25 model saved successfully to {index_directory}")
+
+        # 单独保存我们的 document_ids 列表，因为bm25s内部索引是基于0,1,2...
+        # 而我们需要映射回原始的chunk_id
+        doc_ids_path = os.path.join(index_directory, "doc_ids.pkl") # 保持这个文件名
+        with open(doc_ids_path, 'wb') as f_out:
+            pickle.dump(document_ids, f_out)
+        context.log.info(f"Document IDs saved successfully to {doc_ids_path}")
         
         context.add_output_metadata(
             metadata={
                 "num_documents_indexed": len(corpus_texts),
-                "index_file_path": index_path,
+                "index_directory_path": index_directory, # <--- 修改：现在是目录路径
                 "status": "Success"
             }
         )
     except Exception as e:
+        # ... (错误处理不变) ...
         context.log.error(f"Failed to save BM25 model or document IDs: {e}")
         context.add_output_metadata(
             metadata={
                 "num_documents_indexed": 0,
+                "index_directory_path": index_directory,
                 "status": f"Failed to save index: {str(e)}"
             }
         )
@@ -667,16 +676,16 @@ async def kg_extraction_asset(
 
 # --- 新增：GraphStorageAgent (实现为 Asset) ---
 @dg.asset(
-    name="knowledge_graph_nodes", # 初期我们只存储节点
+    name="knowledge_graph_nodes", # <--- 这个是Dagster内部识别的资产名称
     description="Stores extracted entities as nodes in Neo4j knowledge graph.",
     group_name="kg_building",
     deps=["kg_extractions"] 
 )
-def graph_storage_asset(
+def graph_storage_asset( # <--- 这是Python的函数名
     context: dg.AssetExecutionContext,
-    kg_extractions: List[KGTripleSetOutput], # 输入是上游资产的输出列表
-    neo4j_res: Neo4jResource # 注入Neo4j Resource
-) -> None: # 这个资产主要执行写操作
+    kg_extractions: List[KGTripleSetOutput], 
+    neo4j_res: Neo4jResource 
+) -> None:
     
     context.log.info(f"Received {len(kg_extractions)} KG extraction sets to store in Neo4j.")
 
@@ -809,16 +818,14 @@ def graph_relations_storage_asset( # 函数名可以与资产名不同，但清�
         raise
 
 # --- 更新 all_processing_assets 列表 ---
-# 假设您之前的节点存储资产名为 knowledge_graph_nodes_asset
-# 如果不是，请替换为正确的名称
 all_processing_assets = [
     clean_chunk_text_asset, 
     generate_embeddings_asset, 
     vector_storage_asset,
     keyword_index_asset,
     kg_extraction_asset,
-    knowledge_graph_nodes_asset, # <--- 确保这是您节点存储资产的正确名称
-    graph_relations_storage_asset # <--- 添加新的关系存储资产
+    graph_storage_asset, # <--- 修改这里：使用实际的节点存储资产函数名
+    graph_relations_storage_asset 
 ]--- END OF FILE processing_assets.py ---
 
 --- START OF FILE pydantic_models_dagster.py ---# zhz_rag_pipeline/pydantic_models_dagster.py
@@ -893,35 +900,37 @@ class SentenceTransformerResourceConfig(dg.Config):
 
 # 定义Resource
 class SentenceTransformerResource(dg.ConfigurableResource):
-    model_name_or_path: str # 从配置中获取
-    # device: str # 从配置中获取
-    
-    _model: SentenceTransformer = None # 私有变量存储加载的模型实例
+    model_name_or_path: str
+    _model: SentenceTransformer = None
+    _logger: logging.Logger = None # <--- 新增：声明 _logger 实例变量
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        """
-        在Dagster进程启动或资源首次被需要时调用，用于加载模型。
-        """
-        context.log.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}")
+        self._logger = dg.get_dagster_logger() # <--- 新增：初始化 _logger
+        self._logger.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}") # <--- 修改：使用 self._logger
         try:
-            # self._model = SentenceTransformer(self.model_name_or_path, device=self.device)
-            self._model = SentenceTransformer(self.model_name_or_path) # 暂时不指定device，让库自动选择
-            context.log.info("SentenceTransformer model initialized successfully.")
+            self._model = SentenceTransformer(
+                self.model_name_or_path, 
+            )
+            self._logger.info("SentenceTransformer model initialized successfully.")
         except Exception as e:
-            context.log.error(f"Failed to initialize SentenceTransformer model: {e}")
+            self._logger.error(f"Failed to initialize SentenceTransformer model: {e}")
             raise
 
-    def encode(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
-        """
-        使用加载的模型对文本列表进行编码。
-        """
+    def encode(self, texts: List[str], batch_size: int = 32, normalize_embeddings: bool = True) -> List[List[float]]:
         if self._model is None:
-            # 理论上 setup_for_execution 应该已经运行了
-            # 但作为后备，或者如果资源没有被正确初始化
-            raise RuntimeError("SentenceTransformer model is not initialized. Call setup_for_execution first or ensure resource is configured.")
+            # 可以在这里也用 self._logger 记录错误
+            if self._logger: # 检查 _logger 是否已初始化 (虽然理论上 setup 后应该有了)
+                self._logger.error("SentenceTransformer model is not initialized in encode method.")
+            raise RuntimeError("SentenceTransformer model is not initialized.")
         
-        # sentence-transformers的encode方法返回numpy数组，我们将其转换为list
-        embeddings_np = self._model.encode(texts, batch_size=batch_size, convert_to_tensor=False) # convert_to_tensor=False 直接返回numpy
+        self._logger.debug(f"Encoding {len(texts)} texts. Normalize embeddings: {normalize_embeddings}") 
+        
+        embeddings_np = self._model.encode(
+            texts, 
+            batch_size=batch_size, 
+            convert_to_tensor=False, 
+            normalize_embeddings=normalize_embeddings
+        )
         return [emb.tolist() for emb in embeddings_np]
 
 # 定义ChromaDB Resource的配置模型
@@ -944,17 +953,18 @@ class ChromaDBResource(dg.ConfigurableResource):
     _logger: logging.Logger = None # <--- 新增：用于存储logger实例
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = dg.get_dagster_logger() # <--- 新增：获取Dagster logger
-        # self._logger = logging.getLogger(f"ChromaDBResource.{self.collection_name}") # 或者使用标准的Python logger
+        self._logger = dg.get_dagster_logger() 
 
         self._logger.info(f"Initializing ChromaDB client and collection '{self.collection_name}'...")
         self._logger.info(f"ChromaDB data will be persisted to: {self.persist_directory}")
         try:
             self._client = chromadb.PersistentClient(path=self.persist_directory)
+            
             self._collection = self._client.get_or_create_collection(
                 name=self.collection_name,
+                metadata={"hnsw:space": "cosine"} # <--- 新增/修改：指定距离度量为余弦
             )
-            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized successfully. Item count: {self._collection.count()}")
+            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized/loaded with cosine distance. Item count: {self._collection.count()}")
         except Exception as e:
             self._logger.error(f"Failed to initialize ChromaDB: {e}")
             raise

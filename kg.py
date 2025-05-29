@@ -2,7 +2,8 @@
 import json
 import os
 from typing import List, Dict, Any, Optional
-from neo4j import GraphDatabase, basic_auth, Result, Record # 移除了 EagerResult，因为我们主要处理 Result 和 Record
+from neo4j import GraphDatabase, basic_auth, Result, Record 
+from neo4j.graph import Node, Relationship, Path
 import asyncio
 import logging
 
@@ -30,25 +31,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NEW_KG_SCHEMA_DESCRIPTION = """
-你的任务是根据用户的问题，利用以下知识图谱Schema信息生成一个或多个Cypher查询。
-图谱中的主要节点标签是 :ExtractedEntity。
-每个 :ExtractedEntity 节点有以下核心属性：
-- text: 字符串，表示实体的原始文本。
-- label: 字符串，表示实体的类型，例如 "PERSON", "ORGANIZATION", "TASK", "LOCATION"。
+你的任务是根据用户的问题，严格利用以下【知识图谱Schema信息】生成一个或多个Cypher查询。
 
-目前支持以下关系类型，它们连接 :ExtractedEntity 节点：
-1. :WORKS_AT (从 label="PERSON" 的节点指向 label="ORGANIZATION" 的节点)
-   - 示例: (person:ExtractedEntity {label:"PERSON"})-[:WORKS_AT]->(org:ExtractedEntity {label:"ORGANIZATION"})
-2. :ASSIGNED_TO (从 label="TASK" 的节点指向 label="PERSON" 的节点)
-   - 示例: (task:ExtractedEntity {label:"TASK"})-[:ASSIGNED_TO]->(person:ExtractedEntity {label:"PERSON"}) 
+**【知识图谱Schema信息】**
 
-查询时，请优先使用节点的 text 属性进行匹配。
-如果用户问题中提到了实体类型，请在Cypher查询中使用节点的 label 属性进行筛选。
-例如，如果用户问“张三在哪里工作？”，你可能需要找到一个 text="张三" 且 label="PERSON" 的节点，然后查询其 WORKS_AT 关系。
-如果用户问“项目Alpha的任务分配给了谁？”，你可能需要找到一个 text="项目Alpha的文档编写任务" 且 label="TASK" 的节点，然后查询其 ASSIGNED_TO 关系。
-请只返回Cypher查询语句，不要包含任何解释或其他文本。如果无法根据问题和Schema生成有意义的查询，请返回 "无法生成Cypher查询。"
+1.  **节点 (Nodes):**
+    *   **绝对核心规则：在生成的Cypher查询中，所有节点匹配时必须且只能使用 `:ExtractedEntity` 这个统一标签。严禁在MATCH模式中使用例如 :Person, :Organization, :Task 等更具体的标签名。节点的具体类型通过其 `label` 属性进行区分和筛选（例如，`(n:ExtractedEntity {label: 'PERSON'})`）。**
+    *   每个 `:ExtractedEntity` 节点有且仅有以下两个核心属性:
+        *   `text`: 字符串 (String)，表示实体的原始文本内容。
+        *   `label`: 字符串 (String)，表示实体的类型。目前已知的实体类型包括: "PERSON", "ORGANIZATION", "TASK"。 (注意：虽然理论上可以有 "LOCATION" 等其他类型，但当前已定义的关系主要涉及这三者。)
 
-**【查询示例 - 严格基于上述Schema】**:
+2.  **关系 (Relationships):**
+    *   目前仅支持以下两种关系类型，它们严格连接特定标签的 `:ExtractedEntity` 节点：
+        *   关系名称: `:WORKS_AT`
+            *   方向和类型: `(:ExtractedEntity {label:"PERSON"}) -[:WORKS_AT]-> (:ExtractedEntity {label:"ORGANIZATION"})`
+            *   描述: 表示一个 PERSON 在一个 ORGANIZATION 工作。**此关系严格用于表示工作单位，目标节点必须是 `label:"ORGANIZATION"` 的 `:ExtractedEntity`。如果问题中提及“地点”但明显指代公司或机构，请查询 `ORGANIZATION` 类型的实体。**
+            *   示例: `(person:ExtractedEntity {label:"PERSON", text:"张三"})-[:WORKS_AT]->(org:ExtractedEntity {label:"ORGANIZATION", text:"谷歌"})`
+        *   关系名称: `:ASSIGNED_TO`
+            *   方向和类型: `(:ExtractedEntity {label:"TASK"}) -[:ASSIGNED_TO]-> (:ExtractedEntity {label:"PERSON"})`
+            *   描述: 表示一个任务分配给了一个人。
+            *   示例: `(task:ExtractedEntity {label:"TASK", text:"项目Alpha的文档编写任务"})-[:ASSIGNED_TO]->(person:ExtractedEntity {label:"PERSON", text:"张三"})`
+    *   **重要约束**：生成Cypher查询时，**必须且只能**使用上述明确定义的关系类型 (`:WORKS_AT`, `:ASSIGNED_TO`) 和节点属性 (`text`, `label`)。严禁使用任何未在此处定义的其他关系类型或节点属性。
+
+**【Cypher查询生成规则】**
+
+1.  **严格遵循Schema**:
+    *   你的查询**必须完全基于**上面提供的【知识图谱Schema信息】。
+    *   **节点标签必须固定为 `:ExtractedEntity`。例如，匹配一个“张三”这个人时，应写为 `(p:ExtractedEntity {label: 'PERSON', text: '张三'})`，绝对不能写成 `(p:Person {text: '张三'})`。**
+    *   节点属性只能使用 `text` 和 `label`。
+    *   关系类型只能使用 `:WORKS_AT` 和 `:ASSIGNED_TO`，并严格遵守其定义的方向和连接的实体类型。
+
+2.  **匹配逻辑**:
+    *   当用户问题中提及具体实体名称时，优先使用该实体的 `text` 属性进行精确匹配。
+    *   同时，根据问题上下文或实体类型提示，使用 `label` 属性进行辅助筛选。
+
+3.  **输出格式**:
+    *   如果能生成有效查询，你的回答**必须只包含纯粹的Cypher查询语句本身**。
+    *   如果根据问题和Schema无法生成有效的Cypher查询（例如，问题超出了Schema的表达能力，问题本身逻辑不通，或涉及未定义的关系/属性），**或者问题的核心查询意图（例如询问某个实体的一个特定但Schema中未定义的属性，或寻找一个Schema中未定义的关系类型来连接实体）无法通过已定义的节点属性或关系类型来精确满足，则必须只输出固定的短语：“无法生成Cypher查询。”不要试图通过返回实体本身的其他已知属性或已知的相关实体来“部分回答”该核心意图。如果一个问题询问某个任务的“具体内容”或“要求”，而Schema中没有为TASK实体定义这些属性或相关关系，那么就应该返回“无法生成Cypher查询。”**
+    *   **绝对禁止**在有效的Cypher语句前后添加任何前缀、后缀、解释、注释或markdown标记。
+
+**【查询示例 - 严格基于上述Schema和规则】**:
 
 *   用户问题: "张三在哪里工作？"
     Cypher查询: MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'})-[:WORKS_AT]->(org:ExtractedEntity {label: 'ORGANIZATION'}) RETURN org.text AS organizationName
@@ -62,13 +84,22 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 *   用户问题: "张三负责哪些任务？"
     Cypher查询: MATCH (task:ExtractedEntity {label: 'TASK'})-[:ASSIGNED_TO]->(p:ExtractedEntity {text: '张三', label: 'PERSON'}) RETURN task.text AS taskName
 
-*   用户问题: "谷歌公司有哪些员工？" (与 "列出所有在谷歌工作的人" 类似，测试LLM的理解)
+*   用户问题: "谷歌公司有哪些员工？"
     Cypher查询: MATCH (p:ExtractedEntity {label: 'PERSON'})-[:WORKS_AT]->(org:ExtractedEntity {text: '谷歌', label: 'ORGANIZATION'}) RETURN p.text AS employeeName
 
 *   用户问题: "查询所有任务及其负责人。"
     Cypher查询: MATCH (task:ExtractedEntity {label: 'TASK'})-[:ASSIGNED_TO]->(person:ExtractedEntity {label: 'PERSON'}) RETURN task.text AS taskName, person.text AS assignedPerson
 
-*   用户问题: "百度的CEO是谁？" (假设Schema中没有CEO的具体关系和属性)
+*   用户问题: "百度的CEO是谁？" (此问题超出现有Schema表达能力)
+    Cypher查询: 无法生成Cypher查询。
+
+*   用户问题: "项目Alpha文档编写任务的具体内容是什么？" (核心意图是查询“具体内容”，但Schema中没有为TASK实体定义这些属性或相关关系，所以无法生成查询)
+    Cypher查询: 无法生成Cypher查询。
+
+*   用户问题: "张三目前的工作地点是哪个城市？" (Schema中 :WORKS_AT 指向 ORGANIZATION，没有直接的城市地点关系，且ORGANIZATION节点也没有城市属性)
+    Cypher查询: 无法生成Cypher查询。
+
+*   用户问题: "张三最近一次的工作变动是什么时候？" (此问题涉及Schema未定义的属性如日期)
     Cypher查询: 无法生成Cypher查询。
 
 现在，请根据以下用户问题和上述Schema及规则生成Cypher查询。
@@ -83,6 +114,9 @@ class KGRetriever:
     def __init__(self, llm_cypher_generator_func: callable = generate_cypher_query):
         self.llm_cypher_generator_func = llm_cypher_generator_func
         self._driver: Optional[GraphDatabase.driver] = None
+                # --- 在连接前打印出将要使用的连接参数 ---
+        kg_logger.info(f"KGRetriever attempting to connect with URI: {self.NEO4J_URI}, User: {self.NEO4J_USER}, DB: {self.NEO4J_DATABASE}")
+        
         self._connect_to_neo4j()
         kg_logger.info(f"KGRetriever initialized. Connected to Neo4j: {self._driver is not None}")
 
@@ -113,53 +147,81 @@ class KGRetriever:
             kg_logger.info("Closed Neo4j connection.")
             self._driver = None
 
-    def _convert_neo4j_value_to_json_serializable(self, value: Any) -> Any:
+    def _convert_neo4j_value_to_json_serializable(self, value: Any) -> Any: # <--- 覆盖整个方法
         """
         递归地将Neo4j返回的各种值转换为JSON可序列化的Python原生类型。
         """
-        if hasattr(value, 'labels') and hasattr(value, 'properties') and hasattr(value, 'id'): # Node
-            return {"_id": value.id, "_labels": list(value.labels), **dict(value.properties)}
-        elif hasattr(value, 'type') and hasattr(value, 'properties') and hasattr(value, 'id') and hasattr(value, 'start_node') and hasattr(value, 'end_node'): # Relationship
+        if isinstance(value, Node):
+            # Node对象可以直接通过dict(node)获取其所有属性
+            # element_id 是推荐的唯一标识符
+            return {"_element_id": value.element_id, "_labels": list(value.labels), "properties": dict(value)}
+        
+        elif isinstance(value, Relationship):
+            # Relationship对象也可以通过dict(relationship)获取其属性
             return {
-                "_id": value.id, 
+                "_element_id": value.element_id,
                 "_type": value.type,
-                "_start_node_id": value.start_node.id, 
-                "_end_node_id": value.end_node.id,
-                **dict(value.properties)
+                "_start_node_element_id": value.start_node.element_id,
+                "_end_node_element_id": value.end_node.element_id,
+                "properties": dict(value) # 关系的属性
             }
-        elif hasattr(value, 'nodes') and hasattr(value, 'relationships'): # Path
+            
+        elif isinstance(value, Path):
+            # Path对象包含一系列交替的节点和关系
             return {
                 "nodes": [self._convert_neo4j_value_to_json_serializable(n) for n in value.nodes],
                 "relationships": [self._convert_neo4j_value_to_json_serializable(r) for r in value.relationships]
             }
+            
         elif isinstance(value, list) or isinstance(value, tuple) or isinstance(value, set):
             return [self._convert_neo4j_value_to_json_serializable(item) for item in value]
-        elif isinstance(value, dict): # Python dict, not Neo4j Node/Relationship as dict
+            
+        elif isinstance(value, dict):
+            # 检查是否已经是我们转换后的格式，避免重复处理和无限递归
+            if "_element_id" in value and ("_labels" in value or "_type" in value): 
+                return value
             return {k: self._convert_neo4j_value_to_json_serializable(v) for k, v in value.items()}
+            
         elif isinstance(value, (str, int, float, bool)) or value is None:
             return value
+            
         else:
-            kg_logger.warning(f"Encountered an unhandled Neo4j type ({type(value)}), converting to string: {str(value)}")
-            return str(value)
+            kg_logger.warning(f"KGRetriever: Encountered an unhandled Neo4j type ({type(value)}), attempting to convert to string: {str(value)}")
+            try:
+                return str(value)
+            except Exception as e_str:
+                kg_logger.error(f"KGRetriever: Failed to convert unhandled type {type(value)} to string: {e_str}")
+                return f"[Unserializable object: {type(value)}]"
 
     def execute_cypher_query_sync(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not self._driver:
             kg_logger.error("Neo4j driver not initialized in execute_cypher_query_sync.")
-            return []
-        
-        kg_logger.debug(f"Executing SYNC Cypher: {query} with params: {parameters}")
+            return []        
+        kg_logger.info(f"--- Executing SYNC Cypher ---") # <--- 修改日志级别为INFO，确保能看到
+        kg_logger.info(f"Query: {query}")
+        kg_logger.info(f"Params: {parameters}")
         results_list: List[Dict[str, Any]] = []
         try:
             with self._driver.session(database=self.NEO4J_DATABASE) as session:
                 result_obj: Result = session.run(query, parameters)
-                for record_instance in result_obj: # record_instance is a Record object
+                raw_records = list(result_obj) # 将迭代器具体化为列表
+                kg_logger.info(f"Neo4j raw_records count: {len(raw_records)}")
+
+                for record_instance in raw_records: 
                     record_as_dict = {}
                     for key, value in record_instance.items():
                         record_as_dict[key] = self._convert_neo4j_value_to_json_serializable(value)
                     results_list.append(record_as_dict)
-            kg_logger.debug(f"SYNC Cypher executed. Records: {len(results_list)}")
+
+            # --- 打印转换后的结果数量和前几条 ---
+            kg_logger.info(f"SYNC Cypher executed. Converted records count: {len(results_list)}")
+            if results_list:
+                kg_logger.debug(f"First converted record (sample): {json.dumps(results_list[0], ensure_ascii=False, indent=2)}")
+            else:
+                kg_logger.debug("No records converted.")
+                
         except Exception as e:
-            kg_logger.error(f"Failed to execute SYNC Cypher query: {query}. Error: {e}", exc_info=True)
+            kg_logger.error(f"Failed to execute SYNC Cypher query: '{query}' with params: {parameters}. Error: {e}", exc_info=True)
         return results_list
 
     def _format_neo4j_record_for_retrieval(self, record_data: Dict[str, Any]) -> str:
