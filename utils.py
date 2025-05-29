@@ -5,9 +5,70 @@ import json
 import traceback
 import os
 from dotenv import load_dotenv
+from datetime import datetime, timezone # <--- 添加
+import uuid # <--- 添加
+import logging # <--- 添加
+import asyncio # <--- 添加
+
 load_dotenv()
 
+# --- 添加一个utils模块的logger (新添加) ---
+utils_logger = logging.getLogger("UtilsLogger")
+utils_logger.setLevel(logging.INFO)
+if not utils_logger.hasHandlers():
+    _utils_console_handler = logging.StreamHandler()
+    _utils_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s')
+    _utils_console_handler.setFormatter(_utils_formatter)
+    utils_logger.addHandler(_utils_console_handler)
+    utils_logger.propagate = False
+utils_logger.info("--- UtilsLogger configured ---")
+# --- 结束logger配置 ---
+
+
 MCPO_BASE_URL = os.getenv("MCPO_BASE_URL", "http://localhost:8006")
+
+# --- 通用交互日志记录 (新添加) ---
+# RAG_EVAL_DATA_DIR 的定义：utils.py 位于 zhz_agent 目录下
+# 我们希望 rag_eval_data 也在 zhz_agent 目录下
+_UTILS_DIR = os.path.dirname(os.path.abspath(__file__)) # zhz_agent 目录
+RAG_EVAL_DATA_DIR = os.path.join(_UTILS_DIR, 'rag_eval_data')
+
+if not os.path.exists(RAG_EVAL_DATA_DIR):
+    try:
+        os.makedirs(RAG_EVAL_DATA_DIR)
+        utils_logger.info(f"Successfully created directory for interaction logs: {RAG_EVAL_DATA_DIR}")
+    except Exception as e:
+        utils_logger.error(f"Error creating directory {RAG_EVAL_DATA_DIR}: {e}. Please create it manually.")
+
+def get_interaction_log_filepath(log_type_prefix: str = "interaction") -> str:
+    """获取当前交互日志文件的完整路径，按天分割。"""
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    # 所有日志写入同一个文件，方便统一处理和按时间排序
+    return os.path.join(RAG_EVAL_DATA_DIR, f"rag_interactions_{today_str}.jsonl")
+
+async def log_interaction_data(interaction_data: dict):
+    """
+    将单条交互数据异步追加到JSONL文件中。
+    确保 interaction_data 包含 'timestamp_utc' 和 'interaction_id' (如果外部未提供，则在此处生成)。
+    """
+    filepath = get_interaction_log_filepath()
+
+    # 确保核心字段存在
+    if "timestamp_utc" not in interaction_data:
+        interaction_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+    if "interaction_id" not in interaction_data:
+        interaction_data["interaction_id"] = str(uuid.uuid4())
+
+    try:
+        def _write_sync():
+            with open(filepath, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(interaction_data, ensure_ascii=False) + "\n")
+        
+        await asyncio.to_thread(_write_sync)
+        # utils_logger.debug(f"Successfully logged interaction (type: {interaction_data.get('task_type', 'N/A')}) to {filepath}")
+    except Exception as e:
+        utils_logger.error(f"Failed to log interaction data to {filepath}: {e}", exc_info=True)
+# --- 结束通用交互日志记录 ---
 
 async def call_mcpo_tool(tool_name_with_prefix: str, payload: dict):
     """

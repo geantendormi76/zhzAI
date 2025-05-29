@@ -102,3 +102,5 @@ ehthumbs.db
 Thumbs.db
 
 local_models/
+
+rag_eval_data

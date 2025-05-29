@@ -10,6 +10,10 @@ from dataclasses import dataclass, field # 确保导入 field
 import time
 import logging
 import sys
+import hashlib # <--- 添加
+from datetime import datetime, timezone # <--- 添加
+import uuid # <--- 添加
+
 
 # MCP 框架导入
 from mcp.server.fastmcp import FastMCP, Context
@@ -37,39 +41,37 @@ except Exception as e:
 
 
 # --- 从项目内部导入所有 RAG 模块 ---
-from zhz_agent.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument # QueryRequest 和 HybridRAGResponse 可能需要定义或调整
+from zhz_agent.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
 from zhz_agent.llm import (
-    generate_answer_from_context, 
-    generate_expanded_queries, 
-    generate_cypher_query, # KGRetriever 会用
-    generate_clarification_question, 
-    generate_intent_classification, 
-    # generate_clarification_options, # 似乎未使用
+    generate_answer_from_context,
+    generate_expanded_queries,
+    generate_cypher_query,
+    generate_clarification_question,
+    generate_intent_classification,
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
-# from zhz_agent.vector import VectorRetriever # 不再使用旧的
-from zhz_agent.kg import KGRetriever
-from zhz_agent.fusion import FusionEngine 
-# from zhz_agent.bm25 import BM25Retriever # 不再使用旧的
-
-# --- 导入新的检索器 ---
 from zhz_agent.chromadb_retriever import ChromaDBRetriever
 from zhz_agent.file_bm25_retriever import FileBM25Retriever
-
+from zhz_agent.kg import KGRetriever
+from zhz_agent.fusion import FusionEngine
+from zhz_agent.utils import log_interaction_data
 
 from dotenv import load_dotenv
-# 加载 .env 文件，通常在项目根目录
-# __file__ 是当前 rag_service.py 的路径
-# os.path.join(os.path.dirname(__file__), '..', '.env') 假设 .env 在 zhz_agent 包的上一级目录
-dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+
+# 加载 .env 文件
+# __file__ 是当前 rag_service.py 的路径: /home/zhz/zhz_agent/rag_service.py
+# os.path.dirname(os.path.abspath(__file__)) 是 /home/zhz/zhz_agent 目录
+# .env 文件与 rag_service.py 在同一个目录下 (zhz_agent 目录)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+dotenv_path = os.path.join(current_dir, '.env')
+
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path=dotenv_path)
     rag_logger.info(f"Loaded .env file from: {dotenv_path}")
 else:
     rag_logger.warning(f".env file not found at {dotenv_path}, will rely on environment variables or defaults.")
-    # 尝试加载当前目录的 .env (如果 rag_service.py 被直接运行且.env在同级)
+    # 仍然尝试加载，因为python-dotenv的默认行为是查找当前工作目录和上级目录的.env
     load_dotenv()
-
 
 # --- 应用上下文 Dataclass ---
 @dataclass
@@ -380,22 +382,94 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                 "retrieved_context_docs": [doc.model_dump() for doc in final_context_docs], # 返回用于生成答案的文档
                 "debug_info": {"total_raw_retrievals_count": len(all_raw_retrievals)}
             }
-        
+
+        # --- 添加顶层RAG交互日志记录 (新添加) ---
+        if response_payload.get("status") == "success" and final_answer_from_llm and final_context_docs:
+            try:
+                context_content_for_hash = " ".join(sorted([doc.content for doc in final_context_docs]))
+                context_hash = hashlib.md5(context_content_for_hash.encode('utf-8')).hexdigest()
+                current_app_version = "0.1.0" # 假设的应用版本，后续可以从配置读取
+
+                top_level_rag_log_data = {
+                    # "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    # "interaction_id": str(uuid.uuid4()),
+                    "task_type": "rag_query_processing_success", # 更具体的类型
+                    "user_query": original_query_for_response,
+                    "processed_llm_output": final_answer_from_llm,
+                    "retrieved_context_hash": context_hash,
+                    "retrieved_documents_summary": [
+                        {"source": doc.source_type,
+                         "score": doc.score,
+                         "id": doc.metadata.get("chunk_id") if doc.metadata else doc.metadata.get("id") if doc.metadata else None, # 尝试获取chunk_id或id
+                         "content_preview": doc.content[:50] + "..." if doc.content else ""} # 添加内容预览
+                        for doc in final_context_docs
+                    ],
+                    "final_context_docs_count": len(final_context_docs),
+                    "application_version": current_app_version
+                }
+                # rag_logger.info(f"TOP_LEVEL_RAG_SUCCESS_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
+                await log_interaction_data(top_level_rag_log_data)
+            except Exception as e_log_rag:
+                rag_logger.error(f"Error during top-level RAG success logging: {e_log_rag}", exc_info=True)
+        elif response_payload.get("status") == "clarification_needed":
+            try:
+                current_app_version = "0.1.0"
+                top_level_rag_log_data = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "interaction_id": str(uuid.uuid4()),
+                    "task_type": "rag_clarification_needed",
+                    "user_query": original_query_for_response,
+                    "clarification_question": response_payload.get("clarification_question"),
+                    "uncertainty_reason": response_payload.get("debug_info", {}).get("uncertainty_reason"),
+                    "application_version": current_app_version
+                }
+                # rag_logger.info(f"TOP_LEVEL_RAG_CLARIFICATION_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
+                await log_interaction_data(top_level_rag_log_data)
+            except Exception as e_log_clarify:
+                rag_logger.error(f"Error during top-level RAG clarification logging: {e_log_clarify}", exc_info=True)
+        # --- 结束顶层RAG交互日志记录 ---
+
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
         rag_logger.info(f"--- 'query_rag_v2' 成功执行完毕, 总耗时: {time.time() - start_time_total:.2f}s. 返回JSON响应 ---")
         
-    except Exception as e:
-        # ... (异常处理与您之前的代码类似) ...
-        rag_logger.error(f"RAG Service CRITICAL ERROR in 'query_rag_v2': {type(e).__name__} - {str(e)}", exc_info=True)
-        response_payload = { 
+        sys.stdout.flush(); sys.stderr.flush() #确保在 try 块内，return 前
+        return final_json_output
+
+    except Exception as e_main:
+        rag_logger.error(f"RAG Service CRITICAL ERROR in 'query_rag_v2' (main try-except): {type(e_main).__name__} - {str(e_main)}", exc_info=True)
+        
+        # 确保 original_query_for_response 在此作用域内有效
+        # 如果 query_rag_v2 的参数就是 query，且 original_query_for_response 在 try 开始时被赋值为 query
+        user_query_for_err_log = original_query_for_response if 'original_query_for_response' in locals() and original_query_for_response else query
+        
+        response_payload = {
             "status": "error",
             "error_code": "RAG_SERVICE_INTERNAL_ERROR",
-            "error_message": f"RAG服务内部发生未预期错误: {str(e)}",
-            "original_query": original_query_for_response,
-            "debug_info": {"exception_type": type(e).__name__}
+            "error_message": f"RAG服务内部发生未预期错误: {str(e_main)}",
+            "original_query": user_query_for_err_log,
+            "debug_info": {"exception_type": type(e_main).__name__}
         }
+
+        # --- 添加顶层RAG错误日志记录 ---
+        try:
+            current_app_version = "0.1.0"
+            top_level_rag_error_log_data = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "interaction_id": str(uuid.uuid4()),
+                "task_type": "rag_query_processing_error",
+                "user_query": user_query_for_err_log,
+                "error_message": str(e_main),
+                "error_type": type(e_main).__name__,
+                "traceback": traceback.format_exc(),
+                "application_version": current_app_version
+            }
+            # rag_logger.info(f"TOP_LEVEL_RAG_ERROR_LOG: {json.dumps(top_level_rag_error_log_data, ensure_ascii=False)}")
+            await log_interaction_data(top_level_rag_error_log_data)
+        except Exception as e_log_err_inner:
+            rag_logger.error(f"CRITICAL: Error during top-level RAG error logging itself: {e_log_err_inner}", exc_info=True)
+        # --- 结束顶层RAG错误日志记录 ---
+
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
-    
     sys.stdout.flush(); sys.stderr.flush()
     return final_json_output
 

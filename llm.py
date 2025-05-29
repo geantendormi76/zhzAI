@@ -6,8 +6,43 @@ import asyncio # 用于 asyncio.to_thread
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import traceback # Ensure traceback is imported
+from zhz_agent.utils import log_interaction_data # <--- 添加: 导入通用日志函数
 import logging
+import uuid # <--- 添加: 用于生成 interaction_id
+from datetime import datetime, timezone # <--- 添加: 用于生成时间戳
 load_dotenv() # 确保加载.env文件
+
+# --- 日志文件配置 (新添加) ---
+RAG_EVAL_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rag_eval_data')
+# 确保目录存在，如果不存在则创建
+if not os.path.exists(RAG_EVAL_DATA_DIR):
+    try:
+        os.makedirs(RAG_EVAL_DATA_DIR)
+        print(f"Successfully created directory: {RAG_EVAL_DATA_DIR}")
+    except Exception as e:
+        print(f"Error creating directory {RAG_EVAL_DATA_DIR}: {e}. Please create it manually.")
+
+def get_llm_log_filepath() -> str:
+    """获取当前LLM交互日志文件的完整路径，按天分割。"""
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return os.path.join(RAG_EVAL_DATA_DIR, f"llm_interactions_{today_str}.jsonl")
+
+async def log_llm_interaction_to_jsonl(interaction_data: Dict[str, Any]):
+    """
+    将单条LLM交互数据异步追加到JSONL文件中。
+    """
+    filepath = get_llm_log_filepath()
+    try:
+        def _write_sync():
+            with open(filepath, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(interaction_data, ensure_ascii=False) + "\n")
+
+        await asyncio.to_thread(_write_sync)
+        llm_py_logger.debug(f"Successfully logged LLM interaction to {filepath}")
+    except Exception as e:
+        llm_py_logger.error(f"Failed to log LLM interaction to {filepath}: {e}", exc_info=True)
+# --- 结束日志文件配置 ---
+
 
 # --- 为 llm.py 配置一个logger ---
 llm_py_logger = logging.getLogger("LLMUtilsLogger") # 给一个独特的名字
@@ -40,12 +75,18 @@ NO_ANSWER_PHRASE_KG_WITH_STOP_TOKEN = f"{NO_ANSWER_PHRASE_KG_CLEAN}{UNIQUE_STOP_
 SGLANG_API_URL = os.getenv("SGLANG_API_URL") 
 # 确保SGLang服务正在运行，并且这个URL是正确的
 
-async def call_sglang_llm(prompt: str, 
-                          temperature: float = 0.2, 
+async def call_sglang_llm(prompt: str,
+                          temperature: float = 0.2,
                           max_new_tokens: Optional[int] = 1024,
-                          stop_sequences: Optional[List[str]] = None) -> Optional[str]:
-    
-    llm_py_logger.debug(f"Attempting to call SGLang LLM. Prompt (first 100 chars): {prompt[:100]}...") # 例如替换
+                          stop_sequences: Optional[List[str]] = None,
+                          # --- 添加以下参数用于日志记录 (添加) ---
+                          task_type: str = "unknown", # 例如: "cypher_generation", "answer_generation"
+                          user_query_for_log: Optional[str] = None, # 顶层用户查询
+                          model_name_for_log: str = "qwen2.5-3b-instruct", # 假设默认
+                          application_version_for_log: str = "0.1.0" # 假设版本
+                          ) -> Optional[str]:
+
+    llm_py_logger.debug(f"Attempting to call SGLang LLM. Task: {task_type}, Prompt (first 100 chars): {prompt[:100]}...") 
 
     payload = {
         "text": prompt,
@@ -56,6 +97,16 @@ async def call_sglang_llm(prompt: str,
         }
     }
     headers = {"Content-Type": "application/json"}
+    # --- 为日志准备 llm_parameters (添加) ---
+    llm_parameters_for_log = {
+        "model": model_name_for_log,
+        "temperature": temperature,
+        "max_new_tokens": max_new_tokens,
+        "stop_sequences": stop_sequences if stop_sequences else []
+    }
+    # --- 结束日志参数准备 ---
+    raw_llm_output_text = None # <--- (添加) 初始化变量
+    processed_llm_output_text = None # <--- (添加) 初始化变量
 
     try:
         print(f"[LLM_DEBUG] Payload constructed. SGLANG_API_URL: {SGLANG_API_URL}")
@@ -67,22 +118,38 @@ async def call_sglang_llm(prompt: str,
             response.raise_for_status()
             print("[LLM_DEBUG] response.raise_for_status() passed.")
 
-            response_json = response.json() # 尝试解析JSON
+            response_json = response.json()
             print("[LLM_DEBUG] response.json() successful.")
-            
-            llm_output_text = response_json.get("text", "[[TEXT_FIELD_NOT_FOUND]]").strip() # 获取text字段，如果不存在则用特殊标记
+
+            raw_llm_output_text = response_json.get("text", "[[TEXT_FIELD_NOT_FOUND]]").strip() # <--- (修改) 赋值给 raw_llm_output_text
             print(f"\n<<<<<<<<<< SGLANG LLM INPUT PROMPT START (call_sglang_llm) >>>>>>>>>>\n{prompt}\n<<<<<<<<<< SGLANG LLM INPUT PROMPT END >>>>>>>>>>\n")
-            print(f"\n>>>>>>>>>> SGLANG LLM RAW OUTPUT TEXT START (call_sglang_llm) >>>>>>>>>>\n{llm_output_text}\n>>>>>>>>>> SGLANG LLM RAW OUTPUT TEXT END >>>>>>>>>>\n")
-            llm_py_logger.debug(f"Full SGLang raw response JSON: {response.text}") # 例如替换
+            print(f"\n>>>>>>>>>> SGLANG LLM RAW OUTPUT TEXT START (call_sglang_llm) >>>>>>>>>>\n{raw_llm_output_text}\n>>>>>>>>>> SGLANG LLM RAW OUTPUT TEXT END >>>>>>>>>>\n")
+            llm_py_logger.debug(f"Full SGLang raw response JSON: {response.text}")
 
             meta_info = response_json.get("meta_info", {})
             finish_reason = meta_info.get("finish_reason", {})
             print(f"[LLM_DEBUG] Meta info: {meta_info}, Finish reason: {finish_reason}")
 
             if finish_reason.get("type") == "stop" and finish_reason.get("matched") == UNIQUE_STOP_TOKEN:
-                return llm_output_text.split(UNIQUE_STOP_TOKEN)[0].strip() if llm_output_text and llm_output_text != "[[TEXT_FIELD_NOT_FOUND]]" else NO_ANSWER_PHRASE_ANSWER_CLEAN
-            
-            return llm_output_text if llm_output_text != "[[TEXT_FIELD_NOT_FOUND]]" else None
+                processed_llm_output_text = raw_llm_output_text.split(UNIQUE_STOP_TOKEN)[0].strip() if raw_llm_output_text and raw_llm_output_text != "[[TEXT_FIELD_NOT_FOUND]]" else NO_ANSWER_PHRASE_ANSWER_CLEAN # <--- (修改)
+            else:
+                processed_llm_output_text = raw_llm_output_text if raw_llm_output_text != "[[TEXT_FIELD_NOT_FOUND]]" else None # <--- (修改)
+
+            # --- 日志记录 (修改为调用通用函数) ---
+            interaction_log_data = {
+                # timestamp_utc 和 interaction_id 会由 log_interaction_data 自动添加 (如果未提供)
+                "task_type": task_type, # task_type 已经作为参数传入 call_sglang_llm
+                "user_query": user_query_for_log,
+                "llm_input_prompt": prompt,
+                "llm_parameters": llm_parameters_for_log,
+                "raw_llm_output": raw_llm_output_text,
+                "processed_llm_output": processed_llm_output_text,
+                "application_version": application_version_for_log
+            }
+            await log_interaction_data(interaction_log_data) # <--- 修改: 调用通用函数
+            # --- 结束日志记录 ---
+
+            return processed_llm_output_text # <--- (修改) 返回处理后的文本
 
     except httpx.HTTPStatusError as e: # 更具体的HTTP错误
         print(f"[LLM_DEBUG] httpx.HTTPStatusError: {e}")
@@ -103,8 +170,21 @@ async def call_sglang_llm(prompt: str,
     except Exception as e:
         print(f"[LLM_DEBUG] Unknown error in call_sglang_llm: {type(e).__name__} - {e}")
         traceback.print_exc()
+        # --- 即使异常也要尝试记录 (修改为调用通用函数) ---
+        error_log_data = { # <--- (修改) 组装数据字典
+            "task_type": task_type,
+            "user_query": user_query_for_log,
+            "llm_input_prompt": prompt if 'prompt' in locals() else "Prompt not available",
+            "llm_parameters": llm_parameters_for_log if 'llm_parameters_for_log' in locals() else {},
+            "raw_llm_output": f"Error: {type(e).__name__} - {str(e)}. Partial raw output: {raw_llm_output_text if 'raw_llm_output_text' in locals() and raw_llm_output_text else 'N/A'}",
+            "processed_llm_output": None,
+            "error_details": traceback.format_exc(), # 添加错误详情
+            "application_version": application_version_for_log
+        }
+        await log_interaction_data(error_log_data) # <--- 修改: 调用通用函数
+        # --- 结束异常时的日志记录 ---
         return None
-
+    
 async def generate_answer_from_context(user_query: str, context: str) -> Optional[str]:
     
     prompt = f"""<|im_start|>system
@@ -139,9 +219,16 @@ async def generate_answer_from_context(user_query: str, context: str) -> Optiona
 <|im_start|>assistant
 """
     stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN] 
-    
-    # 保持较低的temperature以获取更确定的答案，除非特定任务需要创造性
-    return await call_sglang_llm(prompt, temperature=0.05, max_new_tokens=512, stop_sequences=stop_sequences)# 降低温度，鼓励直接提取
+    # --- 修改调用 call_sglang_llm 以传递日志参数 (修改) ---
+    return await call_sglang_llm(
+        prompt,
+        temperature=0.05,
+        max_new_tokens=512,
+        stop_sequences=stop_sequences,
+        task_type="answer_generation", # <--- 添加
+        user_query_for_log=user_query, # <--- 添加
+        # model_name_for_log 和 application_version_for_log 可以使用 call_sglang_llm 的默认值
+    )
 
 async def generate_simulated_kg_query_response(user_query: str, kg_schema_description: str, kg_data_summary_for_prompt: str) -> Optional[str]:
     """
@@ -165,8 +252,15 @@ async def generate_simulated_kg_query_response(user_query: str, kg_schema_descri
 <|im_start|>assistant
 """
     stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN]
-    
-    return await call_sglang_llm(prompt, temperature=0.5, max_new_tokens=256, stop_sequences=stop_sequences)
+    # --- 修改调用 call_sglang_llm (修改) ---
+    return await call_sglang_llm(
+        prompt,
+        temperature=0.5,
+        max_new_tokens=256,
+        stop_sequences=stop_sequences,
+        task_type="simulated_kg_query_response", # <--- 添加
+        user_query_for_log=user_query # <--- 添加
+    )
 
 async def generate_expanded_queries(original_query: str) -> List[str]:
     """
@@ -194,11 +288,14 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     stop_sequences = ["<|im_end|>"]
     
     print(f"调用SGLang LLM API进行查询扩展 (Prompt长度: {len(prompt)} 字符)...")
+    # --- 修改调用 call_sglang_llm (修改) ---
     llm_output = await call_sglang_llm(
-        prompt, 
-        temperature=0.7, # 稍高温度，鼓励生成多样性
-        max_new_tokens=512, # 允许生成较长的JSON列表
-        stop_sequences=stop_sequences
+        prompt,
+        temperature=0.7,
+        max_new_tokens=512,
+        stop_sequences=stop_sequences,
+        task_type="query_expansion", # <--- 添加
+        user_query_for_log=original_query # <--- 添加
     )
     expanded_queries = []
     if llm_output:
@@ -294,11 +391,16 @@ async def generate_cypher_query(user_question: str, kg_schema_description: str) 
     # ... (后续的LLM调用和后处理逻辑与您当前版本一致) ...
     stop_sequences = ["<|im_end|>", "无法生成Cypher查询。"] 
     
+    # --- 修改调用 call_sglang_llm (修改) ---
     cypher_query = await call_sglang_llm(
-        prompt, 
-        temperature=0.0, 
-        max_new_tokens=400, # 稍微增加一点，以防复杂查询需要更多空间
-        stop_sequences=stop_sequences
+        prompt,
+        temperature=0.0,
+        max_new_tokens=400,
+        stop_sequences=stop_sequences,
+        task_type="cypher_generation", # <--- 添加
+        user_query_for_log=user_question # <--- 添加
+        # 可以考虑将 kg_schema_description 的版本号或哈希值也记录下来
+        # 例如，在 interaction_log_data 中添加 "kg_schema_version": "v4_final"
     )
     
     if not cypher_query or cypher_query.strip() == "" or cypher_query.strip().lower() == "无法生成cypher查询。" or "无法生成cypher查询" in cypher_query.strip().lower():
@@ -340,11 +442,14 @@ async def generate_clarification_question(original_query: str, uncertainty_reaso
 """
     stop_sequences = ["<|im_end|>"]
     print(f"调用SGLang LLM API生成澄清问题 (Prompt长度: {len(prompt)} 字符)...")
+    # --- 修改调用 call_sglang_llm (修改) ---
     clarification_question = await call_sglang_llm(
-        prompt, 
-        temperature=0.5, # 适中温度，鼓励生成合理的问题
-        max_new_tokens=128, # 澄清问题通常不会太长
-        stop_sequences=stop_sequences
+        prompt,
+        temperature=0.5,
+        max_new_tokens=128,
+        stop_sequences=stop_sequences,
+        task_type="clarification_question_generation", # <--- 添加
+        user_query_for_log=original_query # <--- 添加
     )
     if not clarification_question or clarification_question.strip() == "":
         print("LLM未能生成澄清问题，返回默认提示。")
@@ -384,11 +489,14 @@ async def generate_clarification_options(original_query: str, uncertainty_reason
 """
     stop_sequences = ["<|im_end|>"]
     print(f"调用SGLang LLM API生成澄清选项 (Prompt长度: {len(prompt)} 字符)...")
+    # --- 修改调用 call_sglang_llm (修改) ---
     llm_output = await call_sglang_llm(
         prompt,
-        temperature=0.7, # 稍高温度，鼓励生成多样性
+        temperature=0.7,
         max_new_tokens=256,
-        stop_sequences=stop_sequences
+        stop_sequences=stop_sequences,
+        task_type="clarification_options_generation", # <--- 添加
+        user_query_for_log=original_query # <--- 添加
     )
 
     options = []
@@ -489,11 +597,14 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
     stop_sequences = ["<|im_end|>"]
     print(f"调用SGLang LLM API进行意图分类 (Prompt长度: {len(prompt)} 字符)...")
 
+    # --- 修改调用 call_sglang_llm (修改) ---
     llm_output = await call_sglang_llm(
         prompt,
-        temperature=0.1, # 较低温度，鼓励生成结构化、确定的答案
+        temperature=0.1,
         max_new_tokens=256,
-        stop_sequences=stop_sequences
+        stop_sequences=stop_sequences,
+        task_type="intent_classification", # <--- 添加
+        user_query_for_log=user_query # <--- 添加
     )
 
     if llm_output:
