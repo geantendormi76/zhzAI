@@ -278,5 +278,5 @@ if __name__ == '__main__':
             else:
                 eval_logger.warning(f"Evaluation failed or returned None for {case['id']}")
 
-    # os.environ["USE_SIMULATED_GEMINI_CYPHER_EVAL"] = "true" # Enable for simulation
+    os.environ["USE_SIMULATED_GEMINI_CYPHER_EVAL"] = "true" # Enable for simulation
     asyncio.run(test_cypher_evaluation()) # Uncomment to run tests

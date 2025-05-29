@@ -1,3 +1,5 @@
+# zhz_agent/constants.py
+
 NEW_KG_SCHEMA_DESCRIPTION = """
 你的任务是根据用户的问题，严格利用以下【知识图谱Schema信息】生成一个或多个Cypher查询。
 
