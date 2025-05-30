@@ -66,7 +66,61 @@ def construct_qwen_input_prompt(user_question: str, schema_description: str) -> 
     # 注意：这里使用了最新的V7版本（或您当前使用的版本）的Schema描述作为基础
     # 如果您的 generate_cypher_query 中的模板不同，请相应调整
     prompt = f"""<|im_start|>system
+你是顶级Neo4j Cypher查询生成专家。你的任务是根据用户问题和严格提供的【知识图谱Schema】，生成一个【语法正确】、【逻辑合理】且【高效】的Cypher查询。
+
+**【核心指令与约束 - 必须严格遵守！】**
+
+1.  **【Schema绝对绑定 - 最高优先级】**:
+    *   你生成的Cypher查询中所有用到的【节点标签】、【关系类型】、【属性名称】及其对应的【数据类型】，都**必须严格存在于**下面提供的 "知识图谱Schema描述" 中。
+    *   在构建查询的每一步，都要反复与Schema核对。**严禁臆断、猜测或使用任何Schema中未明确定义的元素。**
+    *   **属性名称的大小写和确切拼写必须与Schema完全一致。**
+    *   **关系类型的名称和方向必须与Schema完全一致。** 例如，如果Schema定义为 `(Person)-[:WORKS_ON]->(Project)`，则查询中不能是 `(Project)-[:WORKS_ON]->(Person)`，除非Schema中也定义了反向关系。
+
+2.  **【纯净输出格式 - 严格要求】**:
+    *   如果能生成有效查询，你的回答**必须只包含纯粹的Cypher查询语句本身**。
+    *   如果根据问题和Schema无法生成有效的Cypher查询（例如，问题超出了Schema表达能力，或问题本身逻辑不通），则**必须只输出固定的短语：“无法生成Cypher查询。”**
+    *   **绝对禁止**在有效的Cypher语句前后添加任何前缀（如“Cypher查询: ”）、后缀、解释、注释、markdown标记（如 ```cypher ```）或任何其他多余的文本。
+
+3.  **【属性与值的使用】**:
+    *   当在`WHERE`子句中对属性进行匹配时，确保值的类型与Schema中定义的属性类型一致。例如，如果`name`是字符串，则匹配 `name: '张三'`；如果`year`是数字，则匹配 `year: 2023`。
+    *   对于数值计算（如`SUM`, `AVG`），**必须**使用Schema中明确指定的数字类型属性（例如，`SalesAmount`节点的 `numeric_amount`）。
+
+4.  **【查询构建逻辑指引】**:
+    *   **实体识别**: 准确识别用户问题中的核心实体及其在Schema中对应的节点标签和属性。
+    *   **关系路径**: 基于问题和Schema构建清晰的`MATCH`路径。
+    *   **条件过滤**: 使用`WHERE`子句添加必要的过滤条件。
+    *   **结果返回**: 使用`RETURN`子句指定需要返回的信息，并用`AS`为返回的列指定清晰、合法的别名（字母或下划线开头）。
+    *   **多步查询**: 对于需要关联多个信息点的问题，合理使用`WITH`传递中间结果。
+    *   **聚合**: 如需统计或汇总，正确使用`COUNT()`, `SUM()`, `COLLECT()`等聚合函数。
+
+**【知识图谱Schema描述】**:
 {schema_description}
+
+**【查询示例 - 严格基于上述Schema】**:
+
+*   用户问题: "张三参与了哪个项目？"
+    Cypher查询: MATCH (p:Person {{name: '张三'}})-[:WORKS_ON]->(proj:Project) RETURN proj.name AS projectName
+
+*   用户问题: "华东区域2024年第一季度的销售额是多少？"
+    Cypher查询: MATCH (r:Region {{name: '华东'}})-[:HAS_SALES_AMOUNT]->(sa:SalesAmount {{period: '2024年第一季度'}}) RETURN sa.numeric_amount AS salesAmount, sa.unit AS salesUnit
+
+*   用户问题: "查询所有产品的名称。"
+    Cypher查询: MATCH (prod:Product) RETURN prod.name AS productName
+
+*   用户问题: "项目X有哪些人参与？"
+    Cypher查询: MATCH (p:Person)-[:WORKS_ON]->(proj:Project {{name: '项目X'}}) RETURN p.name AS participantName
+
+*   用户问题: "2024年第一季度所有区域的总销售额是多少？"
+    Cypher查询: MATCH (r:Region)-[:HAS_SALES_AMOUNT]->(sa:SalesAmount {{period: '2024年第一季度'}}) RETURN sum(sa.numeric_amount) AS totalSales, sa.unit AS commonUnit LIMIT 1 
+    (此查询假设所有相关销售额的单位是相同的，并取第一个出现的单位作为代表)
+
+*   用户问题: "与新产品A相关的文档ID是什么？"
+    Cypher查询: MATCH (p:Product {{name: '新产品A'}})-[:RELATED_TO]->(d:Document) RETURN d.id AS documentId
+
+*   用户问题: "公司CEO是谁？" (假设Schema中没有CEO信息)
+    Cypher查询: 无法生成Cypher查询。
+
+现在，请根据以下用户问题和上述Schema及规则生成Cypher查询。
 <|im_end|>
 <|im_start|>user
 用户问题: {user_question}
@@ -96,67 +150,123 @@ def generate_finetune_samples_for_cypher(
             continue
         processed_ids.add(interaction_id)
 
-        user_question = rag_log.get("user_query") # 这是 llm.py 中记录的 user_query_for_log
-        qwen_generated_cypher = rag_log.get("processed_llm_output")
-        # 原始输入给Qwen的Prompt，理论上应该从rag_log的 "llm_input_prompt" 获取
-        # 如果没有记录完整prompt，我们就用 user_question 和最新的 Schema Prompt 来重构
+        user_question = rag_log.get("user_query")
+        qwen_generated_cypher_raw = rag_log.get("processed_llm_output") # 这是Qwen原始输出
+
+        # --- 改进点: 处理Qwen输出为空或仅包含空白的情况 ---
+        if qwen_generated_cypher_raw is None or not qwen_generated_cypher_raw.strip():
+            qwen_generated_cypher = "无法生成Cypher查询." # 将空输出也视为无法生成
+            refine_logger.info(f"Interaction {interaction_id}: Qwen output was empty/None, treating as '无法生成Cypher查询.'.")
+        else:
+            qwen_generated_cypher = qwen_generated_cypher_raw.strip()
+
+
         qwen_input_prompt = rag_log.get("llm_input_prompt")
-        if not qwen_input_prompt: # 如果原始日志没有存完整输入prompt
+        if not qwen_input_prompt:
             if user_question:
                 qwen_input_prompt = construct_qwen_input_prompt(user_question, NEW_KG_SCHEMA_DESCRIPTION)
             else:
                 refine_logger.warning(f"Skipping Cypher log {interaction_id} due to missing user_question for prompt reconstruction.")
                 continue
         
-        if not user_question or qwen_generated_cypher is None: # qwen_generated_cypher可能是空字符串
-            refine_logger.warning(f"Skipping Cypher log {interaction_id} due to missing user_question or qwen_generated_cypher.")
+        if not user_question: # qwen_generated_cypher 已确保非None
+            refine_logger.warning(f"Skipping Cypher log {interaction_id} due to missing user_question.")
             continue
 
         ideal_cypher_output = None
         source_of_ideal = "unknown"
+        gemini_score_for_log = None # 用于记录
 
         eval_log = cypher_evaluation_logs.get(interaction_id)
 
         if eval_log and eval_log.get("eval_llm_processed_output_json"):
             eval_json = eval_log["eval_llm_processed_output_json"]
-            overall_score = eval_json.get("evaluation_summary", {}).get("overall_quality_score_cypher")
-            gemini_suggestion = eval_json.get("suggestion_for_improvement_cypher", "").strip()
-
-            try: # 尝试将评分转为整数
-                overall_score = int(overall_score)
+            overall_score_str = eval_json.get("evaluation_summary", {}).get("overall_quality_score_cypher")
+            gemini_suggestion_raw = eval_json.get("suggestion_for_improvement_cypher", "").strip()
+            
+            try:
+                overall_score = int(overall_score_str)
+                gemini_score_for_log = overall_score
             except (ValueError, TypeError):
-                refine_logger.warning(f"Could not parse overall_quality_score_cypher for {interaction_id}: {overall_score}")
+                refine_logger.warning(f"Could not parse overall_quality_score_cypher for {interaction_id}: {overall_score_str}")
                 overall_score = 0 # 默认给个低分
+                gemini_score_for_log = 0
 
-            if overall_score >= 4: # 假设4分及以上认为是高质量的
+            # --- 规则1: Qwen自己就说无法生成 ---
+            if qwen_generated_cypher == "无法生成Cypher查询.":
+                # 如果Gemini也认为无法生成或评分低，那么采纳
+                if "无法生成Cypher查询" in gemini_suggestion_raw or overall_score <= 2:
+                    ideal_cypher_output = "无法生成Cypher查询."
+                    source_of_ideal = "qwen_and_gemini_cannot_generate"
+                # 如果Qwen说无法生成，但Gemini给出了高分建议，这很奇怪，需要人工看
+                elif overall_score >=4 and "MATCH" in gemini_suggestion_raw.upper():
+                     refine_logger.info(f"Cypher log {interaction_id}: Qwen said '无法生成', but Gemini suggested a high-score query '{gemini_suggestion_raw}'. Needs manual review.")
+                     continue
+                else: # Qwen说无法生成，Gemini建议不明确或中低分，也采纳Qwen的
+                    ideal_cypher_output = "无法生成Cypher查询."
+                    source_of_ideal = "qwen_cannot_generate_gemini_unclear"
+
+
+            # --- 规则2: Qwen生成了查询，看Gemini评估 ---
+            elif overall_score >= 4: # Gemini认为Qwen的输出质量高
                 ideal_cypher_output = qwen_generated_cypher
-                source_of_ideal = "qwen_high_score"
-            elif gemini_suggestion and gemini_suggestion != "无法生成Cypher查询。" and "cannot be improved" not in gemini_suggestion.lower() and "needs to be extended" not in gemini_suggestion.lower() and "MATCH" in gemini_suggestion.upper(): # Gemini给出了具体的Cypher建议
-                # TODO (可选的LLM辅助提纯): 在这里可以加入调用LLM验证gemini_suggestion的逻辑
-                ideal_cypher_output = gemini_suggestion
-                source_of_ideal = "gemini_suggestion"
-            elif "无法生成Cypher查询" in gemini_suggestion or (overall_score <= 2 and ("hallucinated" in eval_log["eval_llm_raw_output"].lower() or "schema violation" in eval_log["eval_llm_raw_output"].lower())):
-                # 如果Gemini建议无法生成，或者低分且明确提到幻觉/Schema违规
-                ideal_cypher_output = "无法生成Cypher查询。"
-                source_of_ideal = "gemini_cannot_generate"
+                source_of_ideal = "qwen_high_score_by_gemini"
+            
+            # --- 规则3: Qwen的查询质量不高，但Gemini给出了具体的、看起来像Cypher的建议 ---
+            elif gemini_suggestion_raw and \
+                 "无法生成Cypher查询" not in gemini_suggestion_raw and \
+                 "cannot be improved" not in gemini_suggestion_raw.lower() and \
+                 "needs to be extended" not in gemini_suggestion_raw.lower() and \
+                 ("MATCH " in gemini_suggestion_raw.upper() or "RETURN " in gemini_suggestion_raw.upper()): # 检查是否像Cypher
+
+                # --- 改进点: 尝试从Gemini建议中提取纯Cypher ---
+                # 简单提取：假设Cypher建议是主要部分
+                # 更复杂的提取可能需要正则表达式或LLM辅助
+                # 这里我们先直接使用，如果Gemini的建议包含额外文字，微调时模型可能学会忽略它们，或者我们需要后续再清洗
+                extracted_gemini_cypher = gemini_suggestion_raw
+                # 尝试移除常见的解释性前缀
+                common_prefixes = [
+                    "你可以尝试这个查询：", "建议的查询是：", "尝试使用这个查询：",
+                    "You could try this query:", "The suggested query is:", "Try using this query:"
+                ]
+                for prefix in common_prefixes:
+                    if extracted_gemini_cypher.startswith(prefix):
+                        extracted_gemini_cypher = extracted_gemini_cypher[len(prefix):].strip()
+                        break # 找到一个匹配就停止
+
+                # 进一步尝试只取 Cypher 部分，如果建议中包含 "MATCH"
+                if "MATCH " in extracted_gemini_cypher.upper():
+                    match_index = extracted_gemini_cypher.upper().find("MATCH ")
+                    extracted_gemini_cypher = extracted_gemini_cypher[match_index:]
+                
+                ideal_cypher_output = extracted_gemini_cypher.strip() # 确保 strip
+                source_of_ideal = "gemini_suggestion_adopted"
+            
+            # --- 规则4: Gemini明确建议“无法生成” 或 Qwen的查询质量低且有严重问题 ---
+            elif "无法生成Cypher查询" in gemini_suggestion_raw or \
+                 (overall_score <= 2 and ("hallucinated" in eval_log.get("eval_llm_raw_output", "").lower() or \
+                                         "schema violation" in eval_log.get("eval_llm_raw_output", "").lower() or \
+                                         "syntax error" in eval_log.get("eval_llm_raw_output", "").lower())):
+                ideal_cypher_output = "无法生成Cypher查询."
+                source_of_ideal = "gemini_explicitly_cannot_generate_or_qwen_low_quality"
+            
+            # --- 规则5: 其他情况，需要人工审核 ---
             else:
-                # 其他情况，可能需要人工审核和提供黄金标准
-                refine_logger.info(f"Cypher log {interaction_id} (Qwen: '{qwen_generated_cypher}') needs manual review. Gemini score: {overall_score}, Suggestion: '{gemini_suggestion}'")
-                # 暂时跳过，或者标记后导出给人工处理
+                refine_logger.info(f"Cypher log {interaction_id} (Qwen: '{qwen_generated_cypher[:100]}...') needs manual review. Gemini score: {overall_score}, Suggestion: '{gemini_suggestion_raw[:100]}...'")
                 continue 
+        
+        # --- 如果没有Gemini评估日志 ---
         else:
-            # 没有找到对应的Gemini评估日志，或者评估日志无效
-            # 我们可以选择跳过，或者如果信任Qwen的原始输出（不推荐），或者有其他标准
-            refine_logger.warning(f"No valid Gemini evaluation found for Cypher log {interaction_id}. Qwen's output: '{qwen_generated_cypher}'. Skipping for finetune data.")
+            refine_logger.warning(f"No valid Gemini evaluation found for Cypher log {interaction_id}. Qwen's output: '{qwen_generated_cypher[:100]}...'. Skipping for finetune data.")
             continue
             
         if ideal_cypher_output is not None:
             finetune_samples.append({
-                "prompt": qwen_input_prompt, # 这是给Qwen的完整输入
-                "completion": ideal_cypher_output, # 这是期望Qwen的输出
-                "original_qwen_cypher": qwen_generated_cypher, # 保留原始输出供参考
-                "gemini_score": overall_score if eval_log else None, # 保留Gemini评分
-                "source_of_ideal": source_of_ideal, # 记录理想输出的来源
+                "prompt": qwen_input_prompt,
+                "completion": ideal_cypher_output.strip(), # 确保completion也strip
+                "original_qwen_cypher": qwen_generated_cypher,
+                "gemini_score": gemini_score_for_log,
+                "source_of_ideal": source_of_ideal,
                 "interaction_id": interaction_id
             })
 
