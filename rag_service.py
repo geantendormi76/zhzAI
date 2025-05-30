@@ -391,23 +391,22 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                 current_app_version = "0.1.0" # 假设的应用版本，后续可以从配置读取
 
                 top_level_rag_log_data = {
-                    # "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    # "interaction_id": str(uuid.uuid4()),
-                    "task_type": "rag_query_processing_success", # 更具体的类型
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "interaction_id": str(uuid.uuid4()),
+                    "task_type": "rag_query_processing_success",
                     "user_query": original_query_for_response,
-                    "processed_llm_output": final_answer_from_llm,
+                    "processed_llm_output": final_answer_from_llm, # RAG的最终答案
                     "retrieved_context_hash": context_hash,
-                    "retrieved_documents_summary": [
-                        {"source": doc.source_type,
-                         "score": doc.score,
-                         "id": doc.metadata.get("chunk_id") if doc.metadata else doc.metadata.get("id") if doc.metadata else None, # 尝试获取chunk_id或id
-                         "content_preview": doc.content[:50] + "..." if doc.content else ""} # 添加内容预览
+                    "retrieved_documents_summary": [ # 摘要信息
+                        {"source": doc.source_type, "score": doc.score, "id": doc.metadata.get("chunk_id") if doc.metadata else doc.metadata.get("id") if doc.metadata else None, "content_preview": doc.content[:50] + "..." if doc.content else ""}
                         for doc in final_context_docs
                     ],
+                    "retrieved_context_docs": [doc.model_dump() for doc in final_context_docs], # <<<--- 添加这一行，存储完整的上下文文档
                     "final_context_docs_count": len(final_context_docs),
                     "application_version": current_app_version
                 }
-                # rag_logger.info(f"TOP_LEVEL_RAG_SUCCESS_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
+                # await log_interaction_data(top_level_rag_log_data) # 如果已经改成通用日志函数
+                rag_logger.info(f"TOP_LEVEL_RAG_SUCCESS_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
                 await log_interaction_data(top_level_rag_log_data)
             except Exception as e_log_rag:
                 rag_logger.error(f"Error during top-level RAG success logging: {e_log_rag}", exc_info=True)
