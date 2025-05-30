@@ -4,6 +4,7 @@ import httpx
 import json
 import traceback
 import os
+import glob
 from dotenv import load_dotenv
 from datetime import datetime, timezone 
 import uuid 
@@ -51,6 +52,19 @@ def get_evaluation_result_log_filepath(evaluation_name: str = "cypher_eval") -> 
     today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     # 示例: rag_eval_data/eval_results_cypher_eval_20250530.jsonl
     return os.path.join(RAG_EVAL_DATA_DIR, f"eval_results_{evaluation_name}_{today_str}.jsonl")
+
+def find_latest_rag_interaction_log(log_dir: str = RAG_EVAL_DATA_DIR) -> Optional[str]: # <--- 添加的函数，并修改logger，log_dir可以给默认值
+    """在指定目录中查找最新的 RAG 交互日志文件 (rag_interactions_*.jsonl)。"""
+    rag_log_pattern = os.path.join(log_dir, "rag_interactions_*.jsonl")
+    candidate_rag_logs = glob.glob(rag_log_pattern)
+    
+    if candidate_rag_logs:
+        candidate_rag_logs.sort(key=os.path.getmtime, reverse=True)
+        utils_logger.info(f"Automatically selected RAG interaction log: {candidate_rag_logs[0]}") # <--- 修改为 utils_logger
+        return candidate_rag_logs[0]
+    else:
+        utils_logger.warning(f"No RAG interaction log files found matching pattern: {rag_log_pattern} in directory {log_dir}") # <--- 修改为 utils_logger
+        return None
 
 async def log_interaction_data(interaction_data: dict, is_evaluation_result: bool = False, evaluation_name_for_file: Optional[str] = None): # <--- 修改参数
     """

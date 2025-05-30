@@ -228,7 +228,11 @@ async def evaluate_cypher_with_gemini(
         "eval_error_info": error_info,
         "application_version": app_version
     }
-    await log_interaction_data(eval_log_data)
+    await log_interaction_data(
+        eval_log_data, 
+        is_evaluation_result=True, 
+        evaluation_name_for_file="cypher_gemini_flash" # <--- 这个值是关键
+    )
 
     if evaluation_result_json:
         eval_logger.info(f"Cypher evaluation completed. Overall score: {evaluation_result_json.get('evaluation_summary', {}).get('overall_quality_score_cypher')}")
