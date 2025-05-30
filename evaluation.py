@@ -191,71 +191,33 @@ async def evaluate_cypher_with_gemini(
             )
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 raw_gemini_output = response.choices[0].message.content
-                eval_logger.info(f"Raw Gemini output for Answer eval (length: {len(raw_gemini_output)}):\n>>>START_RAW_GEMINI_OUTPUT<<<\n{raw_gemini_output}\n>>>END_RAW_GEMINI_OUTPUT<<<") # 打印完整的原始输出以便调试       
-                # --- 更精确的JSON提取逻辑 ---
-                json_candidate = None
-                cleaned_output_for_json = raw_gemini_output.strip() # 先去除首尾空白
-
-                # 检查是否以 ```json 开头并以 ``` 结尾
-                starts_with_md_json = cleaned_output_for_json.startswith("```json")
-                ends_with_md = cleaned_output_for_json.endswith("```")
-
-                if starts_with_md_json and ends_with_md:
-                    eval_logger.info("Found markdown style JSON block for Answer.")
-                    # 提取 ```json 和 ``` 之间的内容
-                    # 从 "```json" 后开始，到最后一个 "```" 前结束
-                    json_text_start = len("```json")
-                    json_text_end = cleaned_output_for_json.rfind("```")
-                    if json_text_end > json_text_start:
-                        json_candidate = cleaned_output_for_json[json_text_start:json_text_end].strip()
-                    else: # 这种情况不应该发生如果首尾标记都匹配了，但以防万一
-                        json_candidate = cleaned_output_for_json # 退回使用清理后的原始文本
-                        eval_logger.warning("Markdown JSON block markers found, but extraction failed, using stripped raw output for Answer.")
-                elif cleaned_output_for_json.startswith("{") and cleaned_output_for_json.endswith("}"):
-                    eval_logger.info("Assuming direct JSON output for Answer (starts with { and ends with }).")
-                    json_candidate = cleaned_output_for_json
-                else:
-                    # 如果没有明确的json标记，尝试查找第一个'{'和最后一个'}'
-                    eval_logger.warning("No clear JSON markers, attempting to find first/last braces for Answer.")
-                    first_brace = cleaned_output_for_json.find('{')
-                    last_brace = cleaned_output_for_json.rfind('}')
-                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                        json_candidate = cleaned_output_for_json[first_brace : last_brace+1]
-                    else:
-                        eval_logger.error("Could not identify a JSON-like structure in Gemini output for Answer.")
-                        error_info = "No JSON-like structure identified for answer"
-                        json_candidate = None # 明确设为None
-
-                if json_candidate:
-                    try:
-                        evaluation_result_json = json.loads(json_candidate)
-                        eval_logger.info("Successfully parsed extracted JSON candidate for Answer.")
-                    except json.JSONDecodeError as e_json:
-                        eval_logger.error(f"Failed to parse extracted JSON candidate for Answer. Error: {e_json}. Candidate (first 500 chars): {json_candidate[:500]}", exc_info=True)
-                        error_info = f"JSONDecodeError for extracted answer candidate: {str(e_json)}"
-                else:
-                    if not error_info: # 如果之前没有设置错误信息
-                         error_info = "JSON candidate extraction failed for answer"
-                # --- 结束更精确的JSON提取逻辑 ---
+                eval_logger.info(f"Raw Gemini output for Cypher eval (first 300 chars): {raw_gemini_output[:300]}...")
+                cleaned_output = raw_gemini_output.strip()
+                if cleaned_output.startswith("```json"):
+                    cleaned_output = cleaned_output[len("```json"):].strip()
+                if cleaned_output.endswith("```"):
+                    cleaned_output = cleaned_output[:-len("```")].strip()
+                evaluation_result_json = json.loads(cleaned_output)
+                eval_logger.info("Successfully parsed Gemini evaluation result for Cypher.")
             else:
-                eval_logger.error("Gemini returned an empty or malformed response for Answer evaluation.")
-                raw_gemini_output = str(response) # 记录原始响应对象以供调试
-                error_info = "Gemini empty or malformed response for answer"
+                eval_logger.error("Gemini returned an empty or malformed response for Cypher evaluation.")
+                raw_gemini_output = str(response)
+                error_info = "Gemini empty or malformed response"
         except litellm.exceptions.APIError as e_api:
-            eval_logger.error(f"LiteLLM APIError during Answer evaluation: {e_api}", exc_info=True)
-            error_info = f"LiteLLM APIError for answer: {str(e_api)}"
-            raw_gemini_output = error_info if error_info else str(e_api) # 确保raw_gemini_output有值
-        except json.JSONDecodeError as e_json: # 这个外层捕获理论上不应再被直接触发
-            eval_logger.error(f"Outer Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
-            error_info = f"Outer JSONDecodeError for answer: {str(e_json)}"
+            eval_logger.error(f"LiteLLM APIError during Cypher evaluation: {e_api}", exc_info=True)
+            error_info = f"LiteLLM APIError: {str(e_api)}"
+            raw_gemini_output = error_info
+        except json.JSONDecodeError as e_json:
+            eval_logger.error(f"Failed to decode JSON from Gemini Cypher evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
+            error_info = f"JSONDecodeError: {str(e_json)}"
         except Exception as e_gen:
-            eval_logger.error(f"Unexpected error during Answer evaluation with Gemini: {e_gen}", exc_info=True)
-            error_info = f"Unexpected error for answer: {str(e_gen)}"
+            eval_logger.error(f"Unexpected error during Cypher evaluation with Gemini: {e_gen}", exc_info=True)
+            error_info = f"Unexpected error: {str(e_gen)}"
             if raw_gemini_output is None:
                 raw_gemini_output = error_info
 
     eval_log_data = {
-        "task_type": "cypher_evaluation_result",
+        "task_type": "cypher_evaluation_by_gemini",
         "original_interaction_id_ref": original_interaction_id,
         "user_question_for_eval": user_question,
         "generated_cypher_for_eval": generated_cypher,
@@ -266,11 +228,7 @@ async def evaluate_cypher_with_gemini(
         "eval_error_info": error_info,
         "application_version": app_version
     }
-    await log_interaction_data(
-        eval_log_data, 
-        is_evaluation_result=True, 
-        evaluation_name_for_file="cypher_gemini_flash" # <--- 可以更具体，包含模型
-    )
+    await log_interaction_data(eval_log_data)
 
     if evaluation_result_json:
         eval_logger.info(f"Cypher evaluation completed. Overall score: {evaluation_result_json.get('evaluation_summary', {}).get('overall_quality_score_cypher')}")
@@ -592,8 +550,6 @@ async def evaluate_answer_with_gemini(
     """
     eval_logger.info(f"Starting Answer evaluation. User question: '{user_question[:50]}...', Answer: '{generated_answer[:50]}...'")
 
-    # 确保 ANSWER_EVALUATION_PROMPT_V1 在此作用域内是可访问的
-    # (它应该是在这个函数外部，在模块级别定义的)
     prompt_to_gemini = ANSWER_EVALUATION_PROMPT_V1.replace(
         "{{USER_QUESTION}}", user_question
     ).replace(
@@ -657,68 +613,30 @@ async def evaluate_answer_with_gemini(
             response = await litellm.acompletion(
                 model=gemini_model_name,
                 messages=messages_for_gemini,
-                temperature=0.1,
-                max_tokens=2048, # 评估结果可能较长, 之前是4096，对于flash可能太大，调整为2048
+                temperature=0.1, 
+                max_tokens=2048, 
             )
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 raw_gemini_output = response.choices[0].message.content
-                eval_logger.info(f"Raw Gemini output for Answer eval (length: {len(raw_gemini_output)}):\n>>>START_RAW_GEMINI_OUTPUT<<<\n{raw_gemini_output}\n>>>END_RAW_GEMINI_OUTPUT<<<") # 打印完整的原始输出以便调试       
-                # --- 更精确的JSON提取逻辑 ---
-                json_candidate = None
-                cleaned_output_for_json = raw_gemini_output.strip() # 先去除首尾空白
-
-                # 检查是否以 ```json 开头并以 ``` 结尾
-                starts_with_md_json = cleaned_output_for_json.startswith("```json")
-                ends_with_md = cleaned_output_for_json.endswith("```")
-
-                if starts_with_md_json and ends_with_md:
-                    eval_logger.info("Found markdown style JSON block for Answer.")
-                    # 提取 ```json 和 ``` 之间的内容
-                    # 从 "```json" 后开始，到最后一个 "```" 前结束
-                    json_text_start = len("```json")
-                    json_text_end = cleaned_output_for_json.rfind("```")
-                    if json_text_end > json_text_start:
-                        json_candidate = cleaned_output_for_json[json_text_start:json_text_end].strip()
-                    else: # 这种情况不应该发生如果首尾标记都匹配了，但以防万一
-                        json_candidate = cleaned_output_for_json # 退回使用清理后的原始文本
-                        eval_logger.warning("Markdown JSON block markers found, but extraction failed, using stripped raw output for Answer.")
-                elif cleaned_output_for_json.startswith("{") and cleaned_output_for_json.endswith("}"):
-                    eval_logger.info("Assuming direct JSON output for Answer (starts with { and ends with }).")
-                    json_candidate = cleaned_output_for_json
-                else:
-                    # 如果没有明确的json标记，尝试查找第一个'{'和最后一个'}'
-                    eval_logger.warning("No clear JSON markers, attempting to find first/last braces for Answer.")
-                    first_brace = cleaned_output_for_json.find('{')
-                    last_brace = cleaned_output_for_json.rfind('}')
-                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                        json_candidate = cleaned_output_for_json[first_brace : last_brace+1]
-                    else:
-                        eval_logger.error("Could not identify a JSON-like structure in Gemini output for Answer.")
-                        error_info = "No JSON-like structure identified for answer"
-                        json_candidate = None # 明确设为None
-
-                if json_candidate:
-                    try:
-                        evaluation_result_json = json.loads(json_candidate)
-                        eval_logger.info("Successfully parsed extracted JSON candidate for Answer.")
-                    except json.JSONDecodeError as e_json:
-                        eval_logger.error(f"Failed to parse extracted JSON candidate for Answer. Error: {e_json}. Candidate (first 500 chars): {json_candidate[:500]}", exc_info=True)
-                        error_info = f"JSONDecodeError for extracted answer candidate: {str(e_json)}"
-                else:
-                    if not error_info: # 如果之前没有设置错误信息
-                         error_info = "JSON candidate extraction failed for answer"
-                # --- 结束更精确的JSON提取逻辑 ---
+                eval_logger.info(f"Raw Gemini output for Answer eval (first 300 chars): {raw_gemini_output[:300]}...")
+                cleaned_output = raw_gemini_output.strip()
+                if cleaned_output.startswith("```json"):
+                    cleaned_output = cleaned_output[len("```json"):].strip()
+                if cleaned_output.endswith("```"):
+                    cleaned_output = cleaned_output[:-len("```")].strip()
+                evaluation_result_json = json.loads(cleaned_output)
+                eval_logger.info("Successfully parsed Gemini evaluation result for Answer.")
             else:
                 eval_logger.error("Gemini returned an empty or malformed response for Answer evaluation.")
-                raw_gemini_output = str(response) # 记录原始响应对象以供调试
+                raw_gemini_output = str(response)
                 error_info = "Gemini empty or malformed response for answer"
         except litellm.exceptions.APIError as e_api:
             eval_logger.error(f"LiteLLM APIError during Answer evaluation: {e_api}", exc_info=True)
             error_info = f"LiteLLM APIError for answer: {str(e_api)}"
-            raw_gemini_output = error_info if error_info else str(e_api) # 确保raw_gemini_output有值
-        except json.JSONDecodeError as e_json: # 这个外层捕获理论上不应再被直接触发
-            eval_logger.error(f"Outer Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
-            error_info = f"Outer JSONDecodeError for answer: {str(e_json)}"
+            raw_gemini_output = error_info
+        except json.JSONDecodeError as e_json:
+            eval_logger.error(f"Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
+            error_info = f"JSONDecodeError for answer: {str(e_json)}"
         except Exception as e_gen:
             eval_logger.error(f"Unexpected error during Answer evaluation with Gemini: {e_gen}", exc_info=True)
             error_info = f"Unexpected error for answer: {str(e_gen)}"
@@ -726,10 +644,10 @@ async def evaluate_answer_with_gemini(
                 raw_gemini_output = error_info
 
     eval_log_data = {
-        "task_type": "answer_evaluation_result",
+        "task_type": "answer_evaluation_result", 
         "original_interaction_id_ref": original_interaction_id,
         "user_question_for_eval": user_question,
-        "retrieved_contexts_for_eval_char_count": len(retrieved_contexts),
+        "retrieved_contexts_for_eval_char_count": len(retrieved_contexts), 
         "generated_answer_for_eval": generated_answer,
         "eval_llm_input_prompt_char_count": len(prompt_to_gemini),
         "eval_llm_model": gemini_model_name,
@@ -750,6 +668,7 @@ async def evaluate_answer_with_gemini(
         eval_logger.warning("Answer evaluation did not produce a valid JSON result.")
         
     return evaluation_result_json
+
 if __name__ == '__main__':
     import asyncio # Add asyncio import for the test block
 
