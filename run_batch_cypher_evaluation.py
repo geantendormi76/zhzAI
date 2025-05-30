@@ -114,8 +114,8 @@ if __name__ == "__main__":
     log_file_to_evaluate = get_interaction_log_filepath() 
     
     # 示例：如果要评估名为 "rag_interactions_20250529.jsonl" 的特定文件
-    # specific_log_filename = "rag_interactions_20250529.jsonl"
-    # log_file_to_evaluate = os.path.join(os.path.dirname(get_interaction_log_filepath()), specific_log_filename)
+    specific_log_filename = "rag_interactions_20250530.jsonl"
+    log_file_to_evaluate = os.path.join(os.path.dirname(get_interaction_log_filepath()), specific_log_filename)
 
     batch_eval_logger.info(f"Target log file for evaluation: {log_file_to_evaluate}")
 

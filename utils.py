@@ -5,11 +5,11 @@ import json
 import traceback
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timezone # <--- 添加
-import uuid # <--- 添加
-import logging # <--- 添加
-import asyncio # <--- 添加
-
+from datetime import datetime, timezone 
+import uuid 
+import logging 
+import asyncio
+from typing import Dict, Any, Optional 
 load_dotenv()
 
 # --- 添加一个utils模块的logger (新添加) ---
@@ -46,12 +46,23 @@ def get_interaction_log_filepath(log_type_prefix: str = "interaction") -> str:
     # 所有日志写入同一个文件，方便统一处理和按时间排序
     return os.path.join(RAG_EVAL_DATA_DIR, f"rag_interactions_{today_str}.jsonl")
 
-async def log_interaction_data(interaction_data: dict):
+def get_evaluation_result_log_filepath(evaluation_name: str = "cypher_eval") -> str: # <--- 新增函数
+    """获取评估结果日志文件的完整路径，按天分割，并可指定评估类型。"""
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    # 示例: rag_eval_data/eval_results_cypher_eval_20250530.jsonl
+    return os.path.join(RAG_EVAL_DATA_DIR, f"eval_results_{evaluation_name}_{today_str}.jsonl")
+
+async def log_interaction_data(interaction_data: dict, is_evaluation_result: bool = False, evaluation_name_for_file: Optional[str] = None): # <--- 修改参数
     """
-    将单条交互数据异步追加到JSONL文件中。
-    确保 interaction_data 包含 'timestamp_utc' 和 'interaction_id' (如果外部未提供，则在此处生成)。
+    将单条交互数据或评估结果异步追加到JSONL文件中。
     """
-    filepath = get_interaction_log_filepath()
+    if is_evaluation_result:
+        if not evaluation_name_for_file:
+            # 如果是评估结果但没有指定文件名后缀，给一个默认的
+            evaluation_name_for_file = interaction_data.get("task_type", "general_eval") 
+        filepath = get_evaluation_result_log_filepath(evaluation_name=evaluation_name_for_file)
+    else:
+        filepath = get_interaction_log_filepath() # 原始交互日志文件名保持不变
 
     # 确保核心字段存在
     if "timestamp_utc" not in interaction_data:

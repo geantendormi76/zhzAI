@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 
 import litellm # 用于调用Gemini API
 from dotenv import load_dotenv
-
+import re
 # 导入通用日志函数
 from .utils import log_interaction_data
 # 导入共享的Schema描述
@@ -191,33 +191,71 @@ async def evaluate_cypher_with_gemini(
             )
             if response.choices and response.choices[0].message and response.choices[0].message.content:
                 raw_gemini_output = response.choices[0].message.content
-                eval_logger.info(f"Raw Gemini output for Cypher eval (first 300 chars): {raw_gemini_output[:300]}...")
-                cleaned_output = raw_gemini_output.strip()
-                if cleaned_output.startswith("```json"):
-                    cleaned_output = cleaned_output[len("```json"):].strip()
-                if cleaned_output.endswith("```"):
-                    cleaned_output = cleaned_output[:-len("```")].strip()
-                evaluation_result_json = json.loads(cleaned_output)
-                eval_logger.info("Successfully parsed Gemini evaluation result for Cypher.")
+                eval_logger.info(f"Raw Gemini output for Answer eval (length: {len(raw_gemini_output)}):\n>>>START_RAW_GEMINI_OUTPUT<<<\n{raw_gemini_output}\n>>>END_RAW_GEMINI_OUTPUT<<<") # 打印完整的原始输出以便调试       
+                # --- 更精确的JSON提取逻辑 ---
+                json_candidate = None
+                cleaned_output_for_json = raw_gemini_output.strip() # 先去除首尾空白
+
+                # 检查是否以 ```json 开头并以 ``` 结尾
+                starts_with_md_json = cleaned_output_for_json.startswith("```json")
+                ends_with_md = cleaned_output_for_json.endswith("```")
+
+                if starts_with_md_json and ends_with_md:
+                    eval_logger.info("Found markdown style JSON block for Answer.")
+                    # 提取 ```json 和 ``` 之间的内容
+                    # 从 "```json" 后开始，到最后一个 "```" 前结束
+                    json_text_start = len("```json")
+                    json_text_end = cleaned_output_for_json.rfind("```")
+                    if json_text_end > json_text_start:
+                        json_candidate = cleaned_output_for_json[json_text_start:json_text_end].strip()
+                    else: # 这种情况不应该发生如果首尾标记都匹配了，但以防万一
+                        json_candidate = cleaned_output_for_json # 退回使用清理后的原始文本
+                        eval_logger.warning("Markdown JSON block markers found, but extraction failed, using stripped raw output for Answer.")
+                elif cleaned_output_for_json.startswith("{") and cleaned_output_for_json.endswith("}"):
+                    eval_logger.info("Assuming direct JSON output for Answer (starts with { and ends with }).")
+                    json_candidate = cleaned_output_for_json
+                else:
+                    # 如果没有明确的json标记，尝试查找第一个'{'和最后一个'}'
+                    eval_logger.warning("No clear JSON markers, attempting to find first/last braces for Answer.")
+                    first_brace = cleaned_output_for_json.find('{')
+                    last_brace = cleaned_output_for_json.rfind('}')
+                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                        json_candidate = cleaned_output_for_json[first_brace : last_brace+1]
+                    else:
+                        eval_logger.error("Could not identify a JSON-like structure in Gemini output for Answer.")
+                        error_info = "No JSON-like structure identified for answer"
+                        json_candidate = None # 明确设为None
+
+                if json_candidate:
+                    try:
+                        evaluation_result_json = json.loads(json_candidate)
+                        eval_logger.info("Successfully parsed extracted JSON candidate for Answer.")
+                    except json.JSONDecodeError as e_json:
+                        eval_logger.error(f"Failed to parse extracted JSON candidate for Answer. Error: {e_json}. Candidate (first 500 chars): {json_candidate[:500]}", exc_info=True)
+                        error_info = f"JSONDecodeError for extracted answer candidate: {str(e_json)}"
+                else:
+                    if not error_info: # 如果之前没有设置错误信息
+                         error_info = "JSON candidate extraction failed for answer"
+                # --- 结束更精确的JSON提取逻辑 ---
             else:
-                eval_logger.error("Gemini returned an empty or malformed response for Cypher evaluation.")
-                raw_gemini_output = str(response)
-                error_info = "Gemini empty or malformed response"
+                eval_logger.error("Gemini returned an empty or malformed response for Answer evaluation.")
+                raw_gemini_output = str(response) # 记录原始响应对象以供调试
+                error_info = "Gemini empty or malformed response for answer"
         except litellm.exceptions.APIError as e_api:
-            eval_logger.error(f"LiteLLM APIError during Cypher evaluation: {e_api}", exc_info=True)
-            error_info = f"LiteLLM APIError: {str(e_api)}"
-            raw_gemini_output = error_info
-        except json.JSONDecodeError as e_json:
-            eval_logger.error(f"Failed to decode JSON from Gemini Cypher evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
-            error_info = f"JSONDecodeError: {str(e_json)}"
+            eval_logger.error(f"LiteLLM APIError during Answer evaluation: {e_api}", exc_info=True)
+            error_info = f"LiteLLM APIError for answer: {str(e_api)}"
+            raw_gemini_output = error_info if error_info else str(e_api) # 确保raw_gemini_output有值
+        except json.JSONDecodeError as e_json: # 这个外层捕获理论上不应再被直接触发
+            eval_logger.error(f"Outer Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
+            error_info = f"Outer JSONDecodeError for answer: {str(e_json)}"
         except Exception as e_gen:
-            eval_logger.error(f"Unexpected error during Cypher evaluation with Gemini: {e_gen}", exc_info=True)
-            error_info = f"Unexpected error: {str(e_gen)}"
+            eval_logger.error(f"Unexpected error during Answer evaluation with Gemini: {e_gen}", exc_info=True)
+            error_info = f"Unexpected error for answer: {str(e_gen)}"
             if raw_gemini_output is None:
                 raw_gemini_output = error_info
 
     eval_log_data = {
-        "task_type": "cypher_evaluation_by_gemini",
+        "task_type": "cypher_evaluation_result",
         "original_interaction_id_ref": original_interaction_id,
         "user_question_for_eval": user_question,
         "generated_cypher_for_eval": generated_cypher,
@@ -228,7 +266,11 @@ async def evaluate_cypher_with_gemini(
         "eval_error_info": error_info,
         "application_version": app_version
     }
-    await log_interaction_data(eval_log_data)
+    await log_interaction_data(
+        eval_log_data, 
+        is_evaluation_result=True, 
+        evaluation_name_for_file="cypher_gemini_flash" # <--- 可以更具体，包含模型
+    )
 
     if evaluation_result_json:
         eval_logger.info(f"Cypher evaluation completed. Overall score: {evaluation_result_json.get('evaluation_summary', {}).get('overall_quality_score_cypher')}")
@@ -237,46 +279,553 @@ async def evaluate_cypher_with_gemini(
         
     return evaluation_result_json
 
+
+# V1 Answer Evaluation Prompt
+ANSWER_EVALUATION_PROMPT_V1 = """
+You are an expert AI Answer Evaluator, specializing in assessing the quality of responses from a Retrieval Augmented Generation (RAG) system designed as an "Office Worker Assistant". Your evaluation must be objective, strictly based on the provided user question, the context the RAG system used, and the generated answer.
+
+**USER'S NATURAL LANGUAGE QUESTION:**
+Use code with caution.
+Python
+{{USER_QUESTION}}
+**CONTEXT PROVIDED TO THE RAG SYSTEM'S GENERATION MODEL (this is the information the AI had to base its answer on):**
+Use code with caution.
+{{RETRIEVED_CONTEXTS}}
+**AI-GENERATED ANSWER TO EVALUATE:**
+Use code with caution.
+{{GENERATED_ANSWER}}
+**EVALUATION TASK:**
+
+Please evaluate the "AI-GENERATED ANSWER" based on the following criteria. For each dimension, provide a score from 1 to 5 (where 5 is best) and a brief reasoning for your score. Also, if applicable, identify specific phrases or sentences in the answer that exemplify an issue.
+
+**EVALUATION DIMENSIONS & SCORING GUIDELINES:**
+
+1.  **Faithfulness/Traceability (Score 1-5):**
+    *   Is all factual information in the answer directly supported by the "CONTEXT PROVIDED"?
+    *   Does the answer avoid making up information (hallucinations) or contradicting the context?
+    *   **5 (Completely Faithful):** All key factual claims in the answer are directly and accurately supported by the context. No external information introduced.
+    *   **4 (Mostly Faithful):** The vast majority of factual claims are supported. May contain very minor, reasonable inferences closely tied to the context, but no direct contradictions.
+    *   **3 (Partially Faithful):** Some key claims are supported, but there are noticeable unsupported claims, slight misinterpretations of the context, or minor, non-critical hallucinations.
+    *   **2 (Minimally Faithful):** Significant portions of the answer are not supported by the context, or there are clear contradictions or misleading hallucinations.
+    *   **1 (Not Faithful):** The answer is largely based on information 외부 from the context, contains severe hallucinations, or directly contradicts the context.
+
+2.  **Relevance to User Query (Score 1-5):**
+    *   Does the answer directly and precisely address the "USER'S NATURAL LANGUAGE QUESTION"?
+    *   **5 (Perfectly Relevant):** Directly and fully answers the user's core question(s).
+    *   **4 (Highly Relevant):** Accurately answers the main aspects of the question; minor aspects might be less directly addressed.
+    *   **3 (Moderately Relevant):** Addresses parts of the question but may miss key aspects or include some less relevant information.
+    *   **2 (Slightly Relevant):** Touches upon the topic of the question but largely misses the core intent.
+    *   **1 (Not Relevant):** Does not answer the user's question at all.
+
+3.  **Completeness (Score 1-5):**
+    *   **First, assess Context Sufficiency:** Based *only* on the "CONTEXT PROVIDED", does it seem to contain enough information to fully answer the "USER'S NATURAL LANGUAGE QUESTION"? (Answer: "Sufficient", "Partially Sufficient", or "Insufficient"). Provide a brief reason for your assessment of context sufficiency.
+    *   **Then, score Completeness based on the answer's performance given the context:**
+        *   Does the answer address all aspects of the user's query, making good use of the relevant information available in the context?
+        *   If the context was insufficient, does the answer appropriately acknowledge this or focus on what can be answered?
+        *   **5 (Very Complete):** (If context sufficient) Fully addresses all aspects of the query using all relevant context. (If context insufficient) Makes the best use of available context and clearly indicates limitations.
+        *   **4 (Mostly Complete):** (If context sufficient) Addresses main aspects, minor details from context might be missed. (If context insufficient) Good use of available context, fair indication of limitations.
+        *   **3 (Partially Complete):** (If context sufficient) Misses some important aspects or underutilizes relevant context. (If context insufficient) Poor use of available context or unclear about limitations.
+        *   **2 (Slightly Complete):** (If context sufficient) Addresses only a small part, much relevant context ignored. (If context insufficient) Very poor use of limited context.
+        *   **1 (Not Complete):** Fails to address the query meaningfully, even if relevant context was available.
+
+4.  **Coherence/Fluency (Score 1-5):**
+    *   Is the answer well-written, grammatically correct, logically structured, and easy to understand?
+    *   **5 (Very Fluent):** Perfectly written, clear, natural, and easy to understand. No grammatical errors.
+    *   **4 (Fluent):** Well-written, mostly clear, minor or no grammatical errors.
+    *   **3 (Moderately Fluent):** Understandable, but may have some awkward phrasing or minor grammatical errors that don't impede core understanding.
+    *   **2 (Slightly Fluent):** Difficult to understand due to grammatical errors, awkward phrasing, or poor logical flow.
+    *   **1 (Not Fluent):** Largely incomprehensible.
+
+5.  **Actionability & Usability (for an Office Worker Assistant) (Score 1-5):**
+    *   Does the answer provide clear, practical, and easy-to-understand steps, information, or suggestions that would directly help an office worker achieve their task or make a decision?
+    *   **5 (Highly Actionable & Usable):** Provides clear, specific, and immediately applicable steps/information. Language is professional and easy for an office worker to understand. Format facilitates quick information retrieval.
+    *   **4 (Mostly Actionable & Usable):** Provides generally clear guidance or useful information. Might require minor clarification for full actionability, or presentation could be slightly improved, but core content is helpful.
+    *   **3 (Partially Actionable & Usable):** Offers some relevant information or suggestions, but lacks specific steps, is too vague for direct action, or requires significant effort to understand/apply.
+    *   **2 (Minimally Actionable & Usable):** Contains some related information but no clear action plan, is impractical, or very difficult to understand/use. Offers little practical help.
+    *   **1 (Not Actionable & Unusable):** Provides no actionable information, is irrelevant to practical office tasks, or is misleading/confusing.
+
+**OUTPUT JSON STRUCTURE (Strictly follow this format):**
+```json
+{
+  "evaluation_summary": {
+    "overall_answer_quality_score": "<Integer score 1-5, your overall judgment of the answer's quality, considering all dimensions. Faithfulness and Relevance are most critical.>",
+    "main_strengths_answer": "<Briefly describe the main strength(s) of this answer, if any. Be specific.>",
+    "main_weaknesses_answer": "<Briefly describe the main weakness(es) or most critical issue(s) with this answer. Be specific.>"
+  },
+  "dimensions": {
+    "faithfulness": {
+      "score": "<Integer score 1-5>",
+      "reasoning": "<Text explanation for faithfulness score. If not fully faithful, specify which parts are unsupported or hallucinated, referencing the answer text.>",
+      "problematic_answer_segments_faithfulness": ["<List of specific phrases/sentences from the answer that are not faithful, or empty list if none>"]
+    },
+    "relevance": {
+      "score": "<Integer score 1-5>",
+      "reasoning": "<Text explanation for relevance score. Explain how well it addresses the user's core question.>"
+    },
+    "completeness": {
+      "context_sufficiency_assessment": "<String: 'Sufficient', 'Partially Sufficient', or 'Insufficient'>",
+      "context_sufficiency_reasoning": "<Brief reason for the context sufficiency assessment. If not sufficient, what key information is missing from the context?>",
+      "score": "<Integer score 1-5, based on how well the answer uses the available context to address the query>",
+      "reasoning": "<Text explanation for completeness score. If not fully complete, what aspects of the query were missed, or what relevant context was underutilized? If context was insufficient, how well did the answer handle this?>"
+    },
+    "coherence_fluency": {
+      "score": "<Integer score 1-5>",
+      "reasoning": "<Text explanation for coherence/fluency score. Note any grammatical issues or awkward phrasing.>"
+    },
+    "actionability_usability": {
+      "score": "<Integer score 1-5>",
+      "reasoning": "<Text explanation for actionability/usability score, considering an office worker context.>"
+    }
+  },
+  "suggestion_for_answer_improvement": "<Provide specific, actionable suggestions on how this AI-generated answer could be improved, if applicable. If excellent, state 'No improvement needed'.>"
+}
+Use code with caution.
+FEW-SHOT EXAMPLES:
+Example 1: Good Answer
+USER'S NATURAL LANGUAGE QUESTION:
+如何申请本年度的带薪年假，并确保符合公司规定？
+Use code with caution.
+CONTEXT PROVIDED TO THE RAG SYSTEM'S GENERATION MODEL:
+上下文片段1 (来源: 公司政策文档):
+员工每年享有15天带薪年假。申请年假需通过公司内部HRM系统提交，并至少提前两周提出。所有年假申请必须得到直属经理的批准。未经批准的休假将按事假处理。
+
+上下文片段2 (来源: HRM系统操作指南):
+HRM系统年假申请流程：1. 登录HRM门户 (hrm.example-company.com)。 2. 导航至“我的假期”->“假期申请”。 3. 选择“年假”类型，填写休假起止日期和休假天数。 4. 在备注中简要说明休假事由（可选）。 5. 提交申请，等待经理审批。审批状态可在系统中实时查看。
+
+上下文片段3 (来源: 知识图谱精确信息):
+事实: 年假政策规定 -> 提前申请周期: 2周。
+事实: 年假政策规定 -> 审批人: 直属经理。
+事实: 年假政策规定 -> 年假天数上限: 15天/年。
+Use code with caution.
+AI-GENERATED ANSWER TO EVALUATE:
+您可以按照以下步骤申请本年度的带薪年假并确保符合公司规定：
+
+1.  **提前规划与提交：** 根据公司政策，您需要至少提前两周提交年假申请。
+2.  **通过HRM系统申请：**
+    *   登录公司HRM门户网站：hrm.example-company.com
+    *   进入“我的假期”模块，然后选择“假期申请”。
+    *   选择“年假”类型，并准确填写您希望休假的起止日期和天数。
+3.  **获取经理批准：** 所有年假申请都必须得到您直属经理的批准。提交申请后，请留意系统中的审批状态。
+4.  **年假额度：** 请注意，公司规定员工每年享有15天带薪年假。
+
+请确保您的申请符合以上规定，以顺利安排您的休假。
+Use code with caution.
+EXPECTED EVALUATION JSON OUTPUT:
+{
+  "evaluation_summary": {
+    "overall_answer_quality_score": 5,
+    "main_strengths_answer": "答案准确、完整、步骤清晰，非常实用。",
+    "main_weaknesses_answer": "无明显缺点。"
+  },
+  "dimensions": {
+    "faithfulness": {
+      "score": 5,
+      "reasoning": "答案中的所有信息点（提前两周、HRM系统操作、经理批准、15天年假）均能在提供的上下文中找到明确依据，无任何捏造。",
+      "problematic_answer_segments_faithfulness": []
+    },
+    "relevance": {
+      "score": 5,
+      "reasoning": "答案完美地回应了用户关于年假申请流程和合规性的问题。"
+    },
+    "completeness": {
+      "context_sufficiency_assessment": "Sufficient",
+      "context_sufficiency_reasoning": "上下文提供了申请年假所需的所有核心信息（流程、提前时间、审批人、额度）。",
+      "score": 5,
+      "reasoning": "答案全面覆盖了用户问题的各个方面，并充分利用了上下文中的所有关键信息，包括操作步骤和政策规定。"
+    },
+    "coherence_fluency": {
+      "score": 5,
+      "reasoning": "答案语言表达清晰、专业，逻辑步骤明确，易于理解。"
+    },
+    "actionability_usability": {
+      "score": 5,
+      "reasoning": "答案提供了非常清晰、可直接执行的申请步骤，并点明了关键的合规性要求，对办公室员工非常实用且易于操作。"
+    }
+  },
+  "suggestion_for_answer_improvement": "No improvement needed."
+}
+Use code with caution.
+Json
+Example 2: Answer with Hallucination
+USER'S NATURAL LANGUAGE QUESTION:
+我们公司最新的季度IT安全演练是什么时候举行的，主要发现了哪些问题？
+Use code with caution.
+CONTEXT PROVIDED TO THE RAG SYSTEM'S GENERATION MODEL:
+上下文片段1 (来源: 内部邮件):
+主题：关于第三季度IT安全意识培训的通知
+内容：各位同事，为提升全员信息安全意识，公司计划于8月15日举行第三季度IT安全意识培训，主要内容包括密码安全、钓鱼邮件识别等。请大家准时参加。
+
+上下文片段2 (来源: IT部门公告):
+IT服务台提醒：近期发现多起针对财务部门的仿冒邮件，请大家提高警惕，不要点击不明链接。如有疑问，请及时联系IT支持。演练活动将在下月进行。
+Use code with caution.
+AI-GENERATED ANSWER TO EVALUATE:
+公司最新的季度IT安全演练已于上个月（7月）成功举行。演练主要发现了两个问题：一是部分员工的办公电脑未及时更新防病毒软件，二是演练中模拟的钓鱼邮件成功欺骗了约15%的员工。后续将加强相关培训。
+Use code with caution.
+EXPECTED EVALUATION JSON OUTPUT:
+{
+  "evaluation_summary": {
+    "overall_answer_quality_score": 1,
+    "main_strengths_answer": "答案结构尚可。",
+    "main_weaknesses_answer": "答案内容完全是编造的（幻觉），与提供的上下文信息完全不符，具有严重误导性。"
+  },
+  "dimensions": {
+    "faithfulness": {
+      "score": 1,
+      "reasoning": "答案中关于演练已于7月举行、发现的两个具体问题（未更新防病毒软件、15%员工被钓鱼邮件欺骗）在上下文中完全找不到任何依据，是严重的幻觉。",
+      "problematic_answer_segments_faithfulness": ["演练已于上个月（7月）成功举行。", "演练主要发现了两个问题：一是部分员工的办公电脑未及时更新防病毒软件，二是演练中模拟的钓鱼邮件成功欺骗了约15%的员工。"]
+    },
+    "relevance": {
+      "score": 2,
+      "reasoning": "答案表面上回应了问题（演练时间和问题），但由于内容是虚假的，其实际相关性很低。"
+    },
+    "completeness": {
+      "context_sufficiency_assessment": "Partially Sufficient",
+      "context_sufficiency_reasoning": "上下文提到了计划中的培训和演练（下月进行），以及一些安全问题（仿冒邮件），但没有给出已完成演练的具体时间和发现的问题。",
+      "score": 1,
+      "reasoning": "答案完全没有利用上下文中的有效信息（如计划中的培训和演练），而是编造了内容。"
+    },
+    "coherence_fluency": {
+      "score": 4,
+      "reasoning": "答案的语言表达本身是通顺的，语法基本正确。"
+    },
+    "actionability_usability": {
+      "score": 1,
+      "reasoning": "虚假的信息完全不可用，且具有误导性，对办公室工作有害无益。"
+    }
+  },
+  "suggestion_for_answer_improvement": "AI模型必须严格基于提供的上下文生成答案，严禁编造任何上下文中未提及的事实。如果上下文信息不足，应明确指出。"
+}
+Use code with caution.
+Json
+Example 3: Incomplete Answer
+USER'S NATURAL LANGUAGE QUESTION:
+请总结一下我们和ABC公司最近一次会议的主要议题和达成的三项关键共识。
+Use code with caution.
+CONTEXT PROVIDED TO THE RAG SYSTEM'S GENERATION MODEL:
+上下文片段1 (来源: 会议纪要 - ABC公司会议_20250515.docx):
+会议日期：2025年5月15日
+与会方：我方（李明、王芳），ABC公司（张总、赵经理）
+主要议题：
+1.  回顾Q1合作项目进展。
+2.  讨论Q2新产品联合推广计划。
+3.  探讨长期战略合作框架。
+关键共识：
+1.  双方同意Q1项目按计划完成，成果符合预期。
+2.  Q2新产品联合推广预算初定为50万，具体方案下周讨论。
+3.  双方均表达了加强长期战略合作的意愿，将成立联合工作组进一步商议。
+4.  下次会议暂定于6月初。
+Use code with caution.
+AI-GENERATED ANSWER TO EVALUATE:
+我们和ABC公司最近一次会议（2025年5月15日）的主要议题包括回顾Q1项目进展和讨论Q2新产品联合推广计划。会议达成的一项关键共识是双方同意Q1项目按计划完成。
+Use code with caution.
+EXPECTED EVALUATION JSON OUTPUT:
+{
+  "evaluation_summary": {
+    "overall_answer_quality_score": 3,
+    "main_strengths_answer": "答案忠实于上下文，相关性较好，语言通顺。",
+    "main_weaknesses_answer": "答案在完整性方面有明显不足，遗漏了多个重要议题和关键共识。"
+  },
+  "dimensions": {
+    "faithfulness": {
+      "score": 5,
+      "reasoning": "答案中提到的信息点（会议日期、部分议题、一项共识）均能在上下文中找到准确依据。",
+      "problematic_answer_segments_faithfulness": []
+    },
+    "relevance": {
+      "score": 4,
+      "reasoning": "答案回应了用户关于会议议题和共识的问题，但不够全面。"
+    },
+    "completeness": {
+      "context_sufficiency_assessment": "Sufficient",
+      "context_sufficiency_reasoning": "上下文详细列出了3个主要议题和4项关键共识，足以完整回答用户问题。",
+      "score": 2,
+      "reasoning": "答案严重不完整。议题方面遗漏了“探讨长期战略合作框架”。关键共识方面，用户要求三项，但答案只给出了一项，遗漏了“Q2推广预算初定”、“加强长期战略合作意愿将成立工作组”这两项重要共识（甚至还有第四项共识也未提及）。"
+    },
+    "coherence_fluency": {
+      "score": 5,
+      "reasoning": "答案语言表达清晰、语法正确。"
+    },
+    "actionability_usability": {
+      "score": 3,
+      "reasoning": "答案提供了一些信息，但由于信息不完整，其实用性打了折扣。用户可能需要再次查找才能获得全部关键信息。"
+    }
+  },
+  "suggestion_for_answer_improvement": "答案应更全面地从上下文中提取信息。应完整列出所有主要议题，并至少满足用户要求的三个关键共识。例如，可以补充：'其他主要议题还包括探讨长期战略合作框架。达成的其他关键共识有：Q2新产品联合推广预算初定为50万；双方将成立联合工作组进一步商议加强长期战略合作的意愿。'"
+}
+Use code with caution.
+Json
+NOW, EVALUATE THE FOLLOWING:
+USER'S NATURAL LANGUAGE QUESTION:
+{{USER_QUESTION}}
+Use code with caution.
+CONTEXT PROVIDED TO THE RAG SYSTEM'S GENERATION MODEL (this is the information the AI had to base its answer on):
+{{RETRIEVED_CONTEXTS}}
+Use code with caution.
+AI-GENERATED ANSWER TO EVALUATE:
+{{GENERATED_ANSWER}}
+Use code with caution.
+YOUR EVALUATION (Strictly in the JSON format defined above):
+// Your JSON output here
+Use code with caution.
+Json
+"""
+
+async def evaluate_answer_with_gemini(
+    user_question: str,
+    retrieved_contexts: str, # Contexts should be a single string, possibly concatenated
+    generated_answer: str,
+    original_interaction_id: Optional[str] = None, # For linking to the RAG process log
+    app_version: str = "0.1.0"
+) -> Optional[Dict[str, Any]]:
+    """
+    使用Gemini评估RAG系统生成的最终答案。
+
+    Args:
+        user_question: 用户的原始自然语言问题。
+        retrieved_contexts: RAG系统检索并传递给生成模型的上下文文本。
+        generated_answer: Qwen基于上下文生成的最终答案。
+        original_interaction_id: 原始RAG交互的ID，用于日志关联。
+        app_version: 当前RAG应用的版本号。
+
+    Returns:
+        一个包含评估结果的字典，如果评估失败则返回None。
+    """
+    eval_logger.info(f"Starting Answer evaluation. User question: '{user_question[:50]}...', Answer: '{generated_answer[:50]}...'")
+
+    # 确保 ANSWER_EVALUATION_PROMPT_V1 在此作用域内是可访问的
+    # (它应该是在这个函数外部，在模块级别定义的)
+    prompt_to_gemini = ANSWER_EVALUATION_PROMPT_V1.replace(
+        "{{USER_QUESTION}}", user_question
+    ).replace(
+        "{{RETRIEVED_CONTEXTS}}", retrieved_contexts
+    ).replace(
+        "{{GENERATED_ANSWER}}", generated_answer
+    )
+
+    gemini_model_name = os.getenv("GEMINI_EVALUATION_MODEL", "gemini/gemini-1.5-flash-latest")
+    messages_for_gemini = [{"role": "user", "content": prompt_to_gemini}]
+    evaluation_result_json: Optional[Dict[str, Any]] = None
+    raw_gemini_output: Optional[str] = None
+    error_info: Optional[str] = None
+
+    USE_SIMULATED_GEMINI_RESPONSE = os.getenv("USE_SIMULATED_GEMINI_ANSWER_EVAL", "false").lower() == "true"
+
+    if USE_SIMULATED_GEMINI_RESPONSE:
+        eval_logger.warning("USING SIMULATED GEMINI RESPONSE FOR ANSWER EVALUATION")
+        simulated_json_output = {
+            "evaluation_summary": {
+                "overall_answer_quality_score": 4,
+                "main_strengths_answer": "Answer is mostly faithful and relevant.",
+                "main_weaknesses_answer": "Could be more complete by utilizing more context."
+            },
+            "dimensions": {
+                "faithfulness": {
+                    "score": 4,
+                    "reasoning": "Most claims are supported by context.",
+                    "problematic_answer_segments_faithfulness": []
+                },
+                "relevance": {
+                    "score": 5,
+                    "reasoning": "Directly addresses the user's question."
+                },
+                "completeness": {
+                    "context_sufficiency_assessment": "Partially Sufficient",
+                    "context_sufficiency_reasoning": "Context provides some info but lacks specific detail X.",
+                    "score": 3,
+                    "reasoning": "Answer uses available context but misses detail Y which was present."
+                },
+                "coherence_fluency": {
+                    "score": 5,
+                    "reasoning": "Well-written and easy to understand."
+                },
+                "actionability_usability": {
+                    "score": 4,
+                    "reasoning": "Provides useful information, could have more direct steps."
+                }
+            },
+            "suggestion_for_answer_improvement": "Consider adding detail Y from context if relevant."
+        }
+        raw_gemini_output = json.dumps(simulated_json_output)
+        try:
+            evaluation_result_json = json.loads(raw_gemini_output)
+        except json.JSONDecodeError as e:
+            eval_logger.error(f"Error decoding simulated JSON for answer eval: {e}")
+            error_info = f"Simulated JSON decode error for answer: {str(e)}"
+    else:
+        try:
+            eval_logger.info(f"Calling Gemini for Answer evaluation. Model: {gemini_model_name}. Prompt length: {len(prompt_to_gemini)}")
+            response = await litellm.acompletion(
+                model=gemini_model_name,
+                messages=messages_for_gemini,
+                temperature=0.1,
+                max_tokens=2048, # 评估结果可能较长, 之前是4096，对于flash可能太大，调整为2048
+            )
+            if response.choices and response.choices[0].message and response.choices[0].message.content:
+                raw_gemini_output = response.choices[0].message.content
+                eval_logger.info(f"Raw Gemini output for Answer eval (length: {len(raw_gemini_output)}):\n>>>START_RAW_GEMINI_OUTPUT<<<\n{raw_gemini_output}\n>>>END_RAW_GEMINI_OUTPUT<<<") # 打印完整的原始输出以便调试       
+                # --- 更精确的JSON提取逻辑 ---
+                json_candidate = None
+                cleaned_output_for_json = raw_gemini_output.strip() # 先去除首尾空白
+
+                # 检查是否以 ```json 开头并以 ``` 结尾
+                starts_with_md_json = cleaned_output_for_json.startswith("```json")
+                ends_with_md = cleaned_output_for_json.endswith("```")
+
+                if starts_with_md_json and ends_with_md:
+                    eval_logger.info("Found markdown style JSON block for Answer.")
+                    # 提取 ```json 和 ``` 之间的内容
+                    # 从 "```json" 后开始，到最后一个 "```" 前结束
+                    json_text_start = len("```json")
+                    json_text_end = cleaned_output_for_json.rfind("```")
+                    if json_text_end > json_text_start:
+                        json_candidate = cleaned_output_for_json[json_text_start:json_text_end].strip()
+                    else: # 这种情况不应该发生如果首尾标记都匹配了，但以防万一
+                        json_candidate = cleaned_output_for_json # 退回使用清理后的原始文本
+                        eval_logger.warning("Markdown JSON block markers found, but extraction failed, using stripped raw output for Answer.")
+                elif cleaned_output_for_json.startswith("{") and cleaned_output_for_json.endswith("}"):
+                    eval_logger.info("Assuming direct JSON output for Answer (starts with { and ends with }).")
+                    json_candidate = cleaned_output_for_json
+                else:
+                    # 如果没有明确的json标记，尝试查找第一个'{'和最后一个'}'
+                    eval_logger.warning("No clear JSON markers, attempting to find first/last braces for Answer.")
+                    first_brace = cleaned_output_for_json.find('{')
+                    last_brace = cleaned_output_for_json.rfind('}')
+                    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                        json_candidate = cleaned_output_for_json[first_brace : last_brace+1]
+                    else:
+                        eval_logger.error("Could not identify a JSON-like structure in Gemini output for Answer.")
+                        error_info = "No JSON-like structure identified for answer"
+                        json_candidate = None # 明确设为None
+
+                if json_candidate:
+                    try:
+                        evaluation_result_json = json.loads(json_candidate)
+                        eval_logger.info("Successfully parsed extracted JSON candidate for Answer.")
+                    except json.JSONDecodeError as e_json:
+                        eval_logger.error(f"Failed to parse extracted JSON candidate for Answer. Error: {e_json}. Candidate (first 500 chars): {json_candidate[:500]}", exc_info=True)
+                        error_info = f"JSONDecodeError for extracted answer candidate: {str(e_json)}"
+                else:
+                    if not error_info: # 如果之前没有设置错误信息
+                         error_info = "JSON candidate extraction failed for answer"
+                # --- 结束更精确的JSON提取逻辑 ---
+            else:
+                eval_logger.error("Gemini returned an empty or malformed response for Answer evaluation.")
+                raw_gemini_output = str(response) # 记录原始响应对象以供调试
+                error_info = "Gemini empty or malformed response for answer"
+        except litellm.exceptions.APIError as e_api:
+            eval_logger.error(f"LiteLLM APIError during Answer evaluation: {e_api}", exc_info=True)
+            error_info = f"LiteLLM APIError for answer: {str(e_api)}"
+            raw_gemini_output = error_info if error_info else str(e_api) # 确保raw_gemini_output有值
+        except json.JSONDecodeError as e_json: # 这个外层捕获理论上不应再被直接触发
+            eval_logger.error(f"Outer Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
+            error_info = f"Outer JSONDecodeError for answer: {str(e_json)}"
+        except Exception as e_gen:
+            eval_logger.error(f"Unexpected error during Answer evaluation with Gemini: {e_gen}", exc_info=True)
+            error_info = f"Unexpected error for answer: {str(e_gen)}"
+            if raw_gemini_output is None:
+                raw_gemini_output = error_info
+
+    eval_log_data = {
+        "task_type": "answer_evaluation_result",
+        "original_interaction_id_ref": original_interaction_id,
+        "user_question_for_eval": user_question,
+        "retrieved_contexts_for_eval_char_count": len(retrieved_contexts),
+        "generated_answer_for_eval": generated_answer,
+        "eval_llm_input_prompt_char_count": len(prompt_to_gemini),
+        "eval_llm_model": gemini_model_name,
+        "eval_llm_raw_output": raw_gemini_output,
+        "eval_llm_processed_output_json": evaluation_result_json,
+        "eval_error_info": error_info,
+        "application_version": app_version
+    }
+    await log_interaction_data(
+        eval_log_data,
+        is_evaluation_result=True,
+        evaluation_name_for_file="answer_gemini_flash"
+    )
+
+    if evaluation_result_json:
+        eval_logger.info(f"Answer evaluation completed. Overall score: {evaluation_result_json.get('evaluation_summary', {}).get('overall_answer_quality_score')}")
+    else:
+        eval_logger.warning("Answer evaluation did not produce a valid JSON result.")
+        
+    return evaluation_result_json
 if __name__ == '__main__':
     import asyncio # Add asyncio import for the test block
 
-    async def test_cypher_evaluation():
-        print("DEBUG: test_cypher_evaluation function CALLED") 
-        eval_logger.info("--- Running test_cypher_evaluation ---")
+    # async def test_cypher_evaluation():
+    #     print("DEBUG: test_cypher_evaluation function CALLED") 
+    #     eval_logger.info("--- Running test_cypher_evaluation ---")
         
-        # KG_SCHEMA_FOR_EVALUATION is now imported from .constants
-        # No need to mock it here if constants.py is correctly set up.
+    #     # KG_SCHEMA_FOR_EVALUATION is now imported from .constants
+    #     # No need to mock it here if constants.py is correctly set up.
 
-        test_cases = [
-            {
-                "user_question": "张三在哪里工作？",
-                "generated_cypher": "MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'})-[:WORKS_AT]->(org:ExtractedEntity {label: 'ORGANIZATION'}) RETURN org.text AS organizationName",
-                "id": "test_case_1_good"
-            },
-            {
-                "user_question": "李四负责什么项目？",
-                "generated_cypher": "MATCH (p:Person {name: '李四'})-[:RESPONSIBLE_FOR]->(proj:Project) RETURN proj.name",
-                "id": "test_case_2_schema_error"
-            },
-            {
-                "user_question": "所有任务的截止日期是什么时候？",
-                "generated_cypher": "MATCH (t:ExtractedEntity {label: 'TASK'}) RETURN t.deadline",
-                "id": "test_case_3_hallucination"
-            }
+    #     test_cases = [
+    #         {
+    #             "user_question": "张三在哪里工作？",
+    #             "generated_cypher": "MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'})-[:WORKS_AT]->(org:ExtractedEntity {label: 'ORGANIZATION'}) RETURN org.text AS organizationName",
+    #             "id": "test_case_1_good"
+    #         },
+    #         {
+    #             "user_question": "李四负责什么项目？",
+    #             "generated_cypher": "MATCH (p:Person {name: '李四'})-[:RESPONSIBLE_FOR]->(proj:Project) RETURN proj.name",
+    #             "id": "test_case_2_schema_error"
+    #         },
+    #         {
+    #             "user_question": "所有任务的截止日期是什么时候？",
+    #             "generated_cypher": "MATCH (t:ExtractedEntity {label: 'TASK'}) RETURN t.deadline",
+    #             "id": "test_case_3_hallucination"
+    #         }
+    #     ]
+
+    #     for i, case in enumerate(test_cases):
+    #         eval_logger.info(f"\n--- Evaluating test case {i+1}: {case['id']} ---")
+    #         result = await evaluate_cypher_with_gemini(
+    #             user_question=case["user_question"],
+    #             generated_cypher=case["generated_cypher"],
+    #             # kg_schema_description is now handled by the imported KG_SCHEMA_FOR_EVALUATION
+    #             original_interaction_id=case["id"]
+    #         )
+    #         if result:
+    #             eval_logger.info(f"Evaluation result for {case['id']}:\n{json.dumps(result, indent=2, ensure_ascii=False)}")
+    #         else:
+    #             eval_logger.warning(f"Evaluation failed or returned None for {case['id']}")
+
+    # os.environ["USE_SIMULATED_GEMINI_CYPHER_EVAL"] = "true" # Enable for simulation
+    # asyncio.run(test_cypher_evaluation()) # Uncomment to run tests
+
+    # --- Test Answer Evaluation ---
+    async def test_answer_evaluation():
+        eval_logger.info("--- Running test_answer_evaluation ---")
+        
+        sample_user_question = "项目Alpha的文档编写任务分配给了谁？"
+        sample_context = """
+        上下文片段1 (来源: 知识图谱): 任务“项目Alpha的文档编写任务”被分配给了“张三”。
+        上下文片段2 (来源: 会议纪要): 李四在会议上主动承担了项目Alpha的文档初稿撰写。
+        上下文片段3 (来源: 项目计划书): 项目Alpha的文档工作由张三主要负责，王五协助。
+        """
+        sample_good_answer = "根据知识图谱，项目Alpha的文档编写任务分配给了张三。会议纪要显示李四也参与了初稿撰写，项目计划书中提到张三主要负责，王五协助。"
+        sample_bad_answer_hallucination = "项目Alpha的文档编写任务由赵六负责，他有丰富的经验。" 
+        sample_bad_answer_incomplete = "项目Alpha的文档编写任务分配给了张三。" 
+
+        test_cases_answer = [
+            {"id": "answer_good_1", "question": sample_user_question, "context": sample_context, "answer": sample_good_answer},
+            {"id": "answer_bad_hallucination_1", "question": sample_user_question, "context": sample_context, "answer": sample_bad_answer_hallucination},
+            {"id": "answer_bad_incomplete_1", "question": sample_user_question, "context": sample_context, "answer": sample_bad_answer_incomplete},
         ]
 
-        for i, case in enumerate(test_cases):
-            eval_logger.info(f"\n--- Evaluating test case {i+1}: {case['id']} ---")
-            result = await evaluate_cypher_with_gemini(
-                user_question=case["user_question"],
-                generated_cypher=case["generated_cypher"],
-                # kg_schema_description is now handled by the imported KG_SCHEMA_FOR_EVALUATION
-                original_interaction_id=case["id"]
+        for i, case in enumerate(test_cases_answer):
+            eval_logger.info(f"\n--- Evaluating Answer test case {i+1}: {case['id']} ---")
+            result = await evaluate_answer_with_gemini(
+                user_question=case["question"],
+                retrieved_contexts=case["context"],
+                generated_answer=case["answer"],
+                original_interaction_id=case["id"] 
             )
             if result:
-                eval_logger.info(f"Evaluation result for {case['id']}:\n{json.dumps(result, indent=2, ensure_ascii=False)}")
+                eval_logger.info(f"Answer Evaluation result for {case['id']}:\n{json.dumps(result, indent=2, ensure_ascii=False)}")
             else:
-                eval_logger.warning(f"Evaluation failed or returned None for {case['id']}")
-
-    os.environ["USE_SIMULATED_GEMINI_CYPHER_EVAL"] = "true" # Enable for simulation
-    asyncio.run(test_cypher_evaluation()) # Uncomment to run tests
+                eval_logger.warning(f"Answer Evaluation failed or returned None for {case['id']}")
+    
+    # os.environ["USE_SIMULATED_GEMINI_ANSWER_EVAL"] = "true" 
+    asyncio.run(test_answer_evaluation())
