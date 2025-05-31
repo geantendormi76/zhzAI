@@ -6,7 +6,7 @@ from neo4j import GraphDatabase, basic_auth, Result, Record
 from neo4j.graph import Node, Relationship, Path
 import asyncio
 import logging
-from .constants import NEW_KG_SCHEMA_DESCRIPTION
+from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 
 # --- 日志配置 (保持您之前的优秀配置) ---
 _kg_py_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,8 +26,8 @@ try:
 except Exception as e:
     print(f"CRITICAL: Failed to configure file handler for kg_logger: {e}")
 
-from zhz_agent.llm import generate_cypher_query
-from zhz_agent.pydantic_models import RetrievedDocument
+from zhz_rag.llm.sglang_wrapper import generate_cypher_query
+from zhz_rag.config.pydantic_models import RetrievedDocument
 from dotenv import load_dotenv
 load_dotenv()
 

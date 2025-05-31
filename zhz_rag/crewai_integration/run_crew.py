@@ -7,10 +7,10 @@ import datetime
 from crewai import Agent, Task, Crew, Process
 
 # --- 导入我们自己的项目模块 (使用绝对导入) ---
-from zhz_agent.custom_crewai_tools import HybridRAGTool, BaseMCPTool
-from zhz_agent.pydantic_models import QueryRequest # 用于 RAG 工具的输入
-from zhz_agent.utils import call_mcpo_tool
-from zhz_agent.custom_llm import CustomGeminiLLM
+from zhz_rag.crewai_integration.tools import HybridRAGTool, BaseMCPTool
+from zhz_rag.config.pydantic_models import QueryRequest # 用于 RAG 工具的输入
+from zhz_rag.utils.common_utils import call_mcpo_tool
+from zhz_rag.llm.custom_crewai_llms import CustomGeminiLLM
 
 # --- 环境配置 ---
 from dotenv import load_dotenv

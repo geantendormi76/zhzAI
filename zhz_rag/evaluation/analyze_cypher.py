@@ -8,7 +8,7 @@ from collections import Counter
 # --- 配置 ---
 # 假设您的日志文件与此脚本在同一目录下或可以通过相对/绝对路径访问
 # 您需要将此路径替换为实际的 .jsonl 文件路径
-LOG_FILE_DIR = "zhz_agent/rag_eval_data/" # 日志文件所在目录
+LOG_FILE_DIR = "zhz_rag/stored_data/evaluation_results_logs/" # 日志文件所在目录
 # 默认分析当天的日志，您可以修改为特定的文件名
 # from datetime import datetime, timezone
 # today_str = datetime.now(timezone.utc).strftime("%Y%m%d")

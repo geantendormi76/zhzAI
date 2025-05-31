@@ -7,15 +7,16 @@ import glob
 from datetime import datetime # 确保导入
 
 try:
-    from zhz_agent.evaluation import evaluate_cypher_with_gemini
-    from zhz_agent.constants import NEW_KG_SCHEMA_DESCRIPTION
-    from zhz_agent.utils import get_interaction_log_filepath, find_latest_rag_interaction_log # <--- 确保这里导入了 find_latest_rag_interaction_log
+    from zhz_rag.evaluation.evaluator import evaluate_cypher_with_gemini
+    from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+    from zhz_rag.utils.common_utils import get_interaction_log_filepath, find_latest_rag_interaction_log
 except ImportError as e:
     print(f"ERROR: Could not import necessary modules: {e}")
     print("Make sure this script is run in an environment where 'zhz_agent' is accessible.")
     print("If running from outside the project root, you might need to set PYTHONPATH.")
     print("Example: PYTHONPATH=/path/to/your/project python -m zhz_agent.run_batch_cypher_evaluation")
     exit(1)
+from zhz_rag.utils.common_utils import RAG_INTERACTION_LOGS_DIR
 
 import logging
 
@@ -28,9 +29,6 @@ if not batch_cypher_eval_logger.hasHandlers():
     _console_handler.setFormatter(_formatter)
     batch_cypher_eval_logger.addHandler(_console_handler)
     batch_cypher_eval_logger.info("--- BatchCypherEvaluationLogger configured ---")
-
-# LOG_FILE_DIR 定义在脚本的顶层
-LOG_FILE_DIR = "zhz_agent/rag_eval_data/"
 
 async def batch_evaluate_cyphers_from_file(
     rag_interaction_log_filepath: str,
@@ -112,9 +110,9 @@ async def batch_evaluate_cyphers_from_file(
 
 
 if __name__ == "__main__":
+    
     # 1. 自动查找最新的原始RAG交互日志文件
-    log_file_to_evaluate = find_latest_rag_interaction_log(LOG_FILE_DIR)
-
+    log_file_to_evaluate = find_latest_rag_interaction_log(RAG_INTERACTION_LOGS_DIR) 
     # 2. 从环境变量决定是否模拟API调用
     use_simulated = os.getenv("USE_SIMULATED_GEMINI_CYPHER_EVAL", "false").lower() == "true"
     app_version_tag = "0.1.2_batch_cypher_auto" # 更新版本标签

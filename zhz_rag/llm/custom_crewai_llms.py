@@ -11,7 +11,7 @@ from crewai.llms.base_llm import BaseLLM as CrewAIBaseLLM
 import litellm
 
 # --- [修改] Local Imports -> 改为绝对导入 ---
-from zhz_agent.llm import call_sglang_llm # For SGLang LLM
+from zhz_rag.llm.sglang_wrapper import call_sglang_llm # For SGLang LLM
 from dotenv import load_dotenv
 
 load_dotenv()

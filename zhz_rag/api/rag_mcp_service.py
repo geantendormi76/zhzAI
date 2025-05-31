@@ -41,8 +41,8 @@ except Exception as e:
 
 
 # --- 从项目内部导入所有 RAG 模块 ---
-from zhz_agent.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
-from zhz_agent.llm import (
+from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
+from zhz_rag.llm.sglang_wrapper import (
     generate_answer_from_context,
     generate_expanded_queries,
     generate_cypher_query,
@@ -50,11 +50,11 @@ from zhz_agent.llm import (
     generate_intent_classification,
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
-from zhz_agent.chromadb_retriever import ChromaDBRetriever
-from zhz_agent.file_bm25_retriever import FileBM25Retriever
-from zhz_agent.kg import KGRetriever
-from zhz_agent.fusion import FusionEngine
-from zhz_agent.utils import log_interaction_data
+from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
+from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
+from zhz_rag.core_rag.kg_retriever import KGRetriever
+from zhz_rag.core_rag.fusion_engine import FusionEngine
+from zhz_rag.utils.common_utils import log_interaction_data
 
 from dotenv import load_dotenv
 

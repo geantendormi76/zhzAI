@@ -6,26 +6,30 @@ import asyncio # 用于 asyncio.to_thread
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import traceback # Ensure traceback is imported
-from zhz_agent.utils import log_interaction_data # <--- 添加: 导入通用日志函数
+from zhz_rag.utils.common_utils import log_interaction_data # <--- 添加: 导入通用日志函数
 import logging
 import uuid # <--- 添加: 用于生成 interaction_id
 from datetime import datetime, timezone # <--- 添加: 用于生成时间戳
 load_dotenv() # 确保加载.env文件
 
-# --- 日志文件配置 (新添加) ---
-RAG_EVAL_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rag_eval_data')
-# 确保目录存在，如果不存在则创建
-if not os.path.exists(RAG_EVAL_DATA_DIR):
+_LLM_DIR = os.path.dirname(os.path.abspath(__file__))
+# ../../stored_data/rag_interaction_logs/
+RAG_INTERACTION_LOGS_DIR = os.path.join(_LLM_DIR, '..', '..', 'stored_data', 'rag_interaction_logs')
+# 确保目录存在
+if not os.path.exists(RAG_INTERACTION_LOGS_DIR):
     try:
-        os.makedirs(RAG_EVAL_DATA_DIR)
-        print(f"Successfully created directory: {RAG_EVAL_DATA_DIR}")
+        os.makedirs(RAG_INTERACTION_LOGS_DIR)
+        # print(f"Successfully created directory: {RAG_INTERACTION_LOGS_DIR}") # 移除这行，让 logger 处理
     except Exception as e:
-        print(f"Error creating directory {RAG_EVAL_DATA_DIR}: {e}. Please create it manually.")
+        # print(f"Error creating directory {RAG_INTERACTION_LOGS_DIR}: {e}. Please create it manually.")
+        pass # 允许失败，日志函数会处理
 
+# get_llm_log_filepath 应该使用这个新的路径
 def get_llm_log_filepath() -> str:
     """获取当前LLM交互日志文件的完整路径，按天分割。"""
     today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return os.path.join(RAG_EVAL_DATA_DIR, f"llm_interactions_{today_str}.jsonl")
+    # 将LLM交互日志也归入 RAG 交互日志中
+    return os.path.join(RAG_INTERACTION_LOGS_DIR, f"rag_interactions_{today_str}.jsonl")
 
 async def log_llm_interaction_to_jsonl(interaction_data: Dict[str, Any]):
     """

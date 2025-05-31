@@ -4,10 +4,10 @@ from sqlalchemy.sql import func
 import uuid
 
 # --- [修改] 从 pydantic_models 导入枚举 -> 改为绝对导入 ---
-from zhz_agent.pydantic_models import TaskStatus, ReminderMethod
+from zhz_rag.config.pydantic_models import TaskStatus, ReminderMethod
 
 # --- [修改] 从新的 database.py 导入 Base -> 改为绝对导入 ---
-from zhz_agent.database import Base # <--- 确保只从这里导入 Base #
+from zhz_rag.utils.db_utils import Base # <--- 确保只从这里导入 Base #
 
 class TaskDB(Base): # 命名为 TaskDB 以区分 Pydantic 的 TaskModel
     __tablename__ = "tasks"

@@ -7,16 +7,16 @@ import traceback # 导入 traceback
 import pytz
 
 # --- [修改] 从 pydantic_models 导入我们定义的模型 -> 改为绝对导入 ---
-from zhz_agent.pydantic_models import TaskModel, CreateTaskRequest, UpdateTaskRequest, TaskStatus, ReminderMethod
+from zhz_rag.config.pydantic_models import TaskModel, CreateTaskRequest, UpdateTaskRequest, TaskStatus, ReminderMethod
 
 # --- [修改] 从 database_models 导入 SQLAlchemy 表模型 -> 改为绝对导入 ---
-from zhz_agent.database_models import TaskDB
+from zhz_rag.task_management.db_models import TaskDB
 
 # --- [修改] 从新的 database.py 导入 database 对象 和 get_scheduler -> 改为绝对导入 ---
-from zhz_agent.database import database, get_scheduler
+from zhz_rag.utils.db_utils import database, get_scheduler # 将 db_utils 修改为 database
 
 # --- [修改] 从 .task_jobs 导入作业函数 -> 改为绝对导入 ---
-from zhz_agent.task_jobs import send_task_reminder, execute_task_action
+from zhz_rag.task_management.jobs import send_task_reminder, execute_task_action
 from apscheduler.triggers.date import DateTrigger # 用于指定精确的运行时间
 from apscheduler.jobstores.base import JobLookupError # <--- [修改] 导入 JobLookupError 的正确路径
 

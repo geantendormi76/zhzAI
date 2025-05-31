@@ -7,9 +7,9 @@ import glob
 from datetime import datetime # 确保导入
 
 try:
-    from zhz_agent.evaluation import evaluate_answer_with_gemini
-    from zhz_agent.utils import get_interaction_log_filepath # 用于找到原始RAG交互日志文件
-    from zhz_agent.pydantic_models import RetrievedDocument
+    from zhz_rag.evaluation.evaluator import evaluate_answer_with_gemini
+    from zhz_rag.utils.common_utils import RAG_INTERACTION_LOGS_DIR, find_latest_rag_interaction_log # 导入常量和函数
+    from zhz_rag.config.pydantic_models import RetrievedDocument
 except ImportError as e:
     print(f"ERROR: Could not import necessary modules: {e}")
     print("Make sure this script is run in an environment where 'zhz_agent' is accessible.")
@@ -28,9 +28,6 @@ if not batch_answer_eval_logger.hasHandlers():
     _console_handler.setFormatter(_formatter)
     batch_answer_eval_logger.addHandler(_console_handler)
     batch_answer_eval_logger.info("--- BatchAnswerEvaluationLogger configured ---")
-
-# LOG_FILE_DIR 定义在脚本的顶层，方便 find_latest_rag_interaction_log 和 if __name__ == "__main__" 使用
-LOG_FILE_DIR = "zhz_agent/rag_eval_data/"
 
 def format_contexts_for_evaluation(context_docs: List[Dict[str, Any]]) -> str:
     """
@@ -139,22 +136,9 @@ async def batch_evaluate_answers_from_file(
     batch_answer_eval_logger.info(f"Batch Answer evaluation finished. Summary: {summary}")
     return summary
 
-def find_latest_rag_interaction_log(log_dir: str) -> Optional[str]:
-    """在指定目录中查找最新的 RAG 交互日志文件 (rag_interactions_*.jsonl)。"""
-    rag_log_pattern = os.path.join(log_dir, "rag_interactions_*.jsonl")
-    candidate_rag_logs = glob.glob(rag_log_pattern)
-    
-    if candidate_rag_logs:
-        candidate_rag_logs.sort(key=os.path.getmtime, reverse=True)
-        batch_answer_eval_logger.info(f"Automatically selected RAG output log file for answer evaluation: {candidate_rag_logs[0]}")
-        return candidate_rag_logs[0]
-    else:
-        batch_answer_eval_logger.warning(f"No RAG interaction log files found matching pattern: {rag_log_pattern} in directory {log_dir}")
-        return None
-
 if __name__ == "__main__":
     # 1. 自动查找最新的原始RAG交互日志文件
-    log_file_to_evaluate = find_latest_rag_interaction_log(LOG_FILE_DIR)
+    log_file_to_evaluate = find_latest_rag_interaction_log(RAG_INTERACTION_LOGS_DIR)
 
     # 2. 从环境变量决定是否模拟API调用
     use_simulated = os.getenv("USE_SIMULATED_GEMINI_ANSWER_EVAL", "false").lower() == "true"

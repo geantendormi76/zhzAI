@@ -10,7 +10,7 @@ from crewai.tools import BaseTool
 import httpx
 
 # 从 zhz_agent.pydantic_models 导入 QueryRequest
-from zhz_agent.pydantic_models import QueryRequest # 用于 RAG 工具的输入
+from zhz_rag.config.pydantic_models import QueryRequest # 用于 RAG 工具的输入
 
 # MCPO 代理的基地址
 MCPO_BASE_URL = os.getenv("MCPO_BASE_URL", "http://localhost:8006")
@@ -138,7 +138,7 @@ class HybridRAGTool(BaseMCPTool):
         "当用户需要从知识库中获取信息、回答复杂问题或生成报告时，应调用此工具。"
     )
     args_schema: Type[BaseModel] = QueryRequest
-    target_mcp_service_path: str = "zhz_agent_service/query_rag"
+    target_mcp_service_path: str = "zhz_agent_rag_service/query_rag_v2"
 
     async def _arun(self, query: str, top_k_vector: int, top_k_kg: int, top_k_bm25: int, **kwargs: Any) -> str: # --- 确认有 **kwargs ---
         tool_name_for_log = getattr(self, 'name', "HybridRAGTool")

@@ -8,11 +8,16 @@ from datetime import datetime
 
 # 假设 utils.py 和 constants.py 在同一个 zhz_agent 包内
 try:
-    from zhz_agent.utils import find_latest_rag_interaction_log
-    from zhz_agent.pydantic_models import RetrievedDocument
+    from zhz_rag.utils.common_utils import (
+    RAG_INTERACTION_LOGS_DIR,
+    EVALUATION_RESULTS_LOGS_DIR,
+    FINETUNING_GENERATED_DATA_DIR,
+    find_latest_rag_interaction_log # 确保这个也被导入
+)
+    from zhz_rag.config.pydantic_models import RetrievedDocument
     # NO_ANSWER_PHRASE_ANSWER_CLEAN 将从 llm.py 导入，或者在constants.py中定义
     # 我们需要与 llm.py -> generate_answer_from_context 一致的 "无法回答" 短语
-    from zhz_agent.llm import NO_ANSWER_PHRASE_ANSWER_CLEAN 
+    from zhz_rag.llm.sglang_wrapper import NO_ANSWER_PHRASE_ANSWER_CLEAN 
 except ImportError as e:
     print(f"ERROR: Could not import necessary modules for refine_answer_finetune_data: {e}")
     exit(1)
@@ -30,9 +35,9 @@ if not refine_answer_logger.hasHandlers():
     refine_answer_logger.info("--- RefineAnswerFinetuneDataLogger configured ---")
 
 # --- 配置 ---
-RAG_LOG_DIR = "zhz_agent/rag_eval_data/"
-EVAL_LOG_DIR = "zhz_agent/rag_eval_data/"
-FINETUNE_DATA_DIR = "zhz_agent/finetune_data/"
+RAG_LOG_DIR = "zhz_rag/stored_data/evaluation_results_logs/"
+EVAL_LOG_DIR = "zhz_rag/stored_data/evaluation_results_logs/"
+FINETUNE_DATA_DIR = "zhz_rag/finetuning/generated_data/"
 os.makedirs(FINETUNE_DATA_DIR, exist_ok=True)
 
 # --- 与 run_batch_answer_evaluation.py 中类似的上下文格式化函数 ---
@@ -283,7 +288,7 @@ def generate_finetune_samples_for_answer(
 
 
 if __name__ == "__main__":
-    rag_log_file = find_latest_rag_interaction_log(RAG_LOG_DIR)
+    rag_log_file = find_latest_rag_interaction_log(RAG_INTERACTION_LOGS_DIR)
     
     eval_log_file = None
     if rag_log_file:
@@ -309,7 +314,7 @@ if __name__ == "__main__":
             
             if finetune_data:
                 today_for_filename = datetime.now().strftime("%Y%m%d")
-                output_filepath = os.path.join(FINETUNE_DATA_DIR, f"answer_finetune_samples_{today_for_filename}.jsonl")
+                output_filepath = os.path.join(FINETUNING_GENERATED_DATA_DIR, f"answer_finetune_samples_{today_for_filename}.jsonl")
                 
                 with open(output_filepath, 'w', encoding='utf-8') as f_out:
                     for sample in finetune_data:
@@ -318,7 +323,7 @@ if __name__ == "__main__":
                 
                 try:
                     df = pd.DataFrame(finetune_data)
-                    csv_output_filepath = os.path.join(FINETUNE_DATA_DIR, f"answer_finetune_samples_review_{today_for_filename}.csv")
+                    csv_output_filepath = os.path.join(FINETUNING_GENERATED_DATA_DIR, f"answer_finetune_samples_review_{today_for_filename}.csv")
                     df.to_csv(csv_output_filepath, index=False, encoding='utf-8-sig')
                     refine_answer_logger.info(f"Reviewable CSV for answers saved to: {csv_output_filepath}")
                 except Exception as e_csv:

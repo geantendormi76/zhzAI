@@ -8,9 +8,9 @@ import litellm # 用于调用Gemini API
 from dotenv import load_dotenv
 import re
 # 导入通用日志函数
-from .utils import log_interaction_data
+from zhz_rag.utils.common_utils import log_interaction_data # <--- 修改这里
 # 导入共享的Schema描述
-from .constants import NEW_KG_SCHEMA_DESCRIPTION as KG_SCHEMA_FOR_EVALUATION
+from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION as KG_SCHEMA_FOR_EVALUATION # <--- 修改这里
 
 load_dotenv()
 

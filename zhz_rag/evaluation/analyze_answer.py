@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 from collections import Counter
 
 # --- 配置 ---
-LOG_FILE_DIR = "zhz_agent/rag_eval_data/" # 日志文件所在目录
+LOG_FILE_DIR = "zhz_rag/stored_data/evaluation_results_logs/" # 日志文件所在目录
 
 # --- 修改这里以指向新的答案评估结果文件名 ---
 # 您需要根据 evaluation.py 中 evaluation_name_for_file 的设置来构造正确的文件名

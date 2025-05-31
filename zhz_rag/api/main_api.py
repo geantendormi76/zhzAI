@@ -6,9 +6,9 @@ import logging
 from typing import Type, List, Dict, Any, Optional, ClassVar
 
 # --- [修改] 导入 -> 改为绝对导入 ---
-from zhz_agent.database import database, sqlalchemy_engine, Base, get_scheduler # <--- [修改] 导入 get_scheduler
-from zhz_agent.task_manager_service import router as tasks_router
-from zhz_agent import database_models # 确保 SQLAlchemy 模型被导入
+from zhz_rag.utils.db_utils import database, sqlalchemy_engine, Base, get_scheduler
+from zhz_rag.api.task_manager_api import router as tasks_router
+from zhz_rag.task_management import db_models # 确保 SQLAlchemy 模型被导入
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):

@@ -9,7 +9,7 @@ import logging
 import os
 
 # 从项目内部导入pydantic_models
-from zhz_agent.pydantic_models import RetrievedDocument
+from zhz_rag.config.pydantic_models import RetrievedDocument
 
 class FusionEngine:
     _current_script_path = os.path.abspath(__file__)

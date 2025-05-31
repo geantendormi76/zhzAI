@@ -8,8 +8,8 @@ from datetime import datetime
 
 # 假设 utils.py 和 constants.py 在同一个 zhz_agent 包内
 try:
-    from zhz_agent.utils import get_interaction_log_filepath, get_evaluation_result_log_filepath, find_latest_rag_interaction_log # <--- 修改这里
-    from zhz_agent.constants import NEW_KG_SCHEMA_DESCRIPTION
+    from zhz_rag.utils.common_utils import get_interaction_log_filepath, get_evaluation_result_log_filepath, find_latest_rag_interaction_log # <--- 修改这里
+    from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 except ImportError as e:
     print(f"ERROR: Could not import necessary modules: {e}")
     # ... (错误处理)
@@ -29,11 +29,11 @@ if not refine_logger.hasHandlers():
 
 # --- 配置 ---
 # 原始RAG交互日志的目录 (包含cypher_generation类型)
-RAG_LOG_DIR = "zhz_agent/rag_eval_data/"
+RAG_LOG_DIR = "zhz_rag/stored_data/rag_interaction_logs/"
 # Gemini评估结果日志的目录
-EVAL_LOG_DIR = "zhz_agent/rag_eval_data/"
+EVAL_LOG_DIR = "zhz_rag/stored_data/evaluation_results_logs/"
 # 输出微调数据文件的目录
-FINETUNE_DATA_DIR = "zhz_agent/finetune_data/"
+FINETUNE_DATA_DIR = "zhz_rag/finetuning/generated_data/"
 os.makedirs(FINETUNE_DATA_DIR, exist_ok=True)
 
 
