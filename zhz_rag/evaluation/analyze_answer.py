@@ -1,100 +1,129 @@
-# analyze_answer_evaluations.py
+# zhz_rag/evaluation/analyze_answer.py
 import json
 import os
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import Counter
 
-# --- 配置 ---
-LOG_FILE_DIR = "zhz_rag/stored_data/evaluation_results_logs/" # 日志文件所在目录
+# --- 从项目中导入必要的模块 ---
+try:
+    from zhz_rag.utils.common_utils import (
+        load_jsonl_file, # <--- 使用新的通用函数
+        EVALUATION_RESULTS_LOGS_DIR # 导入评估日志目录常量
+    )
+except ImportError as e:
+    print(f"ERROR: Could not import necessary modules in analyze_answer.py: {e}")
+    print("Make sure this script is run in an environment where 'zhz_rag' package is accessible.")
+    exit(1)
 
-# --- 修改这里以指向新的答案评估结果文件名 ---
-# 您需要根据 evaluation.py 中 evaluation_name_for_file 的设置来构造正确的文件名
-EVALUATION_NAME_ANSWER = "answer_gemini_flash" # <<<--- 确保这个与 evaluation.py 中的一致
-# from datetime import datetime, timezone
-# today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-# LOG_FILE_NAME_ANSWER = f"eval_results_{EVALUATION_NAME_ANSWER}_{today_str}.jsonl"
-LOG_FILE_NAME_ANSWER = f"eval_results_{EVALUATION_NAME_ANSWER}_20250530.jsonl" # <<<--- 请修改为您实际评估结果的日志文件名 (注意日期)
+import logging
 
-LOG_FILE_PATH_ANSWER = os.path.join(LOG_FILE_DIR, LOG_FILE_NAME_ANSWER)
+# --- 配置此脚本的logger ---
+analyze_answer_logger = logging.getLogger("AnalyzeAnswerLogger")
+analyze_answer_logger.setLevel(logging.INFO)
+if not analyze_answer_logger.hasHandlers():
+    _console_handler = logging.StreamHandler()
+    _formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s')
+    _console_handler.setFormatter(_formatter)
+    analyze_answer_logger.addHandler(_console_handler)
+    analyze_answer_logger.propagate = False
+analyze_answer_logger.info("--- AnalyzeAnswerLogger configured ---")
 
-OUTPUT_CSV_FILE_ANSWER = os.path.join(LOG_FILE_DIR, f"analysis_{EVALUATION_NAME_ANSWER}_{os.path.splitext(LOG_FILE_NAME_ANSWER)[0].split('_')[-1]}.csv")
+# --- 核心功能函数 ---
 
-def load_answer_evaluation_logs(filepath: str) -> List[Dict[str, Any]]:
-    """从JSONL文件中加载所有 'answer_evaluation_result' 类型的日志。"""
-    eval_logs = []
-    if not os.path.exists(filepath):
-        print(f"错误：答案评估结果日志文件未找到: {filepath}")
-        return eval_logs
-        
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line_number, line in enumerate(f, 1):
-            try:
-                log_entry = json.loads(line.strip())
-                # 我们现在直接读取评估结果文件，所以主要检查 task_type 和是否有评估结果
-                if log_entry.get("task_type") == "answer_evaluation_result" and log_entry.get("eval_llm_processed_output_json"):
-                    eval_logs.append(log_entry)
-            except json.JSONDecodeError:
-                print(f"警告：跳过格式错误的JSON行 {line_number} 在文件 {filepath}")
-            except Exception as e:
-                print(f"警告：处理行 {line_number} 时发生错误: {e}")
-    print(f"从 {filepath} 加载了 {len(eval_logs)} 条 'answer_evaluation_result' 日志。")
-    return eval_logs
-
-def extract_answer_evaluation_details(log_entry: Dict[str, Any]) -> Dict[str, Any]:
-    """从单条答案评估日志中提取关键信息。"""
+def extract_answer_evaluation_details(log_entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    从单条已解析的答案评估日志条目中提取关键信息。
+    这个函数与您之前在 analyze_answer.py 中的版本基本一致，稍作调整。
+    """
     details = {}
-    eval_data = log_entry.get("eval_llm_processed_output_json", {}) # 这是Gemini评估的JSON输出
-    
+    eval_data = log_entry.get("eval_llm_processed_output_json")
+
+    if not eval_data or not isinstance(eval_data, dict):
+        analyze_answer_logger.warning(f"Skipping log entry due to missing or invalid 'eval_llm_processed_output_json'. Interaction ID ref: {log_entry.get('original_interaction_id_ref')}")
+        return None
+
     details["interaction_id_ref"] = log_entry.get("original_interaction_id_ref")
     details["user_question"] = log_entry.get("user_question_for_eval")
     details["generated_answer"] = log_entry.get("generated_answer_for_eval")
-    # details["retrieved_contexts_char_count"] = log_entry.get("retrieved_contexts_for_eval_char_count") # 可选
     
-    if eval_data and isinstance(eval_data, dict):
-        summary = eval_data.get("evaluation_summary", {})
-        dimensions = eval_data.get("dimensions", {})
-        
-        details["overall_answer_quality_score"] = summary.get("overall_answer_quality_score")
-        details["main_strengths_answer"] = summary.get("main_strengths_answer")
-        details["main_weaknesses_answer"] = summary.get("main_weaknesses_answer")
-        
-        faithfulness = dimensions.get("faithfulness", {})
-        details["faithfulness_score"] = faithfulness.get("score")
-        details["faithfulness_reasoning"] = faithfulness.get("reasoning")
-        details["faithfulness_problematic_segments"] = "; ".join(faithfulness.get("problematic_answer_segments_faithfulness", []))
-
-        relevance = dimensions.get("relevance", {})
-        details["relevance_score"] = relevance.get("score")
-        details["relevance_reasoning"] = relevance.get("reasoning")
-        
-        completeness = dimensions.get("completeness", {})
-        details["completeness_context_sufficiency"] = completeness.get("context_sufficiency_assessment")
-        details["completeness_context_reasoning"] = completeness.get("context_sufficiency_reasoning")
-        details["completeness_score"] = completeness.get("score")
-        details["completeness_reasoning"] = completeness.get("reasoning")
-        
-        coherence = dimensions.get("coherence_fluency", {})
-        details["coherence_score"] = coherence.get("score")
-        details["coherence_reasoning"] = coherence.get("reasoning")
-
-        actionability = dimensions.get("actionability_usability", {})
-        details["actionability_score"] = actionability.get("score")
-        details["actionability_reasoning"] = actionability.get("reasoning")
-        
-        details["gemini_suggestion_answer"] = eval_data.get("suggestion_for_answer_improvement")
+    summary = eval_data.get("evaluation_summary", {})
+    dimensions = eval_data.get("dimensions", {})
+    
+    details["overall_answer_quality_score"] = summary.get("overall_answer_quality_score")
+    details["main_strengths_answer"] = summary.get("main_strengths_answer")
+    details["main_weaknesses_answer"] = summary.get("main_weaknesses_answer")
+    
+    faithfulness = dimensions.get("faithfulness", {})
+    details["faithfulness_score"] = faithfulness.get("score")
+    details["faithfulness_reasoning"] = faithfulness.get("reasoning")
+    # 确保 problematic_answer_segments_faithfulness 是列表，然后 join
+    problematic_segments = faithfulness.get("problematic_answer_segments_faithfulness", [])
+    if isinstance(problematic_segments, list):
+        details["faithfulness_problematic_segments"] = "; ".join(problematic_segments)
     else:
-        print(f"警告: interaction_id_ref {details.get('interaction_id_ref')} 的 eval_llm_processed_output_json 为空或格式不正确。")
+        details["faithfulness_problematic_segments"] = str(problematic_segments) # 以防万一不是列表
+
+    relevance = dimensions.get("relevance", {})
+    details["relevance_score"] = relevance.get("score")
+    details["relevance_reasoning"] = relevance.get("reasoning")
+    
+    completeness = dimensions.get("completeness", {})
+    details["completeness_context_sufficiency"] = completeness.get("context_sufficiency_assessment")
+    details["completeness_context_reasoning"] = completeness.get("context_sufficiency_reasoning")
+    details["completeness_score"] = completeness.get("score")
+    details["completeness_reasoning"] = completeness.get("reasoning")
+    
+    coherence = dimensions.get("coherence_fluency", {}) # 键名可能与prompt中的一致
+    details["coherence_score"] = coherence.get("score")
+    details["coherence_reasoning"] = coherence.get("reasoning")
+
+    actionability = dimensions.get("actionability_usability", {}) # 键名可能与prompt中的一致
+    details["actionability_score"] = actionability.get("score")
+    details["actionability_reasoning"] = actionability.get("reasoning")
+    
+    details["gemini_suggestion_answer"] = eval_data.get("suggestion_for_answer_improvement")
 
     return details
 
-def analyze_answer_evaluations_summary(eval_data_list: List[Dict[str, Any]]):
-    """对提取的答案评估数据进行初步分析总结。"""
-    if not eval_data_list:
-        print("没有答案评估数据可供分析。")
-        return
+def perform_answer_evaluation_analysis(
+    evaluation_log_filepath: str,
+    output_csv_filepath: str
+) -> bool:
+    """
+    加载答案评估日志，进行分析，并保存结果到CSV。
 
-    df = pd.DataFrame(eval_data_list)
+    Args:
+        evaluation_log_filepath (str): 答案评估结果日志文件的路径。
+        output_csv_filepath (str): 分析结果CSV文件的保存路径。
+
+    Returns:
+        bool: 如果分析和保存成功则返回True，否则返回False。
+    """
+    analyze_answer_logger.info(f"Starting Answer evaluation analysis for log file: {evaluation_log_filepath}")
+    analyze_answer_logger.info(f"Analysis results will be saved to: {output_csv_filepath}")
+
+    evaluation_logs = load_jsonl_file(evaluation_log_filepath)
+
+    if not evaluation_logs:
+        analyze_answer_logger.warning(f"No evaluation logs found or loaded from {evaluation_log_filepath}. Analysis aborted.")
+        return False
+
+    extracted_details_list = []
+    for log_entry in evaluation_logs:
+        if log_entry.get("task_type") == "answer_evaluation_result": # 确保是答案评估日志
+            details = extract_answer_evaluation_details(log_entry)
+            if details:
+                extracted_details_list.append(details)
+        else:
+            analyze_answer_logger.debug(f"Skipping log entry with task_type '{log_entry.get('task_type')}' as it's not 'answer_evaluation_result'.")
+
+
+    if not extracted_details_list:
+        analyze_answer_logger.info("No valid Answer evaluation details extracted from the logs. No CSV will be generated.")
+        return False
+
+    df = pd.DataFrame(extracted_details_list)
     
     score_columns = [
         "overall_answer_quality_score", "faithfulness_score", "relevance_score",
@@ -104,40 +133,55 @@ def analyze_answer_evaluations_summary(eval_data_list: List[Dict[str, Any]]):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    print("\n--- 初步答案评估分析 ---")
-    print(f"总评估条目数: {len(df)}")
+    analyze_answer_logger.info(f"\n--- Preliminary Answer Evaluation Analysis (from {len(extracted_details_list)} entries) ---")
+    analyze_answer_logger.info(f"Total evaluation entries processed: {len(df)}")
 
     for col_name in score_columns:
         if col_name in df.columns and not df[col_name].isnull().all():
-            print(f"\n维度: {col_name}")
-            print(df[col_name].describe())
-            print("评分分布:")
-            print(df[col_name].value_counts(dropna=False).sort_index())
+            analyze_answer_logger.info(f"\nDimension: {col_name}")
+            analyze_answer_logger.info(f"{df[col_name].describe()}")
+            analyze_answer_logger.info("Score Distribution:")
+            analyze_answer_logger.info(f"{df[col_name].value_counts(dropna=False).sort_index()}")
         else:
-            print(f"\n维度: {col_name} - 无有效数据或全为空值")
+            analyze_answer_logger.info(f"\nDimension: {col_name} - No data or all NaN.")
             
-    # 可以添加对特定文本字段的分析，例如最常见的weaknesses等，但需要更复杂的文本处理
-    # 例如，统计 context_sufficiency_assessment 的分布
-    if "completeness_context_sufficiency" in df.columns:
-        print("\n上下文充分性评估分布:")
-        print(df["completeness_context_sufficiency"].value_counts(dropna=False))
+    if "completeness_context_sufficiency" in df.columns and not df["completeness_context_sufficiency"].isnull().all():
+        analyze_answer_logger.info("\nContext Sufficiency Assessment Distribution:")
+        analyze_answer_logger.info(f"{df['completeness_context_sufficiency'].value_counts(dropna=False)}")
+    else:
+        analyze_answer_logger.info("\nContext Sufficiency Assessment Distribution: No data.")
 
     try:
-        df.to_csv(OUTPUT_CSV_FILE_ANSWER, index=False, encoding='utf-8-sig')
-        print(f"\n答案评估分析结果已保存到: {OUTPUT_CSV_FILE_ANSWER}")
+        os.makedirs(os.path.dirname(output_csv_filepath), exist_ok=True)
+        df.to_csv(output_csv_filepath, index=False, encoding='utf-8-sig')
+        analyze_answer_logger.info(f"\nAnalysis results saved to: {output_csv_filepath}")
+        return True
     except Exception as e:
-        print(f"\n保存答案评估CSV文件失败: {e}")
+        analyze_answer_logger.error(f"\nFailed to save CSV file: {e}", exc_info=True)
+        return False
 
 if __name__ == "__main__":
-    print(f"正在从答案评估结果日志文件加载数据: {LOG_FILE_PATH_ANSWER}")
-    answer_evaluation_logs = load_answer_evaluation_logs(LOG_FILE_PATH_ANSWER)
+    EVALUATION_NAME_FOR_ANSWER = "answer_gemini_flash" # Must match the name used in batch_eval_answer.py / evaluator.py
     
-    if answer_evaluation_logs:
-        extracted_answer_details_list = []
-        for log in answer_evaluation_logs:
-            details = extract_answer_evaluation_details(log)
-            extracted_answer_details_list.append(details)
-        
-        analyze_answer_evaluations_summary(extracted_answer_details_list)
+    # Similar to analyze_cypher.py, we'll try to use the date from the previous successful run.
+    target_date_str = "20250530" # From your previous successful run log for Cypher, assuming Answer evals are on same day.
+                                 # Adjust if your answer eval logs have different dates.
+
+    log_file_name_answer = f"eval_results_{EVALUATION_NAME_FOR_ANSWER}_{target_date_str}.jsonl"
+    log_file_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, log_file_name_answer)
+
+    output_csv_name_answer = f"analysis_{EVALUATION_NAME_FOR_ANSWER}_{target_date_str}.csv"
+    output_csv_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_answer)
+
+    if not os.path.exists(log_file_path_answer):
+        analyze_answer_logger.error(f"Answer evaluation log file for analysis not found: {log_file_path_answer}")
+        analyze_answer_logger.info("Please ensure the filename and date match an existing evaluation log.")
+        # Fallback logic similar to analyze_cypher.py could be added here if needed.
+    
+    if log_file_path_answer and os.path.exists(log_file_path_answer):
+        perform_answer_evaluation_analysis(
+            evaluation_log_filepath=log_file_path_answer,
+            output_csv_filepath=output_csv_path_answer
+        )
     else:
-        print("未能加载任何答案评估日志，分析中止。")
+        analyze_answer_logger.info("Answer evaluation analysis will not run as no suitable log file was identified.")

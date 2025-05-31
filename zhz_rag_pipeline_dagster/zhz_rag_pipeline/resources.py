@@ -1,4 +1,5 @@
 # zhz_rag_pipeline/resources.py
+
 import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -9,6 +10,8 @@ import httpx # 需要导入 httpx
 import asyncio # 如果SGLang调用是异步的
 import json
 from neo4j import GraphDatabase, Driver, Result # 导入neo4j驱动相关类
+import litellm
+import os
 
 
 # 定义Resource的配置模型 (如果需要的话，例如模型路径)
@@ -262,3 +265,112 @@ class Neo4jResource(dg.ConfigurableResource):
             self._logger.info("Closing Neo4j Driver.")
             self._driver.close()
             self._driver = None
+
+class GeminiAPIResourceConfig(dg.Config):
+    model_name: str = "gemini/gemini-1.5-flash-latest" # <--- 修改这里，添加 "gemini/" 前缀
+    """Name of the Gemini model to use for evaluations. Should include provider prefix, e.g., 'gemini/model-name'."""
+
+    proxy_url: Optional[str] = os.getenv("LITELLM_PROXY_URL")
+    """Optional proxy URL for LiteLLM (e.g., http://127.0.0.1:7890). Defaults to LITELLM_PROXY_URL env var."""
+
+    default_temperature: float = 0.1
+    """Default temperature for Gemini API calls."""
+
+    default_max_tokens: int = 2048
+    """Default maximum new tokens for Gemini API calls."""
+    
+class GeminiAPIResource(dg.ConfigurableResource):
+    model_name: str
+    proxy_url: Optional[str]
+    default_temperature: float
+    default_max_tokens: int
+    _api_key: Optional[str] = None
+    _logger: Optional[dg.DagsterLogManager] = None # Dagster logger
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = context.log
+        self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+        # --- 自动为 Gemini 模型名称添加前缀（如果需要） ---
+        if self.model_name and not self.model_name.startswith("gemini/"):
+            if "gemini" in self.model_name.lower(): # 简单检查是否是gemini模型
+                self._logger.info(f"Model name '{self.model_name}' appears to be a Gemini model but is missing 'gemini/' prefix. Adding it automatically.")
+                self.model_name = f"gemini/{self.model_name.split('/')[-1]}" # 取最后一部分并加上gemini/
+            else:
+                self._logger.warning(f"Model name '{self.model_name}' does not start with 'gemini/'. Ensure it's a valid LiteLLM model identifier including the provider.")
+        # --- 结束自动添加前缀逻辑 ---
+        
+        if not self._api_key:
+            self._logger.warning(
+                "Gemini API key not found in GEMINI_API_KEY or GOOGLE_API_KEY environment variables. "
+                "API calls will likely fail."
+            )
+        else:
+            self._logger.info(f"GeminiAPIResource initialized. Model: {self.model_name}, Proxy: {self.proxy_url if self.proxy_url else 'Not set'}")
+
+    async def call_completion(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        # json_mode: bool = False, # 暂不直接处理json_mode，因为Gemini通常通过prompt指示
+    ) -> Optional[str]:
+        if self._logger is None: # 应该在 setup_for_execution 中设置
+            print("ERROR: GeminiAPIResource logger not initialized!") # 临时打印，正常应使用logger
+            # 在实际Dagster环境中，这通常不会发生
+            # 如果发生，说明资源未正确初始化
+            return None
+
+
+        if not self._api_key:
+            self._logger.error("Gemini API key is not configured. Cannot make API call.")
+            return None
+
+        temp_to_use = temperature if temperature is not None else self.default_temperature
+        tokens_to_use = max_tokens if max_tokens is not None else self.default_max_tokens
+
+        litellm_params = {
+            "model": self.model_name,
+            "messages": messages,
+            "api_key": self._api_key,
+            "temperature": temp_to_use,
+            "max_tokens": tokens_to_use,
+        }
+
+        if self.proxy_url:
+            litellm_params["proxy"] = {
+                "http": self.proxy_url,
+                "https": self.proxy_url,
+            }
+        
+        # LiteLLM 的 response_format 参数用于指示期望的输出格式，
+        # 对于 Gemini，通常在 prompt 中指示返回 JSON 更可靠。
+        # if json_mode:
+        #     litellm_params["response_format"] = {"type": "json_object"}
+
+
+        self._logger.debug(f"Calling LiteLLM (Gemini) with params (excluding messages): { {k:v for k,v in litellm_params.items() if k != 'messages'} }")
+        
+        raw_output_text: Optional[str] = None
+        try:
+            # 注意：Dagster 资产函数可以是 async def，所以资源方法也可以是 async
+            response = await litellm.acompletion(**litellm_params)
+            
+            if response and response.choices and response.choices[0].message and response.choices[0].message.content:
+                raw_output_text = response.choices[0].message.content
+                self._logger.debug(f"LiteLLM (Gemini) raw response content (first 300 chars): {raw_output_text[:300]}...")
+            else:
+                self._logger.warning(f"LiteLLM (Gemini) returned an empty or malformed response. Full response: {response}")
+                raw_output_text = None
+        
+        except litellm.exceptions.APIError as e_api:
+            self._logger.error(f"LiteLLM APIError calling Gemini: {e_api}", exc_info=True)
+            raw_output_text = None # Or raise an exception for Dagster to catch
+        except litellm.exceptions.Timeout as e_timeout:
+            self._logger.error(f"LiteLLM Timeout calling Gemini: {e_timeout}", exc_info=True)
+            raw_output_text = None
+        except Exception as e_generic:
+            self._logger.error(f"Unexpected error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
+            raw_output_text = None
+        
+        return raw_output_text

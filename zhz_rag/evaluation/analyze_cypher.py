@@ -1,174 +1,247 @@
-# analyze_cypher_evaluations.py
+# zhz_rag/evaluation/analyze_cypher.py
 import json
 import os
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import Counter
 
-# --- 配置 ---
-# 假设您的日志文件与此脚本在同一目录下或可以通过相对/绝对路径访问
-# 您需要将此路径替换为实际的 .jsonl 文件路径
-LOG_FILE_DIR = "zhz_rag/stored_data/evaluation_results_logs/" # 日志文件所在目录
-# 默认分析当天的日志，您可以修改为特定的文件名
-# from datetime import datetime, timezone
-# today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-# LOG_FILE_NAME = f"rag_interactions_{today_str}.jsonl"
-EVALUATION_NAME = "cypher_gemini_flash" # <<<--- 确保这个与 evaluation.py 中的一致
-# from datetime import datetime, timezone
-# today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-# LOG_FILE_NAME = f"eval_results_{EVALUATION_NAME}_{today_str}.jsonl"
-LOG_FILE_NAME = f"eval_results_{EVALUATION_NAME}_20250530.jsonl" # <<<--- 请修改为您实际评估结果的日志文件名 (注意日期)
+# --- 从项目中导入必要的模块 ---
+try:
+    from zhz_rag.utils.common_utils import (
+        load_jsonl_file, # <--- 使用新的通用函数
+        EVALUATION_RESULTS_LOGS_DIR # 导入评估日志目录常量
+    )
+except ImportError as e:
+    print(f"ERROR: Could not import necessary modules in analyze_cypher.py: {e}")
+    print("Make sure this script is run in an environment where 'zhz_rag' package is accessible.")
+    exit(1)
 
-LOG_FILE_PATH = os.path.join(LOG_FILE_DIR, LOG_FILE_NAME)
+import logging
 
-OUTPUT_CSV_FILE = os.path.join(LOG_FILE_DIR, f"analysis_{EVALUATION_NAME}_{os.path.splitext(LOG_FILE_NAME)[0].split('_')[-1]}.csv") # <<<--- 新的定义
+# --- 配置此脚本的logger ---
+analyze_cypher_logger = logging.getLogger("AnalyzeCypherLogger")
+analyze_cypher_logger.setLevel(logging.INFO)
+if not analyze_cypher_logger.hasHandlers():
+    _console_handler = logging.StreamHandler()
+    _formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s')
+    _console_handler.setFormatter(_formatter)
+    analyze_cypher_logger.addHandler(_console_handler)
+    analyze_cypher_logger.propagate = False
+analyze_cypher_logger.info("--- AnalyzeCypherLogger configured ---")
 
-def load_evaluation_logs(filepath: str) -> List[Dict[str, Any]]:
-    """从JSONL文件中加载所有评估结果日志。"""
-    eval_logs = []
-    if not os.path.exists(filepath):
-        print(f"错误：评估结果日志文件未找到: {filepath}")
-        return eval_logs
-        
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line_number, line in enumerate(f, 1):
-            try:
-                log_entry = json.loads(line.strip())
-                # 现在我们直接读取评估结果文件，所以不需要再按 task_type 筛选了
-                # 只需要确保 eval_llm_processed_output_json 存在
-                if log_entry.get("eval_llm_processed_output_json"):
-                    eval_logs.append(log_entry)
-            except json.JSONDecodeError:
-                print(f"警告：跳过格式错误的JSON行 {line_number} 在文件 {filepath}")
-            except Exception as e:
-                print(f"警告：处理行 {line_number} 时发生错误: {e}")
-    
-    print(f"从 {filepath} 加载了 {len(eval_logs)} 条 'cypher_evaluation_by_gemini' 日志。")
-    return eval_logs
+# --- 核心功能函数 ---
 
-def extract_evaluation_details(log_entry: Dict[str, Any]) -> Dict[str, Any]:
-    """从单条评估日志中提取关键信息。"""
+def extract_cypher_evaluation_details(log_entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    从单条已解析的Cypher评估日志条目中提取关键信息。
+    这个函数与您之前在 analyze_cypher.py 中的版本基本一致，稍作调整以适应通用加载。
+    """
     details = {}
-    eval_data = log_entry.get("eval_llm_processed_output_json", {})
-    
+    # eval_llm_processed_output_json 字段包含了Gemini评估的JSON输出
+    eval_data = log_entry.get("eval_llm_processed_output_json")
+
+    if not eval_data or not isinstance(eval_data, dict):
+        analyze_cypher_logger.warning(f"Skipping log entry due to missing or invalid 'eval_llm_processed_output_json'. Interaction ID ref: {log_entry.get('original_interaction_id_ref')}")
+        return None # 如果核心评估数据缺失，则跳过此条目
+
     details["interaction_id_ref"] = log_entry.get("original_interaction_id_ref")
     details["user_question"] = log_entry.get("user_question_for_eval")
     details["generated_cypher"] = log_entry.get("generated_cypher_for_eval")
     
-    if eval_data and isinstance(eval_data, dict): # 确保 eval_data 是字典
-        summary = eval_data.get("evaluation_summary", {})
-        dimensions = eval_data.get("dimensions", {})
-        
-        details["overall_quality_score"] = summary.get("overall_quality_score_cypher")
-        details["main_strength"] = summary.get("main_strength_cypher")
-        details["main_weakness"] = summary.get("main_weakness_cypher")
-        
-        syntax = dimensions.get("syntactic_correctness", {})
-        details["syntax_score"] = syntax.get("score")
-        details["syntax_reasoning"] = syntax.get("reasoning")
-        
-        schema = dimensions.get("schema_adherence", {})
-        details["schema_overall_score"] = schema.get("overall_score")
-        details["schema_node_label_correct"] = schema.get("node_label_correctness", {}).get("check_result")
-        details["schema_entity_type_correct"] = schema.get("entity_type_property_correctness", {}).get("check_result")
-        details["schema_rel_type_correct"] = schema.get("relationship_type_correctness", {}).get("check_result")
-        details["schema_prop_name_correct"] = schema.get("property_name_correctness", {}).get("check_result")
-        details["schema_hallucinated_present"] = schema.get("hallucinated_schema_elements", {}).get("check_result_hallucination_present")
-        details["schema_hallucinated_elements"] = ", ".join(schema.get("hallucinated_schema_elements", {}).get("elements_found", []))
-        details["schema_reasoning"] = schema.get("reasoning")
-        
-        intent = dimensions.get("intent_accuracy", {})
-        details["intent_score"] = intent.get("score")
-        details["intent_explanation_cypher"] = intent.get("explanation_of_cypher_retrieval")
-        details["intent_alignment_notes"] = intent.get("semantic_alignment_with_question")
-        details["intent_key_elements_notes"] = intent.get("key_element_coverage_notes")
-        details["intent_reasoning"] = intent.get("reasoning")
-        
-        details["qwen_error_patterns"] = ", ".join(eval_data.get("qwen_error_patterns_identified", []))
-        details["gemini_suggestion"] = eval_data.get("suggestion_for_improvement_cypher")
-    else:
-        print(f"警告: interaction_id_ref {details.get('interaction_id_ref')} 的 eval_llm_processed_output_json 为空或格式不正确。")
+    summary = eval_data.get("evaluation_summary", {})
+    dimensions = eval_data.get("dimensions", {})
+    
+    details["overall_quality_score"] = summary.get("overall_quality_score_cypher")
+    details["main_strength"] = summary.get("main_strength_cypher")
+    details["main_weakness"] = summary.get("main_weakness_cypher")
+    
+    syntax = dimensions.get("syntactic_correctness", {})
+    details["syntax_score"] = syntax.get("score")
+    details["syntax_reasoning"] = syntax.get("reasoning")
+    
+    schema = dimensions.get("schema_adherence", {})
+    details["schema_overall_score"] = schema.get("overall_score")
+    details["schema_node_label_correct"] = schema.get("node_label_correctness", {}).get("check_result")
+    details["schema_entity_type_correct"] = schema.get("entity_type_property_correctness", {}).get("check_result")
+    details["schema_rel_type_correct"] = schema.get("relationship_type_correctness", {}).get("check_result")
+    details["schema_prop_name_correct"] = schema.get("property_name_correctness", {}).get("check_result")
+    details["schema_hallucinated_present"] = schema.get("hallucinated_schema_elements", {}).get("check_result_hallucination_present")
+    details["schema_hallucinated_elements"] = ", ".join(schema.get("hallucinated_schema_elements", {}).get("elements_found", []))
+    details["schema_reasoning"] = schema.get("reasoning")
+    
+    intent = dimensions.get("intent_accuracy", {})
+    details["intent_score"] = intent.get("score")
+    details["intent_explanation_cypher"] = intent.get("explanation_of_cypher_retrieval")
+    details["intent_alignment_notes"] = intent.get("semantic_alignment_with_question")
+    details["intent_key_elements_notes"] = intent.get("key_element_coverage_notes")
+    details["intent_reasoning"] = intent.get("reasoning")
+    
+    details["qwen_error_patterns"] = ", ".join(eval_data.get("qwen_error_patterns_identified", []))
+    details["gemini_suggestion"] = eval_data.get("suggestion_for_improvement_cypher")
 
     return details
 
-def analyze_evaluations(eval_data_list: List[Dict[str, Any]]):
-    """对提取的评估数据进行初步分析。"""
-    if not eval_data_list:
-        print("没有评估数据可供分析。")
-        return
+def perform_cypher_evaluation_analysis(
+    evaluation_log_filepath: str,
+    output_csv_filepath: str
+) -> bool:
+    """
+    加载Cypher评估日志，进行分析，并保存结果到CSV。
 
-    df = pd.DataFrame(eval_data_list)
+    Args:
+        evaluation_log_filepath (str): Cypher评估结果日志文件的路径。
+        output_csv_filepath (str): 分析结果CSV文件的保存路径。
+
+    Returns:
+        bool: 如果分析和保存成功则返回True，否则返回False。
+    """
+    analyze_cypher_logger.info(f"Starting Cypher evaluation analysis for log file: {evaluation_log_filepath}")
+    analyze_cypher_logger.info(f"Analysis results will be saved to: {output_csv_filepath}")
+
+    # 使用通用函数加载评估日志
+    # 注意：evaluate_cypher_with_gemini 保存的日志中 task_type 是 "cypher_evaluation_by_gemini"
+    # load_jsonl_file 不关心 task_type，它会加载所有行
+    evaluation_logs = load_jsonl_file(evaluation_log_filepath)
+
+    if not evaluation_logs:
+        analyze_cypher_logger.warning(f"No evaluation logs found or loaded from {evaluation_log_filepath}. Analysis aborted.")
+        return False
+
+    extracted_details_list = []
+    for log_entry in evaluation_logs:
+        # 确保只处理Cypher评估结果
+        if log_entry.get("task_type") == "cypher_evaluation_by_gemini":
+            details = extract_cypher_evaluation_details(log_entry)
+            if details: # extract_cypher_evaluation_details 可能会返回 None
+                extracted_details_list.append(details)
+        else:
+            analyze_cypher_logger.debug(f"Skipping log entry with task_type '{log_entry.get('task_type')}' as it's not 'cypher_evaluation_by_gemini'.")
+
+
+    if not extracted_details_list:
+        analyze_cypher_logger.info("No valid Cypher evaluation details extracted from the logs. No CSV will be generated.")
+        return False
+
+    df = pd.DataFrame(extracted_details_list)
     
-    # 将评分列转换为数值类型，错误时设为NaN
     score_columns = ["overall_quality_score", "syntax_score", "schema_overall_score", "intent_score"]
     for col in score_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    print("\n--- 初步评估分析 ---")
-    print(f"总评估条目数: {len(df)}")
+    analyze_cypher_logger.info(f"\n--- Preliminary Cypher Evaluation Analysis (from {len(extracted_details_list)} entries) ---")
+    analyze_cypher_logger.info(f"Total evaluation entries processed: {len(df)}")
 
-    if "overall_quality_score" in df.columns:
-        print("\n1. 整体质量评分 (Overall Quality Score):")
-        print(df["overall_quality_score"].describe())
-        print("\n评分分布:")
-        print(df["overall_quality_score"].value_counts(dropna=False).sort_index())
+    if "overall_quality_score" in df.columns and not df["overall_quality_score"].isnull().all():
+        analyze_cypher_logger.info("\n1. Overall Quality Score:")
+        analyze_cypher_logger.info(f"{df['overall_quality_score'].describe()}")
+        analyze_cypher_logger.info("\nScore Distribution:")
+        analyze_cypher_logger.info(f"{df['overall_quality_score'].value_counts(dropna=False).sort_index()}")
+    else:
+        analyze_cypher_logger.info("\n1. Overall Quality Score: No data or all NaN.")
 
-    if "schema_overall_score" in df.columns:
-        print("\n2. Schema遵循度总体评分 (Schema Adherence Overall Score):")
-        print(df["schema_overall_score"].describe())
-        print("\n评分分布:")
-        print(df["schema_overall_score"].value_counts(dropna=False).sort_index())
+
+    if "schema_overall_score" in df.columns and not df["schema_overall_score"].isnull().all():
+        analyze_cypher_logger.info("\n2. Schema Adherence Overall Score:")
+        analyze_cypher_logger.info(f"{df['schema_overall_score'].describe()}")
+        analyze_cypher_logger.info("\nScore Distribution:")
+        analyze_cypher_logger.info(f"{df['schema_overall_score'].value_counts(dropna=False).sort_index()}")
         
-        # Schema子项统计 (只统计False的情况，即有问题的)
         schema_sub_checks = [
             "schema_node_label_correct", "schema_entity_type_correct", 
             "schema_rel_type_correct", "schema_prop_name_correct", 
-            "schema_hallucinated_present" # True 表示有问题
+            "schema_hallucinated_present"
         ]
-        print("\nSchema遵循度子项问题统计 (False表示通过, Hallucinated True表示有问题):")
+        analyze_cypher_logger.info("\nSchema Adherence Sub-item Issues (False means issue, Hallucinated True means issue):")
         for check in schema_sub_checks:
             if check in df.columns:
-                if check == "schema_hallucinated_present": # 这个是True代表有问题
+                if check == "schema_hallucinated_present":
                     issue_count = df[df[check] == True].shape[0]
-                    print(f"  - {check} (存在幻觉): {issue_count} 条")
-                else: # 其他的是False代表有问题
+                    analyze_cypher_logger.info(f"  - {check} (Hallucination Present): {issue_count} entries")
+                else:
                     issue_count = df[df[check] == False].shape[0]
-                    print(f"  - {check} (未通过): {issue_count} 条")
+                    analyze_cypher_logger.info(f"  - {check} (Incorrect): {issue_count} entries")
+    else:
+        analyze_cypher_logger.info("\n2. Schema Adherence Overall Score: No data or all NaN.")
 
 
-    if "intent_score" in df.columns:
-        print("\n3. 意图准确性评分 (Intent Accuracy Score):")
-        print(df["intent_score"].describe())
-        print("\n评分分布:")
-        print(df["intent_score"].value_counts(dropna=False).sort_index())
+    if "intent_score" in df.columns and not df["intent_score"].isnull().all():
+        analyze_cypher_logger.info("\n3. Intent Accuracy Score:")
+        analyze_cypher_logger.info(f"{df['intent_score'].describe()}")
+        analyze_cypher_logger.info("\nScore Distribution:")
+        analyze_cypher_logger.info(f"{df['intent_score'].value_counts(dropna=False).sort_index()}")
+    else:
+        analyze_cypher_logger.info("\n3. Intent Accuracy Score: No data or all NaN.")
 
-    if "qwen_error_patterns" in df.columns:
-        print("\n4. 识别出的Qwen错误模式 (Top 5):")
+
+    if "qwen_error_patterns" in df.columns and not df["qwen_error_patterns"].isnull().all():
+        analyze_cypher_logger.info("\n4. Identified Qwen Error Patterns (Top 5):")
         all_patterns = []
         for pattern_list_str in df["qwen_error_patterns"].dropna():
-            if pattern_list_str: # 确保不是空字符串
-                all_patterns.extend([p.strip() for p in pattern_list_str.split(",")])
+            if pattern_list_str and isinstance(pattern_list_str, str):
+                all_patterns.extend([p.strip() for p in pattern_list_str.split(",") if p.strip()])
         pattern_counts = Counter(all_patterns)
-        print(pattern_counts.most_common(5))
+        analyze_cypher_logger.info(f"{pattern_counts.most_common(5)}")
+    else:
+        analyze_cypher_logger.info("\n4. Identified Qwen Error Patterns: No data.")
         
-    # 保存到CSV
     try:
-        df.to_csv(OUTPUT_CSV_FILE, index=False, encoding='utf-8-sig')
-        print(f"\n分析结果已保存到: {OUTPUT_CSV_FILE}")
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_csv_filepath), exist_ok=True)
+        df.to_csv(output_csv_filepath, index=False, encoding='utf-8-sig')
+        analyze_cypher_logger.info(f"\nAnalysis results saved to: {output_csv_filepath}")
+        return True
     except Exception as e:
-        print(f"\n保存CSV文件失败: {e}")
+        analyze_cypher_logger.error(f"\nFailed to save CSV file: {e}", exc_info=True)
+        return False
 
 if __name__ == "__main__":
-    print(f"正在从评估结果日志文件加载数据: {LOG_FILE_PATH}")
-    evaluation_logs = load_evaluation_logs(LOG_FILE_PATH)
+    # --- Configuration for running the analysis ---
+    EVALUATION_NAME_FOR_CYPHER = "cypher_gemini_flash" # Must match the name used in batch_eval_cypher.py / evaluator.py
+
+    # Try to find the latest log file for the given evaluation name
+    # This requires a naming convention for eval logs, e.g., eval_results_<name>_<date>.jsonl
+    # For simplicity, we'll construct a potential filename based on today's date,
+    # but in a real scenario, you might want a more robust way to find the latest.
     
-    if evaluation_logs:
-        extracted_details_list = []
-        for log in evaluation_logs:
-            details = extract_evaluation_details(log)
-            extracted_details_list.append(details)
-        
-        analyze_evaluations(extracted_details_list)
+    # For demonstration, let's try to find a log from a recent specific date if today's doesn't exist.
+    # You might need to adjust this logic or manually specify the file.
+    
+    # We will try to use the file name you provided in the previous run's log:
+    # eval_results_cypher_gemini_flash_20250530.jsonl
+    # This assumes the "date" part of the filename is consistent.
+    
+    # Let's try to find the log file used in the last successful Cypher evaluation run (20250530)
+    # This is a placeholder, in a real system you might have a more robust way to get this.
+    target_date_str = "20250530" # From your previous successful run log
+    
+    log_file_name_cypher = f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_{target_date_str}.jsonl"
+    log_file_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, log_file_name_cypher)
+
+    output_csv_name_cypher = f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{target_date_str}.csv"
+    output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_cypher)
+
+    if not os.path.exists(log_file_path_cypher):
+        analyze_cypher_logger.error(f"Cypher evaluation log file for analysis not found: {log_file_path_cypher}")
+        analyze_cypher_logger.info("Please ensure the filename and date match an existing evaluation log.")
+        # As a fallback, you could try finding the *absolute* latest eval log if the dated one isn't found,
+        # but that might not always be what you want.
+        # Example:
+        # eval_logs_pattern = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_*.jsonl")
+        # all_eval_logs = sorted(glob.glob(eval_logs_pattern), key=os.path.getmtime, reverse=True)
+        # if all_eval_logs:
+        #     log_file_path_cypher = all_eval_logs[0]
+        #     date_part_from_filename = os.path.basename(log_file_path_cypher).split('_')[-1].split('.')[0]
+        #     output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{date_part_from_filename}.csv")
+        #     analyze_cypher_logger.info(f"Falling back to latest available Cypher eval log: {log_file_path_cypher}")
+        # else:
+        #     analyze_cypher_logger.error(f"No Cypher evaluation logs found matching pattern: {eval_logs_pattern}")
+        #     log_file_path_cypher = None # Ensure it's None if no fallback
+    
+    if log_file_path_cypher and os.path.exists(log_file_path_cypher) : # Check again if fallback was attempted
+        perform_cypher_evaluation_analysis(
+            evaluation_log_filepath=log_file_path_cypher,
+            output_csv_filepath=output_csv_path_cypher
+        )
     else:
-        print("未能加载任何评估日志，分析中止。")
+        analyze_cypher_logger.info("Cypher evaluation analysis will not run as no suitable log file was identified.")

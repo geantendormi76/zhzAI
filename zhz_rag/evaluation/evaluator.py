@@ -1,21 +1,20 @@
-# zhz_agent/evaluation.py
+# zhz_rag/evaluation/evaluator.py
 import os
 import json
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 
-import litellm # 用于调用Gemini API
-from dotenv import load_dotenv
-import re
-# 导入通用日志函数
-from zhz_rag.utils.common_utils import log_interaction_data # <--- 修改这里
-# 导入共享的Schema描述
-from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION as KG_SCHEMA_FOR_EVALUATION # <--- 修改这里
+# 导入共享的Schema描述 和 通用日志函数
+from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION as KG_SCHEMA_FOR_EVALUATION
+from zhz_rag.utils.common_utils import log_interaction_data
 
-load_dotenv()
+# --- 类型检查时导入资源类，避免循环导入 ---
+if TYPE_CHECKING:
+    from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import GeminiAPIResource
 
 import logging
 
+# --- 配置此模块的logger ---
 eval_logger = logging.getLogger("EvaluationLogger")
 eval_logger.setLevel(logging.INFO)
 eval_logger.propagate = False
@@ -120,28 +119,28 @@ Please evaluate the "GENERATED CYPHER QUERY" based on the following criteria. Pr
 ```"""
 
 async def evaluate_cypher_with_gemini(
+    gemini_resource: 'GeminiAPIResource', # <--- 修改：接收 GeminiAPIResource 实例
     user_question: str,
     generated_cypher: str,
-    # kg_schema_description is now imported as KG_SCHEMA_FOR_EVALUATION
     original_interaction_id: Optional[str] = None,
     app_version: str = "0.1.0"
 ) -> Optional[Dict[str, Any]]:
     eval_logger.info(f"Starting Cypher evaluation. User question: '{user_question[:50]}...', Cypher: '{generated_cypher[:100]}...'")
 
     prompt_to_gemini = CYPHER_EVALUATION_PROMPT_V1.replace(
-        "{{KG_SCHEMA_DESCRIPTION}}", KG_SCHEMA_FOR_EVALUATION # Use imported constant
+        "{{KG_SCHEMA_DESCRIPTION}}", KG_SCHEMA_FOR_EVALUATION
     ).replace(
         "{{USER_QUESTION}}", user_question
     ).replace(
         "{{GENERATED_CYPHER}}", generated_cypher
     )
 
-    gemini_model_name = os.getenv("GEMINI_EVALUATION_MODEL", "gemini/gemini-1.5-flash-latest")
     messages_for_gemini = [{"role": "user", "content": prompt_to_gemini}]
     evaluation_result_json: Optional[Dict[str, Any]] = None
     raw_gemini_output: Optional[str] = None
     error_info: Optional[str] = None
 
+    # 模拟API调用的逻辑保持不变，但实际API调用将通过gemini_resource
     USE_SIMULATED_GEMINI_RESPONSE = os.getenv("USE_SIMULATED_GEMINI_CYPHER_EVAL", "false").lower() == "true"
 
     if USE_SIMULATED_GEMINI_RESPONSE:
@@ -182,15 +181,13 @@ async def evaluate_cypher_with_gemini(
             error_info = f"Simulated JSON decode error: {str(e)}"
     else:
         try:
-            eval_logger.info(f"Calling Gemini for Cypher evaluation. Model: {gemini_model_name}. Prompt length: {len(prompt_to_gemini)}")
-            response = await litellm.acompletion(
-                model=gemini_model_name,
-                messages=messages_for_gemini,
-                temperature=0.1,
-                max_tokens=2048,
+            eval_logger.info(f"Calling Gemini for Cypher evaluation via GeminiAPIResource. Model: {gemini_resource.model_name}. Prompt length: {len(prompt_to_gemini)}")
+            # --- 修改：通过 gemini_resource 调用 ---
+            raw_gemini_output = await gemini_resource.call_completion(
+                messages=messages_for_gemini
+                # temperature 和 max_tokens 将使用 gemini_resource 的默认值或配置值
             )
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                raw_gemini_output = response.choices[0].message.content
+            if raw_gemini_output:
                 eval_logger.info(f"Raw Gemini output for Cypher eval (first 300 chars): {raw_gemini_output[:300]}...")
                 cleaned_output = raw_gemini_output.strip()
                 if cleaned_output.startswith("```json"):
@@ -200,20 +197,15 @@ async def evaluate_cypher_with_gemini(
                 evaluation_result_json = json.loads(cleaned_output)
                 eval_logger.info("Successfully parsed Gemini evaluation result for Cypher.")
             else:
-                eval_logger.error("Gemini returned an empty or malformed response for Cypher evaluation.")
-                raw_gemini_output = str(response)
-                error_info = "Gemini empty or malformed response"
-        except litellm.exceptions.APIError as e_api:
-            eval_logger.error(f"LiteLLM APIError during Cypher evaluation: {e_api}", exc_info=True)
-            error_info = f"LiteLLM APIError: {str(e_api)}"
-            raw_gemini_output = error_info
+                eval_logger.error("Gemini call via resource returned None or empty for Cypher evaluation.")
+                error_info = "Gemini call via resource returned None/empty"
         except json.JSONDecodeError as e_json:
             eval_logger.error(f"Failed to decode JSON from Gemini Cypher evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
             error_info = f"JSONDecodeError: {str(e_json)}"
-        except Exception as e_gen:
-            eval_logger.error(f"Unexpected error during Cypher evaluation with Gemini: {e_gen}", exc_info=True)
-            error_info = f"Unexpected error: {str(e_gen)}"
-            if raw_gemini_output is None:
+        except Exception as e_gen: # 更通用的异常捕获，因为 call_completion 可能自己处理了 LiteLLM 异常
+            eval_logger.error(f"Unexpected error during Cypher evaluation with Gemini resource: {e_gen}", exc_info=True)
+            error_info = f"Unexpected error with Gemini resource: {str(e_gen)}"
+            if raw_gemini_output is None: # 如果 call_completion 返回 None 且没有设置 raw_gemini_output
                 raw_gemini_output = error_info
 
     eval_log_data = {
@@ -222,18 +214,17 @@ async def evaluate_cypher_with_gemini(
         "user_question_for_eval": user_question,
         "generated_cypher_for_eval": generated_cypher,
         "eval_llm_input_prompt_char_count": len(prompt_to_gemini),
-        "eval_llm_model": gemini_model_name,
+        "eval_llm_model": gemini_resource.model_name, # <--- 修改：从资源获取模型名称
         "eval_llm_raw_output": raw_gemini_output,
         "eval_llm_processed_output_json": evaluation_result_json,
         "eval_error_info": error_info,
         "application_version": app_version
     }
     await log_interaction_data(
-        eval_log_data, 
-        is_evaluation_result=True, 
-        evaluation_name_for_file="cypher_gemini_flash" # <--- 这个值是关键
+        eval_log_data,
+        is_evaluation_result=True,
+        evaluation_name_for_file="cypher_gemini_flash"
     )
-
     if evaluation_result_json:
         eval_logger.info(f"Cypher evaluation completed. Overall score: {evaluation_result_json.get('evaluation_summary', {}).get('overall_quality_score_cypher')}")
     else:
@@ -533,25 +524,13 @@ Json
 """
 
 async def evaluate_answer_with_gemini(
+    gemini_resource: 'GeminiAPIResource', # <--- 修改：接收 GeminiAPIResource 实例
     user_question: str,
-    retrieved_contexts: str, # Contexts should be a single string, possibly concatenated
+    retrieved_contexts: str,
     generated_answer: str,
-    original_interaction_id: Optional[str] = None, # For linking to the RAG process log
+    original_interaction_id: Optional[str] = None,
     app_version: str = "0.1.0"
 ) -> Optional[Dict[str, Any]]:
-    """
-    使用Gemini评估RAG系统生成的最终答案。
-
-    Args:
-        user_question: 用户的原始自然语言问题。
-        retrieved_contexts: RAG系统检索并传递给生成模型的上下文文本。
-        generated_answer: Qwen基于上下文生成的最终答案。
-        original_interaction_id: 原始RAG交互的ID，用于日志关联。
-        app_version: 当前RAG应用的版本号。
-
-    Returns:
-        一个包含评估结果的字典，如果评估失败则返回None。
-    """
     eval_logger.info(f"Starting Answer evaluation. User question: '{user_question[:50]}...', Answer: '{generated_answer[:50]}...'")
 
     prompt_to_gemini = ANSWER_EVALUATION_PROMPT_V1.replace(
@@ -562,7 +541,6 @@ async def evaluate_answer_with_gemini(
         "{{GENERATED_ANSWER}}", generated_answer
     )
 
-    gemini_model_name = os.getenv("GEMINI_EVALUATION_MODEL", "gemini/gemini-1.5-flash-latest")
     messages_for_gemini = [{"role": "user", "content": prompt_to_gemini}]
     evaluation_result_json: Optional[Dict[str, Any]] = None
     raw_gemini_output: Optional[str] = None
@@ -613,15 +591,12 @@ async def evaluate_answer_with_gemini(
             error_info = f"Simulated JSON decode error for answer: {str(e)}"
     else:
         try:
-            eval_logger.info(f"Calling Gemini for Answer evaluation. Model: {gemini_model_name}. Prompt length: {len(prompt_to_gemini)}")
-            response = await litellm.acompletion(
-                model=gemini_model_name,
-                messages=messages_for_gemini,
-                temperature=0.1, 
-                max_tokens=2048, 
+            eval_logger.info(f"Calling Gemini for Answer evaluation via GeminiAPIResource. Model: {gemini_resource.model_name}. Prompt length: {len(prompt_to_gemini)}")
+            # --- 修改：通过 gemini_resource 调用 ---
+            raw_gemini_output = await gemini_resource.call_completion(
+                messages=messages_for_gemini
             )
-            if response.choices and response.choices[0].message and response.choices[0].message.content:
-                raw_gemini_output = response.choices[0].message.content
+            if raw_gemini_output:
                 eval_logger.info(f"Raw Gemini output for Answer eval (first 300 chars): {raw_gemini_output[:300]}...")
                 cleaned_output = raw_gemini_output.strip()
                 if cleaned_output.startswith("```json"):
@@ -631,30 +606,25 @@ async def evaluate_answer_with_gemini(
                 evaluation_result_json = json.loads(cleaned_output)
                 eval_logger.info("Successfully parsed Gemini evaluation result for Answer.")
             else:
-                eval_logger.error("Gemini returned an empty or malformed response for Answer evaluation.")
-                raw_gemini_output = str(response)
-                error_info = "Gemini empty or malformed response for answer"
-        except litellm.exceptions.APIError as e_api:
-            eval_logger.error(f"LiteLLM APIError during Answer evaluation: {e_api}", exc_info=True)
-            error_info = f"LiteLLM APIError for answer: {str(e_api)}"
-            raw_gemini_output = error_info
+                eval_logger.error("Gemini call via resource returned None or empty for Answer evaluation.")
+                error_info = "Gemini call via resource returned None/empty for answer"
         except json.JSONDecodeError as e_json:
             eval_logger.error(f"Failed to decode JSON from Gemini Answer evaluation. Raw output: {raw_gemini_output[:500] if raw_gemini_output else 'N/A'}", exc_info=True)
             error_info = f"JSONDecodeError for answer: {str(e_json)}"
         except Exception as e_gen:
-            eval_logger.error(f"Unexpected error during Answer evaluation with Gemini: {e_gen}", exc_info=True)
-            error_info = f"Unexpected error for answer: {str(e_gen)}"
+            eval_logger.error(f"Unexpected error during Answer evaluation with Gemini resource: {e_gen}", exc_info=True)
+            error_info = f"Unexpected error for answer with Gemini resource: {str(e_gen)}"
             if raw_gemini_output is None:
                 raw_gemini_output = error_info
 
     eval_log_data = {
-        "task_type": "answer_evaluation_result", 
+        "task_type": "answer_evaluation_result",
         "original_interaction_id_ref": original_interaction_id,
         "user_question_for_eval": user_question,
-        "retrieved_contexts_for_eval_char_count": len(retrieved_contexts), 
+        "retrieved_contexts_for_eval_char_count": len(retrieved_contexts),
         "generated_answer_for_eval": generated_answer,
         "eval_llm_input_prompt_char_count": len(prompt_to_gemini),
-        "eval_llm_model": gemini_model_name,
+        "eval_llm_model": gemini_resource.model_name, # <--- 修改：从资源获取模型名称
         "eval_llm_raw_output": raw_gemini_output,
         "eval_llm_processed_output_json": evaluation_result_json,
         "eval_error_info": error_info,
@@ -674,81 +644,80 @@ async def evaluate_answer_with_gemini(
     return evaluation_result_json
 
 if __name__ == '__main__':
-    import asyncio # Add asyncio import for the test block
+    import asyncio
 
-    # async def test_cypher_evaluation():
-    #     print("DEBUG: test_cypher_evaluation function CALLED") 
-    #     eval_logger.info("--- Running test_cypher_evaluation ---")
-        
-    #     # KG_SCHEMA_FOR_EVALUATION is now imported from .constants
-    #     # No need to mock it here if constants.py is correctly set up.
-
-    #     test_cases = [
-    #         {
-    #             "user_question": "张三在哪里工作？",
-    #             "generated_cypher": "MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'})-[:WORKS_AT]->(org:ExtractedEntity {label: 'ORGANIZATION'}) RETURN org.text AS organizationName",
-    #             "id": "test_case_1_good"
-    #         },
-    #         {
-    #             "user_question": "李四负责什么项目？",
-    #             "generated_cypher": "MATCH (p:Person {name: '李四'})-[:RESPONSIBLE_FOR]->(proj:Project) RETURN proj.name",
-    #             "id": "test_case_2_schema_error"
-    #         },
-    #         {
-    #             "user_question": "所有任务的截止日期是什么时候？",
-    #             "generated_cypher": "MATCH (t:ExtractedEntity {label: 'TASK'}) RETURN t.deadline",
-    #             "id": "test_case_3_hallucination"
-    #         }
-    #     ]
-
-    #     for i, case in enumerate(test_cases):
-    #         eval_logger.info(f"\n--- Evaluating test case {i+1}: {case['id']} ---")
-    #         result = await evaluate_cypher_with_gemini(
-    #             user_question=case["user_question"],
-    #             generated_cypher=case["generated_cypher"],
-    #             # kg_schema_description is now handled by the imported KG_SCHEMA_FOR_EVALUATION
-    #             original_interaction_id=case["id"]
-    #         )
-    #         if result:
-    #             eval_logger.info(f"Evaluation result for {case['id']}:\n{json.dumps(result, indent=2, ensure_ascii=False)}")
-    #         else:
-    #             eval_logger.warning(f"Evaluation failed or returned None for {case['id']}")
-
-    # os.environ["USE_SIMULATED_GEMINI_CYPHER_EVAL"] = "true" # Enable for simulation
-    # asyncio.run(test_cypher_evaluation()) # Uncomment to run tests
-
-    # --- Test Answer Evaluation ---
-    async def test_answer_evaluation():
-        eval_logger.info("--- Running test_answer_evaluation ---")
-        
-        sample_user_question = "项目Alpha的文档编写任务分配给了谁？"
-        sample_context = """
-        上下文片段1 (来源: 知识图谱): 任务“项目Alpha的文档编写任务”被分配给了“张三”。
-        上下文片段2 (来源: 会议纪要): 李四在会议上主动承担了项目Alpha的文档初稿撰写。
-        上下文片段3 (来源: 项目计划书): 项目Alpha的文档工作由张三主要负责，王五协助。
-        """
-        sample_good_answer = "根据知识图谱，项目Alpha的文档编写任务分配给了张三。会议纪要显示李四也参与了初稿撰写，项目计划书中提到张三主要负责，王五协助。"
-        sample_bad_answer_hallucination = "项目Alpha的文档编写任务由赵六负责，他有丰富的经验。" 
-        sample_bad_answer_incomplete = "项目Alpha的文档编写任务分配给了张三。" 
-
-        test_cases_answer = [
-            {"id": "answer_good_1", "question": sample_user_question, "context": sample_context, "answer": sample_good_answer},
-            {"id": "answer_bad_hallucination_1", "question": sample_user_question, "context": sample_context, "answer": sample_bad_answer_hallucination},
-            {"id": "answer_bad_incomplete_1", "question": sample_user_question, "context": sample_context, "answer": sample_bad_answer_incomplete},
-        ]
-
-        for i, case in enumerate(test_cases_answer):
-            eval_logger.info(f"\n--- Evaluating Answer test case {i+1}: {case['id']} ---")
-            result = await evaluate_answer_with_gemini(
-                user_question=case["question"],
-                retrieved_contexts=case["context"],
-                generated_answer=case["answer"],
-                original_interaction_id=case["id"] 
-            )
-            if result:
-                eval_logger.info(f"Answer Evaluation result for {case['id']}:\n{json.dumps(result, indent=2, ensure_ascii=False)}")
-            else:
-                eval_logger.warning(f"Answer Evaluation failed or returned None for {case['id']}")
+    # --- 模拟一个 GeminiAPIResource 实例用于测试 ---
+    # 在实际的 Dagster 环境中，这个资源会被正确注入
+    # 为了让这里的测试能跑通，我们需要一个模拟的资源或配置
     
-    # os.environ["USE_SIMULATED_GEMINI_ANSWER_EVAL"] = "true" 
-    asyncio.run(test_answer_evaluation())
+    class MockGeminiAPIResource:
+        def __init__(self, api_key, model_name, proxy_url=None, temp=0.1, max_tokens=1024):
+            self.api_key = api_key
+            self.model_name = model_name
+            self.proxy_url = proxy_url
+            self.default_temperature = temp
+            self.default_max_tokens = max_tokens
+            self._logger = eval_logger # 使用eval_logger进行模拟
+            self._logger.info("MockGeminiAPIResource initialized for testing.")
+            if not self.api_key:
+                 self._logger.warning("MockGeminiAPIResource: API key is missing!")
+
+
+        async def call_completion(self, messages: List[Dict[str, str]], **kwargs) -> Optional[str]:
+            self._logger.info(f"MockGeminiAPIResource.call_completion called with {len(messages)} messages.")
+            # 这是一个非常简化的模拟，实际测试时可能需要更复杂的模拟响应
+            # 或者直接依赖环境变量 USE_SIMULATED_GEMINI_..._EVAL 来触发 evaluator 内部的模拟
+            if "cypher" in messages[0]["content"].lower():
+                return json.dumps({
+                    "evaluation_summary": {"overall_quality_score_cypher": 5, "main_strength_cypher": "Mocked Cypher OK", "main_weakness_cypher": "None"},
+                    "dimensions": {}, "qwen_error_patterns_identified": [], "suggestion_for_improvement_cypher": "Mocked suggestion"
+                })
+            else:
+                return json.dumps({
+                     "evaluation_summary": {"overall_answer_quality_score": 5, "main_strengths_answer": "Mocked Answer OK", "main_weaknesses_answer": "None"},
+                     "dimensions": {}, "suggestion_for_answer_improvement": "Mocked suggestion for answer"
+                })
+
+    async def test_evaluators_with_mock_resource():
+        eval_logger.info("--- Running tests for evaluators with MockGeminiAPIResource ---")
+        
+        mock_api_key = os.getenv("GEMINI_API_KEY") or "MOCK_API_KEY_IF_NOT_SET"
+        mock_resource = MockGeminiAPIResource(
+            api_key=mock_api_key,
+            model_name="gemini-1.5-flash-latest" # 与资源默认值一致
+        )
+
+        # --- Test Cypher Evaluation ---
+        eval_logger.info("\n--- Testing Cypher Evaluation with Mock Resource ---")
+        cypher_result = await evaluate_cypher_with_gemini(
+            gemini_resource=mock_resource,
+            user_question="Test Cypher Question?",
+            generated_cypher="MATCH (n) RETURN n",
+            original_interaction_id="test_cypher_eval_001"
+        )
+        if cypher_result:
+            eval_logger.info(f"Mocked Cypher Eval Result: {json.dumps(cypher_result, indent=2, ensure_ascii=False)}")
+        else:
+            eval_logger.warning("Mocked Cypher Eval returned None.")
+
+        # --- Test Answer Evaluation ---
+        eval_logger.info("\n--- Testing Answer Evaluation with Mock Resource ---")
+        answer_result = await evaluate_answer_with_gemini(
+            gemini_resource=mock_resource,
+            user_question="Test Answer Question?",
+            retrieved_contexts="Some sample context.",
+            generated_answer="A sample answer based on context.",
+            original_interaction_id="test_answer_eval_001"
+        )
+        if answer_result:
+            eval_logger.info(f"Mocked Answer Eval Result: {json.dumps(answer_result, indent=2, ensure_ascii=False)}")
+        else:
+            eval_logger.warning("Mocked Answer Eval returned None.")
+
+    # 如果希望在直接运行 evaluator.py 时执行测试：
+    # asyncio.run(test_evaluators_with_mock_resource())
+    
+    # 保留您之前的测试代码（如果需要独立运行并实际调用API，但要注意资源注入）
+    # os.environ["USE_SIMULATED_GEMINI_ANSWER_EVAL"] = "true"
+    # asyncio.run(test_answer_evaluation()) # 您之前的测试函数名
+    pass # 通常 evaluator.py 不会直接运行，而是被其他脚本调用
