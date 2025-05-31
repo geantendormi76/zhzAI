@@ -5,6 +5,8 @@ from typing import Dict, List, Any # Optional 可能之后会用到
 # 从项目中导入我们重构的批量评估函数和相关工具/常量
 from zhz_rag.evaluation.batch_eval_cypher import run_cypher_batch_evaluation
 from zhz_rag.evaluation.batch_eval_answer import run_answer_batch_evaluation
+from zhz_rag.evaluation.analyze_cypher import perform_cypher_evaluation_analysis
+from zhz_rag.evaluation.analyze_answer import perform_answer_evaluation_analysis
 from zhz_rag.utils.common_utils import (
     find_latest_rag_interaction_log,
     RAG_INTERACTION_LOGS_DIR,
@@ -125,10 +127,100 @@ async def batch_answer_evaluation_log_asset(
         
     return dg.Output(output_log_filepath, metadata=metadata)
 
+@dg.asset(
+    name="cypher_evaluation_analysis_report", # 资产名称
+    description="Generates a CSV analysis report from Cypher evaluation results.",
+    group_name="evaluation_pipeline",
+    compute_kind="python",
+    # deps=[batch_cypher_evaluation_log_asset] # 通过函数参数自动推断依赖
+)
+def cypher_analysis_report_asset(
+    context: dg.AssetExecutionContext,
+    batch_cypher_evaluations_log: str # 上游资产的输出 (即 cypher 评估日志文件的路径)
+) -> dg.Output[str]: # 输出 CSV 报告文件的路径
+    """
+    Analyzes Cypher evaluation logs and produces a CSV report.
+    """
+    context.log.info(f"Starting Cypher evaluation analysis using log file: {batch_cypher_evaluations_log}")
+
+    if not os.path.exists(batch_cypher_evaluations_log):
+        error_msg = f"Input Cypher evaluation log file not found: {batch_cypher_evaluations_log}"
+        context.log.error(error_msg)
+        raise dg.Failure(description=error_msg)
+
+    # 构建输出CSV文件的路径
+    # 我们希望CSV文件也存储在 EVALUATION_RESULTS_LOGS_DIR 目录下
+    # 文件名可以基于输入日志名或固定一个模式
+    base_input_log_name = os.path.basename(batch_cypher_evaluations_log)
+    # 从 "eval_results_cypher_gemini_flash_YYYYMMDD.jsonl" 生成 "analysis_cypher_gemini_flash_YYYYMMDD.csv"
+    if base_input_log_name.startswith("eval_results_") and base_input_log_name.endswith(".jsonl"):
+        analysis_file_name = "analysis_" + base_input_log_name[len("eval_results_"):-len(".jsonl")] + ".csv"
+    else: # Fallback naming
+        analysis_file_name = f"analysis_cypher_report_{context.run_id[:8]}.csv"
+    
+    output_csv_filepath = os.path.join(EVALUATION_RESULTS_LOGS_DIR, analysis_file_name)
+    
+    success = perform_cypher_evaluation_analysis(
+        evaluation_log_filepath=batch_cypher_evaluations_log,
+        output_csv_filepath=output_csv_filepath
+    )
+
+    if success:
+        context.log.info(f"Cypher evaluation analysis report generated: {output_csv_filepath}")
+        return dg.Output(output_csv_filepath, metadata={"output_csv_filepath": output_csv_filepath, "source_log": base_input_log_name})
+    else:
+        error_msg = f"Cypher evaluation analysis failed for log file: {batch_cypher_evaluations_log}"
+        context.log.error(error_msg)
+        raise dg.Failure(description=error_msg)
+
+
+@dg.asset(
+    name="answer_evaluation_analysis_report", # 资产名称
+    description="Generates a CSV analysis report from Answer evaluation results.",
+    group_name="evaluation_pipeline",
+    compute_kind="python",
+    # deps=[batch_answer_evaluations_log_asset] # 通过函数参数自动推断依赖
+)
+def answer_analysis_report_asset(
+    context: dg.AssetExecutionContext,
+    batch_answer_evaluations_log: str # 上游资产的输出 (即 answer 评估日志文件的路径)
+) -> dg.Output[str]: # 输出 CSV 报告文件的路径
+    """
+    Analyzes Answer evaluation logs and produces a CSV report.
+    """
+    context.log.info(f"Starting Answer evaluation analysis using log file: {batch_answer_evaluations_log}")
+
+    if not os.path.exists(batch_answer_evaluations_log):
+        error_msg = f"Input Answer evaluation log file not found: {batch_answer_evaluations_log}"
+        context.log.error(error_msg)
+        raise dg.Failure(description=error_msg)
+
+    base_input_log_name = os.path.basename(batch_answer_evaluations_log)
+    if base_input_log_name.startswith("eval_results_") and base_input_log_name.endswith(".jsonl"):
+        analysis_file_name = "analysis_" + base_input_log_name[len("eval_results_"):-len(".jsonl")] + ".csv"
+    else: # Fallback naming
+        analysis_file_name = f"analysis_answer_report_{context.run_id[:8]}.csv"
+        
+    output_csv_filepath = os.path.join(EVALUATION_RESULTS_LOGS_DIR, analysis_file_name)
+
+    success = perform_answer_evaluation_analysis(
+        evaluation_log_filepath=batch_answer_evaluations_log,
+        output_csv_filepath=output_csv_filepath
+    )
+
+    if success:
+        context.log.info(f"Answer evaluation analysis report generated: {output_csv_filepath}")
+        return dg.Output(output_csv_filepath, metadata={"output_csv_filepath": output_csv_filepath, "source_log": base_input_log_name})
+    else:
+        error_msg = f"Answer evaluation analysis failed for log file: {batch_answer_evaluations_log}"
+        context.log.error(error_msg)
+        raise dg.Failure(description=error_msg)
+
 # 将所有评估相关的资产收集到一个列表中，方便在 definitions.py 中引用
 all_evaluation_assets = [
     latest_rag_interaction_log_for_evaluation_asset,
     batch_cypher_evaluation_log_asset,
     batch_answer_evaluation_log_asset,
-    # 后续会在这里添加分析报告资产
+    cypher_analysis_report_asset, # <--- 新增
+    answer_analysis_report_asset, # <--- 新增
 ]
