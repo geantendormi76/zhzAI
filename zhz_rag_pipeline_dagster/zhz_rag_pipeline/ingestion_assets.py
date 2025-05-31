@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Union
 from .pydantic_models_dagster import LoadedDocumentOutput, ParsedDocumentOutput
 
 class LoadDocumentsConfig(dg.Config):
-    documents_directory: str = "/home/zhz/zhz_agent/zhz_agent_data_source" # 请确保这是您实际的测试数据目录
+    documents_directory: str = "/home/zhz/zhz_agent/data/raw_documents/" # 更新后的原始文档目录
     allowed_extensions: List[str] = [".txt"]
 
 @dg.asset(

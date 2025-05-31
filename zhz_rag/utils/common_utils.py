@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import uuid
 import logging
 import asyncio #确保 asyncio 被导入
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 load_dotenv()
 
@@ -205,3 +205,39 @@ async def call_mcpo_tool(tool_name_with_prefix: str, payload: Dict[str, Any]) ->
             response_text_snippet = response.text[:500] if response and hasattr(response, 'text') else "Response object not available or no text."
             utils_logger.error(f"{error_msg}. Response snippet: {response_text_snippet}", exc_info=True)
             return {"error": error_msg, "exception_type": type(exc).__name__}
+        
+def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, Any]]:
+    """
+    从 JSONL 文件加载数据。
+
+    Args:
+        filepath (str): JSONL 文件的路径。
+        encoding (str): 文件编码，默认为 'utf-8'。
+
+    Returns:
+        List[Dict[str, Any]]: 从文件中加载的字典列表。如果文件不存在或解析出错，
+                              会记录错误并返回空列表。
+    """
+    data_list: List[Dict[str, Any]] = []
+    if not os.path.exists(filepath):
+        utils_logger.error(f"File not found: {filepath}") # 使用已有的 utils_logger
+        return data_list
+
+    try:
+        with open(filepath, 'r', encoding=encoding) as f:
+            for line_number, line in enumerate(f, 1):
+                try:
+                    if line.strip(): # 确保行不是空的
+                        data_list.append(json.loads(line.strip()))
+                except json.JSONDecodeError as e_json:
+                    utils_logger.warning(f"Skipping malformed JSON line {line_number} in {filepath}: {e_json}")
+                except Exception as e_line:
+                    utils_logger.warning(f"Error processing line {line_number} in {filepath}: {e_line}")
+    except FileNotFoundError: # 再次捕获以防万一，虽然上面已经检查了
+        utils_logger.error(f"File not found during open: {filepath}")
+    except Exception as e_file:
+        utils_logger.error(f"Error reading or processing file {filepath}: {e_file}", exc_info=True)
+        return [] # 如果文件读取层面发生严重错误，返回空列表
+
+    utils_logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
+    return data_list

@@ -233,8 +233,8 @@ def vector_storage_asset(
 
 
 # --- 新增：定义 KeywordIndexAgent 的配置 Pydantic 模型 ---
-class BM25IndexConfig(dg.Config): 
-    index_file_path: str = "/home/zhz/dagster_home/bm25_index_data/"
+class BM25IndexConfig(dg.Config):
+    index_file_path: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index/"
 
 # --- 修改：KeywordIndexAgent (实现为 Asset) ---
 @dg.asset(

@@ -102,6 +102,6 @@ ehthumbs.db
 Thumbs.db
 
 local_models/
+stored_data/
 
-rag_eval_data
 现阶段核心代码.txt

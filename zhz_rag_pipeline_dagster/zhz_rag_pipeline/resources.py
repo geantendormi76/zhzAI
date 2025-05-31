@@ -59,7 +59,7 @@ class ChromaDBResourceConfig(dg.Config):
     collection_name: str = "rag_documents" # 默认集合名称
     # settings: Optional[Dict[str, Any]] = None # 高级Chroma设置
     # 使用更具体的持久化路径配置
-    persist_directory: str = "/home/zhz/dagster_home/chroma_data" # 推荐的持久化目录
+    persist_directory: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index/" # 更新后的ChromaDB持久化目录
 
 # 定义ChromaDB Resource
 class ChromaDBResource(dg.ConfigurableResource):
