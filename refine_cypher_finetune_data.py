@@ -211,36 +211,50 @@ def generate_finetune_samples_for_cypher(
             elif overall_score >= 4: # Gemini认为Qwen的输出质量高
                 ideal_cypher_output = qwen_generated_cypher
                 source_of_ideal = "qwen_high_score_by_gemini"
+
             
             # --- 规则3: Qwen的查询质量不高，但Gemini给出了具体的、看起来像Cypher的建议 ---
             elif gemini_suggestion_raw and \
-                 "无法生成Cypher查询" not in gemini_suggestion_raw and \
-                 "cannot be improved" not in gemini_suggestion_raw.lower() and \
-                 "needs to be extended" not in gemini_suggestion_raw.lower() and \
-                 ("MATCH " in gemini_suggestion_raw.upper() or "RETURN " in gemini_suggestion_raw.upper()): # 检查是否像Cypher
+                "无法生成Cypher查询" not in gemini_suggestion_raw and \
+                "cannot be improved" not in gemini_suggestion_raw.lower() and \
+                "needs to be extended" not in gemini_suggestion_raw.lower() and \
+                ("MATCH " in gemini_suggestion_raw.upper() or \
+                    "RETURN " in gemini_suggestion_raw.upper() or \
+                    "CREATE " in gemini_suggestion_raw.upper() or \
+                    "MERGE " in gemini_suggestion_raw.upper() or \
+                    "WITH " in gemini_suggestion_raw.upper() or \
+                    "OPTIONAL MATCH " in gemini_suggestion_raw.upper()
+                ):
 
-                # --- 改进点: 尝试从Gemini建议中提取纯Cypher ---
-                # 简单提取：假设Cypher建议是主要部分
-                # 更复杂的提取可能需要正则表达式或LLM辅助
-                # 这里我们先直接使用，如果Gemini的建议包含额外文字，微调时模型可能学会忽略它们，或者我们需要后续再清洗
-                extracted_gemini_cypher = gemini_suggestion_raw
-                # 尝试移除常见的解释性前缀
-                common_prefixes = [
-                    "你可以尝试这个查询：", "建议的查询是：", "尝试使用这个查询：",
-                    "You could try this query:", "The suggested query is:", "Try using this query:"
-                ]
-                for prefix in common_prefixes:
-                    if extracted_gemini_cypher.startswith(prefix):
-                        extracted_gemini_cypher = extracted_gemini_cypher[len(prefix):].strip()
-                        break # 找到一个匹配就停止
-
-                # 进一步尝试只取 Cypher 部分，如果建议中包含 "MATCH"
-                if "MATCH " in extracted_gemini_cypher.upper():
-                    match_index = extracted_gemini_cypher.upper().find("MATCH ")
-                    extracted_gemini_cypher = extracted_gemini_cypher[match_index:]
+                # 简化处理：直接将 Gemini 的原始建议作为 completion 的候选
+                # 清洗工作主要交给人工审核阶段
+                # 我们仍然可以做非常基础的清理，比如首尾空格和常见的 markdown
                 
-                ideal_cypher_output = extracted_gemini_cypher.strip() # 确保 strip
-                source_of_ideal = "gemini_suggestion_adopted"
+                temp_completion = gemini_suggestion_raw.strip()
+                if temp_completion.startswith("```") and temp_completion.endswith("```"):
+                    temp_completion = temp_completion[3:-3].strip()
+                    if temp_completion.lower().startswith("cypher"):
+                        temp_completion = temp_completion[len("cypher"):].strip()
+                elif temp_completion.startswith("`") and temp_completion.endswith("`"):
+                    temp_completion = temp_completion[1:-1].strip()
+
+                # 只要建议中包含核心Cypher关键字，我们就认为它有价值被审核
+                core_cypher_keywords_check = ["MATCH", "RETURN", "CREATE", "MERGE", "WITH", "OPTIONAL MATCH"]
+                suggestion_contains_cypher_keyword = False
+                if temp_completion:
+                    for core_keyword in core_cypher_keywords_check:
+                        if core_keyword in temp_completion.upper():
+                            suggestion_contains_cypher_keyword = True
+                            break
+                
+                if suggestion_contains_cypher_keyword:
+                    ideal_cypher_output = temp_completion # 使用初步清理后的建议
+                    source_of_ideal = "gemini_suggestion_for_review" # 明确标记为需要审核
+                    refine_logger.info(f"Interaction {interaction_id}: Gemini suggestion adopted for review. Raw: '{gemini_suggestion_raw[:150]}...', Processed for completion: '{ideal_cypher_output[:150]}...'")
+                else:
+                    refine_logger.warning(f"Interaction {interaction_id}: Gemini suggestion '{gemini_suggestion_raw[:150]}...' did not appear to contain core Cypher keywords after basic cleaning. Skipping.")
+                    continue
+
             
             # --- 规则4: Gemini明确建议“无法生成” 或 Qwen的查询质量低且有严重问题 ---
             elif "无法生成Cypher查询" in gemini_suggestion_raw or \

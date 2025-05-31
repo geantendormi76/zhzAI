@@ -200,42 +200,70 @@ def generate_finetune_samples_for_answer(
                     "relevance": "parse_error", "completeness": "parse_error",
                     "context_sufficiency": context_sufficiency
                 }
+                
+            # --- Completion选择逻辑 (改进版) ---
+            ideal_answer_output = None # 重新初始化
+            source_of_ideal = "unknown" # 重新初始化
 
-            # --- Completion选择逻辑 (初步) ---
-            # 规则1: Qwen的答案本身就是标准的“无法回答”，并且Gemini评估上下文不足
-            if qwen_generated_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN and \
-                context_sufficiency == "Insufficient" and \
-                overall_score >= 4 : # Gemini 认为这个“无法回答”是高质量的
-                    ideal_answer_output = NO_ANSWER_PHRASE_ANSWER_CLEAN
-                    source_of_ideal = "qwen_no_answer_confirmed_by_gemini_context_insufficient_high_score"
+            # 规则 0: Qwen的原始答案就是标准的“无法回答”短语
+            is_qwen_standard_no_answer = (qwen_generated_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN)
 
-            # 规则2: Gemini 评分很高 (例如 overall, faithfulness, relevance 都 >= 4)
-            elif overall_score >= 4 and faithfulness_score >= 4 and relevance_score >= 4:
-                ideal_answer_output = qwen_generated_answer
-                source_of_ideal = "qwen_high_score_by_gemini"
-
-            # 规则3: 上下文不足，且Qwen的答案不是标准的“无法回答”，但Gemini建议应指出信息不足
-            elif context_sufficiency == "Insufficient" and \
-                 "information is not available" in gemini_suggestion_answer.lower() or \
-                 "context does not contain" in gemini_suggestion_answer.lower() or \
-                 "cannot be answered" in gemini_suggestion_answer.lower():
+            # 规则 1: 上下文不足，且Qwen正确地给出了标准的“无法回答”
+            if is_qwen_standard_no_answer and \
+               context_sufficiency == "Insufficient" and \
+               overall_score >= 4: # Gemini认为Qwen的这个“无法回答”是高质量的
+                ideal_answer_output = NO_ANSWER_PHRASE_ANSWER_CLEAN
+                source_of_ideal = "qwen_standard_no_answer_confirmed_by_gemini_context_insufficient"
+            
+            # 规则 2: 上下文不足，Qwen可能没有给出标准“无法回答”，但Gemini建议应指出信息不足
+            elif not is_qwen_standard_no_answer and \
+                 context_sufficiency == "Insufficient" and \
+                 completeness_score <=2 and \
+                 ("information is not available" in gemini_suggestion_answer.lower() or \
+                  "context does not contain" in gemini_suggestion_answer.lower() or \
+                  "cannot be answered from the context" in gemini_suggestion_answer.lower() or \
+                  "should state that the information is not found" in gemini_suggestion_answer.lower()):
                 ideal_answer_output = NO_ANSWER_PHRASE_ANSWER_CLEAN
                 source_of_ideal = "gemini_suggests_no_answer_due_to_insufficient_context"
-            
-            # 规则4: Gemini 给出了非常具体的、可直接采纳的改进建议 (这部分较难自动化判断，初期可跳过或标记人工)
-            # 例如，如果 suggestion 是 "答案应为 'XXX' 而不是 'YYY'"
-            # 暂时，我们只记录这类情况，不直接采纳建议作为 completion
-            elif gemini_suggestion_answer and gemini_suggestion_answer != "No improvement needed." and len(gemini_suggestion_answer) < 150 : # 假设简短的建议更可能是直接替换
-                 refine_answer_logger.info(f"Answer log {interaction_id} (Qwen: '{qwen_generated_answer[:100]}...') has a potentially actionable Gemini suggestion: '{gemini_suggestion_answer}'. Needs manual review for completion.")
-                 # 可以在这里将 gemini_suggestion_answer 存入一个特殊字段，供人工审核后决定是否用作 completion
-                 # continue # 暂时跳过，等待人工审核流程
 
-            # 规则5: 其他情况，需要人工审核
+            # 规则 3: Gemini 整体评分很高 (例如 overall, faithfulness, relevance 都 >= 4)
+            # 并且 Qwen 的答案不是标准的“无法回答”（如果已经是，则由规则1处理）
+            elif not is_qwen_standard_no_answer and \
+                 overall_score >= 4 and faithfulness_score >= 4 and relevance_score >= 4:
+                ideal_answer_output = qwen_generated_answer
+                source_of_ideal = "qwen_high_score_by_gemini"
+                # 如果此时 Gemini 仍有改进建议，可以额外标记
+                if gemini_suggestion_answer and \
+                   gemini_suggestion_answer != "No improvement needed." and \
+                   "suggestion" not in source_of_ideal: # 避免重复标记
+                    source_of_ideal += "_with_minor_gemini_suggestion"
+
+
+            # 规则 4: Qwen的答案评分不高，但Gemini给出了具体的改进建议
+            # 我们将这类样本标记出来，completion暂时使用Qwen的答案，供人工审核和优化
+            elif overall_score < 4 and \
+                 gemini_suggestion_answer and \
+                 gemini_suggestion_answer != "No improvement needed." and \
+                 len(gemini_suggestion_answer) > 10: # 假设太短的建议可能不具体
+                ideal_answer_output = qwen_generated_answer # 保留Qwen答案作为基础
+                source_of_ideal = "qwen_low_score_with_gemini_suggestion_for_review"
+                refine_answer_logger.info(f"Answer log {interaction_id} (Qwen: '{qwen_generated_answer[:100]}...') marked for review due to low score but has Gemini suggestion: '{gemini_suggestion_answer[:100]}...'")
+            
+            # 规则 5: 如果Qwen的答案是标准“无法回答”，但上下文其实是充分的，或者Gemini认为可以回答
+            # 这通常意味着Qwen可能错误地判断无法回答，或者Gemini的评估与Qwen的判断不一致
+            elif is_qwen_standard_no_answer and \
+                 (context_sufficiency == "Sufficient" or (context_sufficiency == "Partially Sufficient" and completeness_score >=3)) and \
+                 overall_score < 4 : # Gemini不认可这个“无法回答”
+                ideal_answer_output = qwen_generated_answer # 保留Qwen的“无法回答”
+                source_of_ideal = "qwen_no_answer_but_gemini_disagrees_or_context_sufficient_for_review"
+                refine_answer_logger.info(f"Answer log {interaction_id}: Qwen said 'no answer', but Gemini scores/context sufficiency suggest it might be answerable. Marked for review. Gemini scores: {gemini_scores_for_log}, Suggestion: '{gemini_suggestion_answer[:100]}...'")
+
+            # 规则 6: 其他所有情况，暂时跳过，等待更明确的规则或人工审核
             else:
-                refine_answer_logger.info(f"Answer log {interaction_id} (Qwen: '{qwen_generated_answer[:100]}...') needs manual review. Gemini scores: {gemini_scores_for_log}, Suggestion: '{gemini_suggestion_answer[:100]}...'")
+                refine_answer_logger.info(f"Answer log {interaction_id} (Qwen: '{qwen_generated_answer[:100]}...') did not meet current finetune criteria. Needs manual review or rule adjustment. Gemini scores: {gemini_scores_for_log}, Suggestion: '{gemini_suggestion_answer[:100]}...'")
                 continue
 
-        else:
+        else: # 没有有效的Gemini评估日志
             refine_answer_logger.warning(f"No valid Gemini evaluation found for Answer log {interaction_id}. Qwen's output: '{qwen_generated_answer[:100]}...'. Skipping for finetune data.")
             continue
             
@@ -243,9 +271,9 @@ def generate_finetune_samples_for_answer(
             finetune_samples.append({
                 "prompt": qwen_answer_input_prompt,
                 "completion": ideal_answer_output.strip(),
-                "original_qwen_answer": qwen_generated_answer,
+                "original_qwen_answer": qwen_generated_answer_raw.strip() if qwen_generated_answer_raw else NO_ANSWER_PHRASE_ANSWER_CLEAN, # 记录Qwen最原始的输出
                 "gemini_scores": gemini_scores_for_log,
-                "gemini_suggestion": gemini_suggestion_answer if eval_log else None,
+                "gemini_suggestion": gemini_suggestion_answer if eval_log and eval_log.get("eval_llm_processed_output_json") else None,
                 "source_of_ideal": source_of_ideal,
                 "interaction_id": interaction_id
             })

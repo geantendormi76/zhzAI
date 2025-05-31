@@ -61,8 +61,8 @@ llm_py_logger.info("--- LLMUtilsLogger configured ---")
 
 
 # --- 定义LLM在无法回答时应该输出的精确短语 (不含停止标记) ---
-NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据提供的信息，无法回答该问题。"
-NO_ANSWER_PHRASE_KG_CLEAN = "从知识图谱中未找到直接相关信息。"
+NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # <<<--- 修改为此字符串
+NO_ANSWER_PHRASE_KG_CLEAN = "从知识图谱中未找到直接相关信息。" # 这个保持不变，除非KG的prompt也用了不同的
 
 # --- 定义通用的唯一停止标记 ---
 UNIQUE_STOP_TOKEN = "<|im_endofunable|>" # 报告建议的独特停止标记
