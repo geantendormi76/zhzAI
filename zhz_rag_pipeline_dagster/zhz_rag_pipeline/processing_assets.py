@@ -636,24 +636,32 @@ def kuzu_entity_relations_asset(
 
     conn = kuzu_readwrite_db.get_connection() # 获取共享连接
 
-    # --- 新增：在资产开始时立即验证 Schema ---
     try:
         context.log.info("Verifying table existence at the START of kuzu_entity_relations_asset...")
         node_tables_at_start = conn._get_node_table_names()
         rel_tables_info_at_start = conn._get_rel_table_names()
         rel_tables_at_start = [info['name'] for info in rel_tables_info_at_start]
-        all_tables_at_start = node_tables_at_start + rel_tables_at_start
+        all_tables_at_start_actual_case = node_tables_at_start + rel_tables_at_start # 存储实际大小写的表名
+
+        expected_rel_table_name_to_check = "AssignedTo" # 或者 "ASSIGNED_TO" 如果你期望的是全大写
+
         context.log.info(f"Node tables at start of relations asset: {node_tables_at_start}")
-        context.log.info(f"Rel tables at start of relations asset: {rel_tables_at_start}")
-        context.log.info(f"All tables at start of relations asset: {all_tables_at_start}")
-        if "ASSIGNED_TO" not in all_tables_at_start:
-            context.log.error("CRITICAL: 'ASSIGNED_TO' table NOT FOUND at the very start of kuzu_entity_relations_asset on the shared connection!")
+        context.log.info(f"Rel tables at start of relations asset (actual case): {rel_tables_at_start}")
+        context.log.info(f"All tables at start of relations asset (actual case): {all_tables_at_start_actual_case}")
+
+        found_assigned_to = False
+        for table_name_in_db in all_tables_at_start_actual_case:
+            if table_name_in_db.lower() == expected_rel_table_name_to_check.lower():
+                found_assigned_to = True
+                break
+        
+        if not found_assigned_to:
+            context.log.error(f"CRITICAL: Expected table '{expected_rel_table_name_to_check}' NOT FOUND at the very start of kuzu_entity_relations_asset on the shared connection!")
         else:
-            context.log.info("'ASSIGNED_TO' table IS PRESENT at the start of kuzu_entity_relations_asset.")
+            context.log.info(f"Expected table '{expected_rel_table_name_to_check}' IS PRESENT at the start of kuzu_entity_relations_asset.")
     except Exception as e_verify_start:
         context.log.error(f"Error verifying tables at start of kuzu_entity_relations_asset: {e_verify_start}")
-    # --- 结束新增验证 ---
-
+    
     if not kg_extractions:
         context.log.warning("No KG extractions received, nothing to store for relations.")
         context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No data"})
