@@ -14,7 +14,7 @@ from zhz_rag.utils.common_utils import (
     get_evaluation_result_log_filepath
 )
 # 导入 GeminiAPIResource 以声明资源依赖
-from .resources import GeminiAPIResource # 假设 evaluation_assets.py 与 resources.py 在同一包内
+from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import GeminiAPIResource
 
 # --- 资产定义 ---
 

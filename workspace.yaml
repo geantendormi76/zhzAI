@@ -1,4 +1,4 @@
 load_from:
   - python_module:
       module_name: zhz_rag_pipeline_dagster.zhz_rag_pipeline.definitions
-      working_directory: /home/zhz/zhz_agent 
+      working_directory: /home/zhz/zhz_agent

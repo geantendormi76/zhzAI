@@ -1,50 +1,50 @@
-# zhz_rag_pipeline/resources.py
-
+# /home/zhz/zhz_agent/zhz_rag_pipeline_dagster/zhz_rag_pipeline/resources.py
 import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.config import Settings # 用于更细致的配置
-from typing import List, Dict, Any, Union, Optional
+from chromadb.config import Settings
+from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator
 import logging
-import httpx # 需要导入 httpx
-import asyncio # 如果SGLang调用是异步的
+import httpx
+import asyncio
 import json
-from neo4j import GraphDatabase, Driver, Result # 导入neo4j驱动相关类
+# from neo4j import GraphDatabase, Driver, Result # Neo4j不再直接用于此资源
 import litellm
 import os
+import kuzu # 确保导入 kuzu
+import shutil
+from pydantic import PrivateAttr, Field as PydanticField
+from contextlib import contextmanager
+import portalocker # <--- 重新导入 portalocker
+import time # <--- 导入 time，可能用于短暂等待
 
-
-# 定义Resource的配置模型 (如果需要的话，例如模型路径)
+# --- SentenceTransformerResource ---
 class SentenceTransformerResourceConfig(dg.Config):
-    model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5" # 默认模型路径
-    # device: str = "cpu" # 可以添加设备配置，如 "cuda"
+    model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5"
 
-# 定义Resource
 class SentenceTransformerResource(dg.ConfigurableResource):
     model_name_or_path: str
-    _model: SentenceTransformer = None
-    _logger: logging.Logger = None # <--- 新增：声明 _logger 实例变量
+    _model: SentenceTransformer = PrivateAttr(default=None)
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = dg.get_dagster_logger() # <--- 新增：初始化 _logger
-        self._logger.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}") # <--- 修改：使用 self._logger
+        self._logger = context.log
+        self._logger.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}")
         try:
-            self._model = SentenceTransformer(
-                self.model_name_or_path, 
-            )
+            self._model = SentenceTransformer(self.model_name_or_path)
             self._logger.info("SentenceTransformer model initialized successfully.")
         except Exception as e:
-            self._logger.error(f"Failed to initialize SentenceTransformer model: {e}")
+            self._logger.error(f"Failed to initialize SentenceTransformer model: {e}", exc_info=True)
             raise
 
     def encode(self, texts: List[str], batch_size: int = 32, normalize_embeddings: bool = True) -> List[List[float]]:
         if self._model is None:
-            # 可以在这里也用 self._logger 记录错误
-            if self._logger: # 检查 _logger 是否已初始化 (虽然理论上 setup 后应该有了)
+            if self._logger:
                 self._logger.error("SentenceTransformer model is not initialized in encode method.")
             raise RuntimeError("SentenceTransformer model is not initialized.")
         
-        self._logger.debug(f"Encoding {len(texts)} texts. Normalize embeddings: {normalize_embeddings}") 
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
+        logger_instance.debug(f"Encoding {len(texts)} texts. Normalize embeddings: {normalize_embeddings}")
         
         embeddings_np = self._model.encode(
             texts, 
@@ -54,323 +54,296 @@ class SentenceTransformerResource(dg.ConfigurableResource):
         )
         return [emb.tolist() for emb in embeddings_np]
 
-# 定义ChromaDB Resource的配置模型
+# --- ChromaDBResource ---
 class ChromaDBResourceConfig(dg.Config):
-    # path: Optional[str] = "/home/zhz/dagster_home/chroma_db" # 持久化存储路径
-    # host: Optional[str] = None # 如果连接远程ChromaDB服务器
-    # port: Optional[int] = None
-    collection_name: str = "rag_documents" # 默认集合名称
-    # settings: Optional[Dict[str, Any]] = None # 高级Chroma设置
-    # 使用更具体的持久化路径配置
-    persist_directory: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index/" # 更新后的ChromaDB持久化目录
+    collection_name: str = "rag_documents"
+    persist_directory: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index/"
 
-# 定义ChromaDB Resource
 class ChromaDBResource(dg.ConfigurableResource):
     collection_name: str
     persist_directory: str
 
-    _client: chromadb.Client = None
-    _collection: chromadb.Collection = None
-    _logger: logging.Logger = None # <--- 新增：用于存储logger实例
+    _client: chromadb.Client = PrivateAttr(default=None)
+    _collection: chromadb.Collection = PrivateAttr(default=None)
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = dg.get_dagster_logger() 
-
+        self._logger = context.log
         self._logger.info(f"Initializing ChromaDB client and collection '{self.collection_name}'...")
         self._logger.info(f"ChromaDB data will be persisted to: {self.persist_directory}")
         try:
+            os.makedirs(self.persist_directory, exist_ok=True)
             self._client = chromadb.PersistentClient(path=self.persist_directory)
-            
             self._collection = self._client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "cosine"} # <--- 新增/修改：指定距离度量为余弦
+                metadata={"hnsw:space": "cosine"}
             )
-            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized/loaded with cosine distance. Item count: {self._collection.count()}")
+            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized/loaded. Count: {self._collection.count()}")
         except Exception as e:
-            self._logger.error(f"Failed to initialize ChromaDB: {e}")
+            self._logger.error(f"Failed to initialize ChromaDB: {e}", exc_info=True)
             raise
 
     def add_embeddings(self, ids: List[str], embeddings: List[List[float]], metadatas: List[Dict[str, Any]] = None):
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         if self._collection is None:
-            # 可以在这里也用 self._logger 记录错误，或者直接抛出异常
-            self._logger.error("ChromaDB collection is not initialized. Cannot add embeddings.")
+            logger_instance.error("ChromaDB collection is not initialized. Cannot add embeddings.")
             raise RuntimeError("ChromaDB collection is not initialized.")
         
         if not (len(ids) == len(embeddings) and (metadatas is None or len(ids) == len(metadatas))):
-            self._logger.error("Length mismatch for ids, embeddings, or metadatas.")
+            logger_instance.error("Length mismatch for ids, embeddings, or metadatas.")
             raise ValueError("Length of ids, embeddings, and metadatas (if provided) must be the same.")
 
         if not ids:
-            self._logger.info("No ids provided to add_embeddings, skipping.")
+            logger_instance.info("No ids provided to add_embeddings, skipping.")
             return
 
-        self._logger.info(f"Adding/updating {len(ids)} embeddings to ChromaDB collection '{self.collection_name}'...") # <--- 修改：使用 self._logger
-        self._collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas
-        )
-        self._logger.info(f"Embeddings added/updated. Collection count now: {self._collection.count()}") # <--- 修改：使用 self._logger
+        logger_instance.info(f"Adding/updating {len(ids)} embeddings to ChromaDB collection '{self.collection_name}'...")
+        self._collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
+        logger_instance.info(f"Embeddings added/updated. Collection count now: {self._collection.count()}")
 
     def query_embeddings(self, query_embeddings: List[List[float]], n_results: int = 5) -> chromadb.QueryResult:
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         if self._collection is None:
-            self._logger.error("ChromaDB collection is not initialized. Cannot query embeddings.")
+            logger_instance.error("ChromaDB collection is not initialized. Cannot query embeddings.")
             raise RuntimeError("ChromaDB collection is not initialized.")
-        # query方法本身可能没有太多需要日志记录的，除非你想记录查询参数或结果数量
-        self._logger.debug(f"Querying ChromaDB collection '{self.collection_name}' with {len(query_embeddings)} vectors, n_results={n_results}.")
-        return self._collection.query(
-            query_embeddings=query_embeddings,
-            n_results=n_results
-        )
-    
-# 定义SGLang Resource的配置模型
+        logger_instance.debug(f"Querying ChromaDB collection '{self.collection_name}' with {len(query_embeddings)} vectors, n_results={n_results}.")
+        return self._collection.query(query_embeddings=query_embeddings, n_results=n_results)
+
+# --- SGLangAPIResource ---
 class SGLangAPIResourceConfig(dg.Config):
     api_url: str = "http://127.0.0.1:30000/generate"
     default_temperature: float = 0.1
-    default_max_new_tokens: int = 512 # 根据KG提取的典型输出长度调整
-    # default_stop_tokens: List[str] = ["<|im_end|>"] # 可以设默认停止标记
+    default_max_new_tokens: int = 512
 
-# 定义SGLang Resource
 class SGLangAPIResource(dg.ConfigurableResource):
     api_url: str
     default_temperature: float
     default_max_new_tokens: int
-    # default_stop_tokens: List[str]
-
-    _logger: logging.Logger = None
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = dg.get_dagster_logger()
+        self._logger = context.log
         self._logger.info(f"SGLangAPIResource configured with API URL: {self.api_url}")
-        # 这里不需要实际的连接或初始化，因为是无状态的HTTP API调用
 
     async def generate_structured_output(
-        self, 
-        prompt: str, 
-        json_schema: Dict[str, Any],
-        temperature: Optional[float] = None,
-        max_new_tokens: Optional[int] = None,
-        # stop_tokens: Optional[List[str]] = None # 可选
-    ) -> Dict[str, Any]: # 期望返回解析后的JSON字典
-        
+        self, prompt: str, json_schema: Dict[str, Any],
+        temperature: Optional[float] = None, max_new_tokens: Optional[int] = None
+    ) -> Dict[str, Any]:
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         temp_to_use = temperature if temperature is not None else self.default_temperature
         tokens_to_use = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
-        # stop_to_use = stop_tokens if stop_tokens is not None else self.default_stop_tokens
-
         payload = {
             "text": prompt,
             "sampling_params": {
                 "temperature": temp_to_use,
                 "max_new_tokens": tokens_to_use,
-                # "stop": stop_to_use, # 根据模型调整
-                "stop": ["<|im_end|>"], # 假设Qwen
-                "json_schema": json.dumps(json_schema) # 确保传递JSON字符串
+                "stop": ["<|im_end|>"],
+                "json_schema": json.dumps(json_schema)
             }
         }
-        self._logger.debug(f"Sending request to SGLang. Prompt (start): {prompt[:100]}... Schema: {json.dumps(json_schema)}")
-
+        logger_instance.debug(f"Sending request to SGLang. Prompt (start): {prompt[:100]}... Schema: {json.dumps(json_schema)}")
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client: # 增加超时时间
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(self.api_url, json=payload)
                 response.raise_for_status()
-                
                 response_json = response.json()
                 generated_text = response_json.get("text", "").strip()
-                
-                self._logger.debug(f"SGLang raw response text: {generated_text}")
-                # 尝试解析
+                logger_instance.debug(f"SGLang raw response text: {generated_text}")
                 try:
                     parsed_output = json.loads(generated_text)
                     return parsed_output
                 except json.JSONDecodeError as e:
-                    self._logger.error(f"Failed to decode SGLang JSON output: {generated_text}. Error: {e}")
+                    logger_instance.error(f"Failed to decode SGLang JSON output: {generated_text}. Error: {e}", exc_info=True)
                     raise ValueError(f"SGLang output was not valid JSON: {generated_text}") from e
-
         except httpx.HTTPStatusError as e:
-            self._logger.error(f"SGLang API HTTP error: {e.response.status_code} - {e.response.text}")
+            logger_instance.error(f"SGLang API HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
             raise
         except httpx.RequestError as e:
-            self._logger.error(f"SGLang API request error: {e}")
+            logger_instance.error(f"SGLang API request error: {e}", exc_info=True)
             raise
         except Exception as e:
-            self._logger.error(f"Unexpected error during SGLang call: {e}")
+            logger_instance.error(f"Unexpected error during SGLang call: {e}", exc_info=True)
             raise
 
-# 定义Neo4j Resource的配置模型
-class Neo4jResourceConfig(dg.Config):
-    uri: str = "bolt://localhost:7687" # 从您的 .env 文件获取
-    user: str = "neo4j"                 # 从您的 .env 文件获取
-    password: str = "zhz199276"          # 从您的 .env 文件获取
-    database: str = "neo4j"             # 默认数据库，可以配置
-
-# 定义Neo4j Resource
-class Neo4jResource(dg.ConfigurableResource):
-    uri: str
-    user: str
-    password: str
-    database: str
-
-    _driver: Driver = None # Neo4j驱动实例
-    _logger: logging.Logger = None
-
-    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = dg.get_dagster_logger()
-        self._logger.info(f"Initializing Neo4j Driver for URI: {self.uri}, Database: {self.database}")
-        try:
-            self._driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
-            # 验证连接 (可选但推荐)
-            with self._driver.session(database=self.database) as session:
-                session.run("RETURN 1").consume() # 一个简单的查询来测试连接
-            self._logger.info("Neo4j Driver initialized and connection verified successfully.")
-        except Exception as e:
-            self._logger.error(f"Failed to initialize Neo4j Driver or verify connection: {e}")
-            raise
-
-    def execute_query(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> Result:
-        """
-        执行一个Cypher查询并返回结果。
-        """
-        if self._driver is None:
-            self._logger.error("Neo4j Driver is not initialized.")
-            raise RuntimeError("Neo4j Driver is not initialized.")
-        
-        self._logger.debug(f"Executing Neo4j query: {query} with parameters: {parameters}")
-        with self._driver.session(database=self.database) as session:
-            result = session.run(query, parameters)
-            return result # 返回 Result 对象，调用方可以处理
-
-    def execute_write_queries(self, queries_with_params: List[tuple[str, Dict[str, Any]]]):
-        """
-        在单个事务中执行多个写操作查询。
-        queries_with_params: 一个元组列表，每个元组是 (cypher_query_string, parameters_dict)
-        """
-        if self._driver is None:
-            self._logger.error("Neo4j Driver is not initialized.")
-            raise RuntimeError("Neo4j Driver is not initialized.")
-
-        with self._driver.session(database=self.database) as session:
-            with session.begin_transaction() as tx:
-                for query, params in queries_with_params:
-                    self._logger.debug(f"Executing in transaction: {query} with params: {params}")
-                    tx.run(query, params)
-                tx.commit()
-        self._logger.info(f"Executed {len(queries_with_params)} write queries in a transaction.")
-
-
-    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        """
-        在Dagster进程结束时关闭Neo4j驱动程序。
-        """
-        if self._driver is not None:
-            self._logger.info("Closing Neo4j Driver.")
-            self._driver.close()
-            self._driver = None
-
+# --- GeminiAPIResource ---
 class GeminiAPIResourceConfig(dg.Config):
-    model_name: str = "gemini/gemini-1.5-flash-latest" # <--- 修改这里，添加 "gemini/" 前缀
-    """Name of the Gemini model to use for evaluations. Should include provider prefix, e.g., 'gemini/model-name'."""
-
-    proxy_url: Optional[str] = os.getenv("LITELLM_PROXY_URL")
-    """Optional proxy URL for LiteLLM (e.g., http://127.0.0.1:7890). Defaults to LITELLM_PROXY_URL env var."""
-
+    model_name: str = PydanticField(default="gemini/gemini-1.5-flash-latest", description="Name of the Gemini model.")
+    proxy_url: Optional[str] = PydanticField(default_factory=lambda: os.getenv("LITELLM_PROXY_URL"), description="Optional proxy URL for LiteLLM.")
     default_temperature: float = 0.1
-    """Default temperature for Gemini API calls."""
-
     default_max_tokens: int = 2048
-    """Default maximum new tokens for Gemini API calls."""
     
 class GeminiAPIResource(dg.ConfigurableResource):
     model_name: str
     proxy_url: Optional[str]
     default_temperature: float
     default_max_tokens: int
-    _api_key: Optional[str] = None
-    _logger: Optional[dg.DagsterLogManager] = None # Dagster logger
+    _api_key: Optional[str] = PrivateAttr(default=None)
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
         self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-        # --- 自动为 Gemini 模型名称添加前缀（如果需要） ---
         if self.model_name and not self.model_name.startswith("gemini/"):
-            if "gemini" in self.model_name.lower(): # 简单检查是否是gemini模型
-                self._logger.info(f"Model name '{self.model_name}' appears to be a Gemini model but is missing 'gemini/' prefix. Adding it automatically.")
-                self.model_name = f"gemini/{self.model_name.split('/')[-1]}" # 取最后一部分并加上gemini/
+            if "gemini" in self.model_name.lower():
+                self._logger.info(f"Model name '{self.model_name}' auto-prefixed to 'gemini/'.")
+                self.model_name = f"gemini/{self.model_name.split('/')[-1]}"
             else:
-                self._logger.warning(f"Model name '{self.model_name}' does not start with 'gemini/'. Ensure it's a valid LiteLLM model identifier including the provider.")
-        # --- 结束自动添加前缀逻辑 ---
-        
+                self._logger.warning(f"Model name '{self.model_name}' does not start with 'gemini/'.")
         if not self._api_key:
-            self._logger.warning(
-                "Gemini API key not found in GEMINI_API_KEY or GOOGLE_API_KEY environment variables. "
-                "API calls will likely fail."
-            )
+            self._logger.warning("Gemini API key not found. API calls will likely fail.")
         else:
-            self._logger.info(f"GeminiAPIResource initialized. Model: {self.model_name}, Proxy: {self.proxy_url if self.proxy_url else 'Not set'}")
+            self._logger.info(f"GeminiAPIResource initialized. Model: {self.model_name}, Proxy: {self.proxy_url or 'Not set'}")
 
     async def call_completion(
-        self,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        # json_mode: bool = False, # 暂不直接处理json_mode，因为Gemini通常通过prompt指示
+        self, messages: List[Dict[str, str]],
+        temperature: Optional[float] = None, max_tokens: Optional[int] = None,
     ) -> Optional[str]:
-        if self._logger is None: # 应该在 setup_for_execution 中设置
-            print("ERROR: GeminiAPIResource logger not initialized!") # 临时打印，正常应使用logger
-            # 在实际Dagster环境中，这通常不会发生
-            # 如果发生，说明资源未正确初始化
-            return None
-
-
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         if not self._api_key:
-            self._logger.error("Gemini API key is not configured. Cannot make API call.")
+            logger_instance.error("Gemini API key is not configured.")
             return None
-
         temp_to_use = temperature if temperature is not None else self.default_temperature
         tokens_to_use = max_tokens if max_tokens is not None else self.default_max_tokens
-
         litellm_params = {
-            "model": self.model_name,
-            "messages": messages,
-            "api_key": self._api_key,
-            "temperature": temp_to_use,
-            "max_tokens": tokens_to_use,
+            "model": self.model_name, "messages": messages, "api_key": self._api_key,
+            "temperature": temp_to_use, "max_tokens": tokens_to_use,
         }
-
         if self.proxy_url:
-            litellm_params["proxy"] = {
-                "http": self.proxy_url,
-                "https": self.proxy_url,
-            }
-        
-        # LiteLLM 的 response_format 参数用于指示期望的输出格式，
-        # 对于 Gemini，通常在 prompt 中指示返回 JSON 更可靠。
-        # if json_mode:
-        #     litellm_params["response_format"] = {"type": "json_object"}
-
-
-        self._logger.debug(f"Calling LiteLLM (Gemini) with params (excluding messages): { {k:v for k,v in litellm_params.items() if k != 'messages'} }")
-        
+            litellm_params["proxy"] = {"http": self.proxy_url, "https": self.proxy_url} # type: ignore
+        logger_instance.debug(f"Calling LiteLLM (Gemini) with params (excluding messages): { {k:v for k,v in litellm_params.items() if k != 'messages'} }")
         raw_output_text: Optional[str] = None
         try:
-            # 注意：Dagster 资产函数可以是 async def，所以资源方法也可以是 async
-            response = await litellm.acompletion(**litellm_params)
-            
+            response = await litellm.acompletion(**litellm_params) # type: ignore
             if response and response.choices and response.choices[0].message and response.choices[0].message.content:
                 raw_output_text = response.choices[0].message.content
-                self._logger.debug(f"LiteLLM (Gemini) raw response content (first 300 chars): {raw_output_text[:300]}...")
+                logger_instance.debug(f"LiteLLM (Gemini) raw response (first 300 chars): {raw_output_text[:300]}...")
             else:
-                self._logger.warning(f"LiteLLM (Gemini) returned an empty or malformed response. Full response: {response}")
-                raw_output_text = None
-        
-        except litellm.exceptions.APIError as e_api:
-            self._logger.error(f"LiteLLM APIError calling Gemini: {e_api}", exc_info=True)
-            raw_output_text = None # Or raise an exception for Dagster to catch
-        except litellm.exceptions.Timeout as e_timeout:
-            self._logger.error(f"LiteLLM Timeout calling Gemini: {e_timeout}", exc_info=True)
-            raw_output_text = None
+                logger_instance.warning(f"LiteLLM (Gemini) returned empty/malformed response: {response}")
         except Exception as e_generic:
-            self._logger.error(f"Unexpected error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
-            raw_output_text = None
-        
+            logger_instance.error(f"Error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
         return raw_output_text
+
+# --- KuzuDB Resources (New Strategy Applied) ---
+class KuzuDBReadWriteResource(dg.ConfigurableResource):
+    db_path_str: str = PydanticField(
+        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
+        description=(
+            "Path to the KuzuDB database directory. "
+            "Can be relative to the project root (if not starting with '/') or absolute."
+        )
+    )
+    clear_on_startup_for_testing: bool = PydanticField(
+        default=False, # 生产中通常为 False，测试时可设为 True
+        description="If true, delete and re-initialize the DB when the resource is first set up. USE WITH CAUTION."
+    )
+
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+    _resolved_db_path: str = PrivateAttr()
+    _db: Optional[kuzu.Database] = PrivateAttr(default=None) # <--- 持有 Database 实例
+    _conn: Optional[kuzu.Connection] = PrivateAttr(default=None) # <--- 持有 Connection 实例
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = context.log
+        if os.path.isabs(self.db_path_str):
+            self._resolved_db_path = self.db_path_str
+        else:
+            self._resolved_db_path = os.path.abspath(self.db_path_str)
+        
+        self._logger.info(
+            f"KuzuDBReadWriteResource setup: resolved_path='{self._resolved_db_path}', "
+            f"clear_on_startup_for_testing={self.clear_on_startup_for_testing}"
+        )
+
+        if self.clear_on_startup_for_testing:
+            if os.path.exists(self._resolved_db_path):
+                self._logger.warning(f"Clearing KuzuDB directory: {self._resolved_db_path}")
+                try:
+                    shutil.rmtree(self._resolved_db_path)
+                    self._logger.info(f"Successfully removed KuzuDB directory.")
+                except OSError as e:
+                    self._logger.error(f"Failed to remove KuzuDB directory {self._resolved_db_path}: {e}", exc_info=True)
+                    raise
+        
+        try:
+            os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
+            self._db = kuzu.Database(self._resolved_db_path, read_only=False)
+            self._conn = kuzu.Connection(self._db)
+            self._logger.info(f"KuzuDB Database and Connection initialized successfully at {self._resolved_db_path}.")
+        except Exception as e:
+            self._logger.error(f"Failed to initialize KuzuDB: {e}", exc_info=True)
+            raise
+
+    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger.info(f"Tearing down KuzuDBReadWriteResource for {self._resolved_db_path}...")
+        if self._conn is not None:
+            # 可以在这里选择性地执行最后的 CHECKPOINT，但通常 KuzuDB 关闭时会处理
+            # try:
+            #     self._logger.info("Executing final CHECKPOINT on KuzuDB connection before teardown.")
+            #     self._conn.execute("CHECKPOINT;")
+            #     self._logger.info("Final CHECKPOINT successful.")
+            # except Exception as e_chk:
+            #     self._logger.error(f"Error during final CHECKPOINT: {e_chk}")
+            del self._conn # Kuzu Connection 没有 close()
+            self._conn = None
+        if self._db is not None:
+            del self._db # 依赖 KuzuDB Database 的 __del__ 方法进行清理和锁释放
+            self._db = None
+        self._logger.info("KuzuDBReadWriteResource teardown complete.")
+
+    def get_connection(self) -> kuzu.Connection:
+        """Returns the managed KuzuDB connection."""
+        if self._conn is None:
+            # 这种错误不应该在 in_process_executor 下发生，因为 setup_for_execution 会先运行
+            self._logger.error("KuzuDB connection not available. Resource might not have been set up correctly.")
+            raise Exception("KuzuDB connection not available. Resource might not have been set up correctly.")
+        return self._conn
+            
+# KuzuDBReadOnlyResource 定义保持不变
+class KuzuDBReadOnlyResource(dg.ConfigurableResource):
+    db_path_str: str = PydanticField(
+        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
+        description=(
+            "Path to the KuzuDB database directory for read-only access. "
+            "Can be relative to the project root (if not starting with '/') or absolute."
+        )
+    )
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+    _resolved_db_path: str = PrivateAttr()
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = context.log
+        if os.path.isabs(self.db_path_str):
+            self._resolved_db_path = self.db_path_str
+        else:
+            self._resolved_db_path = os.path.abspath(self.db_path_str)
+
+        self._logger.info(f"KuzuDBReadOnlyResource setup: resolved_path='{self._resolved_db_path}'")
+        if not os.path.exists(self._resolved_db_path):
+            self._logger.error(f"KuzuDB path {self._resolved_db_path} does not exist for ReadOnly access. Operations will likely fail.")
+
+    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
+        logger_instance.info("KuzuDBReadOnlyResource teardown complete.")
+
+    @contextmanager
+    def get_readonly_connection(self) -> Iterator[kuzu.Connection]:
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
+        db_instance: Optional[kuzu.Database] = None
+        logger_instance.info(f"Attempting to open KuzuDB(RO) at {self._resolved_db_path} for readonly session.")
+        
+        if not os.path.exists(self._resolved_db_path):
+            logger_instance.error(f"KuzuDB directory {self._resolved_db_path} not found for read-only access.")
+            raise FileNotFoundError(f"KuzuDB directory {self._resolved_db_path} not found for read-only access.")
+
+        try:
+            db_instance = kuzu.Database(self._resolved_db_path, read_only=True)
+            logger_instance.info(f"KuzuDB(RO) session opened at {self._resolved_db_path}")
+            conn = kuzu.Connection(db_instance)
+            yield conn
+        except Exception as e:
+            logger_instance.error(f"Error during KuzuDB(RO) session: {e}", exc_info=True)
+            raise
+        finally:
+            if db_instance:
+                del db_instance
+                logger_instance.info(f"KuzuDB(RO) Database object for session at {self._resolved_db_path} dereferenced (closed).")

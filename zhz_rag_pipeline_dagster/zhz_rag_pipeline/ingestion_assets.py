@@ -77,13 +77,13 @@ def load_documents_asset(
 @dg.asset(
     name="parsed_documents",
     description="Parses loaded documents into text and extracts basic structure.",
-    group_name="ingestion", # 也属于摄入组
-    deps=[load_documents_asset] 
+    group_name="ingestion"
+    # deps=[load_documents_asset] # <--- 删除这一行，因为依赖已通过函数参数 raw_documents 声明
 )
 def parse_document_asset(
     context: dg.AssetExecutionContext, 
     raw_documents: List[LoadedDocumentOutput] 
-) -> List[ParsedDocumentOutput]: 
+) -> List[ParsedDocumentOutput]:
     
     parsed_docs: List[ParsedDocumentOutput] = []
     context.log.info(f"Received {len(raw_documents)} documents to parse.")

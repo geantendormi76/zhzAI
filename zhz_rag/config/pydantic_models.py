@@ -1,5 +1,5 @@
-# zhz_agent/pydantic_models.py
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+# /home/zhz/zhz_agent/zhz_rag/config/pydantic_models.py
+from pydantic import BaseModel, Field, root_validator # 使用 root_validator 替代 model_validator
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime
@@ -7,24 +7,28 @@ import uuid
 
 # --- RAG Models ---
 class QueryRequest(BaseModel):
-    model_config = ConfigDict(extra='forbid')
     query: str = Field(description="用户提出的原始查询文本。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_vector: int = Field(description="期望检索的向量搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_kg: int = Field(description="期望检索的知识图谱结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_bm25: int = Field(description="期望检索的 BM25 关键词搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
 
-    @model_validator(mode='before')
+    @root_validator(pre=True)
     @classmethod
-    def remove_internal_params(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            print(f"Pydantic DEBUG (QueryRequest before validation): Received data for validation: {str(data)[:500]}")
-            removed_security_context = data.pop('security_context', None)
+    def remove_internal_params(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(values, dict):
+            # print(f"Pydantic DEBUG (QueryRequest before validation): Received data for validation: {str(values)[:500]}") # 可以取消注释以进行调试
+            removed_security_context = values.pop('security_context', None)
             if removed_security_context:
-                print(f"Pydantic INFO (QueryRequest before validation): Removed 'security_context': {str(removed_security_context)[:100]}")
-            removed_agent_fingerprint = data.pop('agent_fingerprint', None)
+                # print(f"Pydantic INFO (QueryRequest before validation): Removed 'security_context': {str(removed_security_context)[:100]}")
+                pass
+            removed_agent_fingerprint = values.pop('agent_fingerprint', None)
             if removed_agent_fingerprint:
-                print(f"Pydantic INFO (QueryRequest before validation): Removed 'agent_fingerprint': {str(removed_agent_fingerprint)[:100]}")
-        return data
+                # print(f"Pydantic INFO (QueryRequest before validation): Removed 'agent_fingerprint': {str(removed_agent_fingerprint)[:100]}")
+                pass
+        return values
+
+    class Config:
+        extra = 'forbid'
 
 class RetrievedDocument(BaseModel):
     source_type: str
@@ -41,15 +45,15 @@ class HybridRAGResponse(BaseModel):
 
 # --- Task Management Models ---
 class TaskStatus(str, Enum):
-    PENDING = "pending"      # 待处理 (新创建，尚未到执行时间)
-    ACTIVE = "active"        # 活动 (已到执行时间，等待执行或正在执行)
-    COMPLETED = "completed"  # 已完成
-    CANCELLED = "cancelled"  # 已取消
-    FAILED = "failed"        # 执行失败
-    REMINDING = "reminding"    # 提醒中 (可选状态)
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    REMINDING = "reminding"
 
 class ReminderMethod(str, Enum):
-    NOTIFICATION = "notification" # 桌面通知
+    NOTIFICATION = "notification"
 
 class TaskModel(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="任务的唯一ID (自动生成)")
@@ -63,28 +67,29 @@ class TaskModel(BaseModel):
     reminder_offset_minutes: Optional[int] = Field(None, description="提醒时间相对于due_date的提前分钟数 (例如10分钟前)")
     reminder_methods: List[ReminderMethod] = Field(default=[ReminderMethod.NOTIFICATION], description="提醒方式列表")
     priority: int = Field(default=0, description="任务优先级 (例如 0:普通, 1:重要, 2:紧急)")
-    tags: List[str] = Field(default_factory=list, description="任务标签") # 确保默认为空列表
+    tags: List[str] = Field(default_factory=list, description="任务标签")
     action_type: Optional[str] = Field(None, description="任务到期时需要执行的动作类型 (例如 'navigate', 'send_message', 'run_report')")
-    action_payload: Dict[str, Any] = Field(default_factory=dict, description="执行动作时需要的参数 (例如导航的目的地)") # 确保默认为空字典
+    action_payload: Dict[str, Any] = Field(default_factory=dict, description="执行动作时需要的参数 (例如导航的目的地)")
     execution_result: Optional[str] = Field(None, description="任务执行后的结果或错误信息")
     last_executed_at: Optional[datetime] = Field(None, description="上次执行时间 (UTC)")
 
-    model_config = ConfigDict(
-        use_enum_values=True,
-        from_attributes=True,
-    )
+    class Config:
+        use_enum_values = True
+        orm_mode = True # Pydantic V1 中使用 orm_mode = True 替代 from_attributes
 
 class CreateTaskRequest(BaseModel):
     title: str
     description: Optional[str] = None
     due_date: Optional[datetime] = None
-    reminder_offset_minutes: Optional[int] = None # 例如 "10" 代表提前10分钟
+    reminder_offset_minutes: Optional[int] = None
     reminder_methods: Optional[List[ReminderMethod]] = [ReminderMethod.NOTIFICATION]
     priority: Optional[int] = 0
     tags: Optional[List[str]] = None
     action_type: Optional[str] = None
     action_payload: Optional[Dict[str, Any]] = None
-    model_config = ConfigDict(extra='forbid')
+    
+    class Config:
+        extra = 'forbid'
 
 class UpdateTaskRequest(BaseModel):
     title: Optional[str] = None
@@ -97,4 +102,6 @@ class UpdateTaskRequest(BaseModel):
     tags: Optional[List[str]] = None
     action_type: Optional[str] = None
     action_payload: Optional[Dict[str, Any]] = None
-    model_config = ConfigDict(extra='forbid')
+
+    class Config:
+        extra = 'forbid'

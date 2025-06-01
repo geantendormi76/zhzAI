@@ -2,6 +2,8 @@
 from typing import List, Dict, Any, Union, Optional
 from pydantic import BaseModel
 import uuid
+from typing import List # 确保 List 已导入
+
 
 class LoadedDocumentOutput(BaseModel):
     document_path: str
