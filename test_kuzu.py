@@ -1,165 +1,132 @@
+# test_kuzu.py
 import kuzu
 import os
-import pandas as pd # 导入 pandas 以便更好地显示结果
+import pandas as pd
+import re # <--- 添加导入
+import unicodedata # <--- 添加导入
 
-# 1. 定义数据库文件的存储路径 (指向 Dagster 创建的数据库)
-DB_PATH = "./zhz_rag/stored_data/kuzu_default_db" # 确保这是正确的相对路径或绝对路径
-
-def print_query_results(conn, query_string, description="Query"):
-    print(f"\n--- {description} ---")
-    print(f"Executing Query: {query_string.strip()}")
+def normalize_text_for_id(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
     try:
-        results = conn.execute(query_string)
-        # 使用 pandas DataFrame 来显示结果，更美观
-        df = results.get_as_df()
-        if df.empty:
-            print("  Query returned no results.")
-        else:
-            print(df.to_string()) # to_string() 会打印整个 DataFrame
-        results.close() # 关闭结果集
+        normalized_text = unicodedata.normalize('NFKD', text)
+        normalized_text = normalized_text.lower()
+        normalized_text = normalized_text.strip()
+        normalized_text = re.sub(r'\s+', ' ', normalized_text)
+        return normalized_text
     except Exception as e:
-        print(f"  Error executing query: {e}")
+        return text
+
+DB_PATH = "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db"
+
+def run_queries(conn: kuzu.Connection):
+    print("\n--- Querying Data ---")
+
+    # 规范化查询条件中的文本
+    task_text_orig = "项目Alpha的文档编写任务"
+    person_text_orig = "张三"
+    org_text_orig = "谷歌"
+
+    task_text_norm = normalize_text_for_id(task_text_orig)
+    person_text_norm = normalize_text_for_id(person_text_orig)
+    org_text_norm = normalize_text_for_id(org_text_orig)
+
+    print(f"Normalized for query: '{task_text_orig}' -> '{task_text_norm}'")
+    print(f"Normalized for query: '{person_text_orig}' -> '{person_text_norm}'")
+    print(f"Normalized for query: '{org_text_orig}' -> '{org_text_norm}'")
+
+
+    queries_to_run = {
+        "Total ExtractedEntity Nodes": "MATCH (n:ExtractedEntity) RETURN count(n) AS total_entities;",
+        "All ExtractedEntity Nodes (Limit 5)": "MATCH (n:ExtractedEntity) RETURN n.id_prop, n.text, n.label LIMIT 5;",
+        # 使用规范化后的文本进行查询
+        "Specific Entity (张三 - normalized)": f"MATCH (n:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}}) RETURN n.id_prop, n.text, n.label;",
+        "Specific Entity (项目Alpha... - normalized)": f"MATCH (n:ExtractedEntity {{text: '{task_text_norm}', label: 'TASK'}}) RETURN n.id_prop, n.text, n.label;",
+        "Specific Entity (谷歌 - normalized)": f"MATCH (n:ExtractedEntity {{text: '{org_text_norm}', label: 'ORGANIZATION'}}) RETURN n.id_prop, n.text, n.label;",
+        
+        "Total WorksAt Relationships": "MATCH ()-[r:WorksAt]->() RETURN count(r) AS total_works_at_rels;",
+        "Total AssignedTo Relationships": "MATCH ()-[r:AssignedTo]->() RETURN count(r) AS total_assigned_to_rels;",
+        
+        # 关系查询也使用规范化文本（如果条件中包含文本）
+        "Who works at 谷歌? (normalized)": f"MATCH (p:ExtractedEntity {{label: 'PERSON'}})-[r:WorksAt]->(o:ExtractedEntity {{text: '{org_text_norm}', label: 'ORGANIZATION'}}) RETURN p.text AS person_name;",
+        "Where does 张三 work? (normalized)": f"MATCH (p:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}})-[r:WorksAt]->(o:ExtractedEntity {{label: 'ORGANIZATION'}}) RETURN o.text AS organization_name;",
+        "What task is assigned to 张三? (normalized)": f"MATCH (t:ExtractedEntity {{label: 'TASK'}})-[r:AssignedTo]->(p:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}}) RETURN t.text AS task_name;",
+        "Who is the task '项目Alpha...' assigned to? (normalized)": f"MATCH (t:ExtractedEntity {{text: '{task_text_norm}', label: 'TASK'}})-[r:AssignedTo]->(p:ExtractedEntity {{label: 'PERSON'}}) RETURN p.text AS person_name;",
+        
+        "All WorksAt Relationships (Source and Target Text)": "MATCH (src:ExtractedEntity)-[r:WorksAt]->(tgt:ExtractedEntity) RETURN src.text AS source_text, src.label AS source_label, tgt.text AS target_text, tgt.label AS target_label;",
+        "All AssignedTo Relationships (Source and Target Text)": "MATCH (src:ExtractedEntity)-[r:AssignedTo]->(tgt:ExtractedEntity) RETURN src.text AS source_text, src.label AS source_label, tgt.text AS target_text, tgt.label AS target_label;",
+    }
+
+    for description, query_str in queries_to_run.items():
+        print(f"\nExecuting Query: {description}")
+        print(f"Cypher: {query_str}")
+        try:
+            results = conn.execute(query_str)
+            # 使用 pandas 显示结果更美观
+            df = pd.DataFrame(results.get_as_df())
+            if not df.empty:
+                print(df.to_string())
+            else:
+                print("  Query returned no results.")
+            results.close() # 记得关闭结果集
+        except Exception as e:
+            print(f"  Error executing query: {e}")
 
 def main():
-    if not os.path.exists(DB_PATH) or not os.path.isdir(DB_PATH):
-        print(f"KuzuDB directory not found at: {DB_PATH}")
-        print("Please ensure the Dagster pipeline has run successfully and created the database.")
+    print(f"Kuzu Python client version: {kuzu.__version__}")
+    print(f"Attempting to connect to KuzuDB at: {DB_PATH}")
+
+    if not os.path.exists(DB_PATH):
+        print(f"ERROR: Database directory not found at {DB_PATH}")
+        print("Please ensure the Dagster KuzuDB pipeline has run successfully and created the database.")
         return
 
     db = None
     conn = None
     try:
-        # 1. 初始化数据库和连接 (以只读模式打开，因为我们只是验证)
-        # 如果需要执行写操作进行测试，可以将 read_only 改为 False
-        print(f"Connecting to KuzuDB at: {os.path.abspath(DB_PATH)}")
-        db = kuzu.Database(DB_PATH, read_only=True) 
+        # --- 连接到已存在的数据库 (只读模式足够用于查询) ---
+        # 如果需要执行写操作（例如，在测试中临时修改），可以使用 read_only=False
+        db = kuzu.Database(DB_PATH, read_only=True)
         conn = kuzu.Connection(db)
-        print("Successfully connected to KuzuDB.")
+        print(f"Successfully connected to KuzuDB. Database path: {os.path.abspath(DB_PATH)}")
 
-        # 2. 验证 Schema 是否存在 (可选，因为 Dagster 资产已验证)
-        #    但我们可以用 conn._get... 方法再次确认
+        # --- 列出所有表 (使用我们从研究报告中知道的方法) ---
+        print("\n--- Listing Tables ---")
         try:
             node_tables = conn._get_node_table_names()
+            print(f"Node Tables: {node_tables}")
             rel_tables_info = conn._get_rel_table_names()
-            rel_table_names = [info['name'] for info in rel_tables_info]
-            print(f"\nDetected Node Tables: {node_tables}")
-            print(f"Detected Rel Tables: {rel_table_names}")
-            
+            rel_tables = [info['name'] for info in rel_tables_info]
+            print(f"Rel Tables: {rel_tables}")
+            all_tables = node_tables + rel_tables
+            print(f"All Tables: {all_tables}")
+
+            # 验证核心表是否存在
             expected_tables = ["ExtractedEntity", "WorksAt", "AssignedTo"]
-            all_expected_found = True
-            for tbl in expected_tables:
-                if tbl not in (node_tables + rel_table_names):
-                    print(f"Warning: Expected table '{tbl}' not found in detected schema.")
-                    all_expected_found = False
-            if all_expected_found:
-                print("All expected tables are present in the schema.")
-                
-        except Exception as e_schema:
-            print(f"Error retrieving schema information: {e_schema}")
+            missing = [t for t in expected_tables if t not in all_tables]
+            if not missing:
+                print("Core tables (ExtractedEntity, WorksAt, AssignedTo) are present.")
+            else:
+                print(f"WARNING: Missing core tables: {missing}")
 
+        except Exception as e_list_tables:
+            print(f"Error listing tables: {e_list_tables}")
+            print("This might indicate an issue with the KuzuDB connection or version compatibility for these internal methods.")
 
-        # 3. 查询数据
-        
-        # 查询所有 ExtractedEntity 节点 (限制数量以防过多)
-        print_query_results(conn, 
-                            "MATCH (e:ExtractedEntity) RETURN e.id_prop, e.text, e.label LIMIT 10", 
-                            description="All ExtractedEntity Nodes (Sample)")
-
-        # 根据我们 doc1.txt 的内容 "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。"
-        # 我们期望的实体：
-        # - {text: "项目Alpha的文档编写任务", label: "TASK"}
-        # - {text: "张三", label: "PERSON"}
-        # - {text: "谷歌", label: "ORGANIZATION"}
-        # 我们期望的关系：
-        # - ("项目Alpha的文档编写任务")-[:ASSIGNED_TO]->("张三")
-        # - ("张三")-[:WORKS_AT]->("谷歌")
-
-        # 查询特定实体 "张三"
-        print_query_results(conn, 
-                            "MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'}) RETURN p.id_prop, p.text, p.label", 
-                            description="Details for Entity '张三'")
-
-        # 查询 "张三" 在哪里工作
-        print_query_results(conn, 
-                            """
-                            MATCH (p:ExtractedEntity {text: '张三', label: 'PERSON'})
-                                  -[:WorksAt]->
-                                  (o:ExtractedEntity {label: 'ORGANIZATION'})
-                            RETURN p.text AS person, o.text AS organization
-                            """, 
-                            description="'张三' WorksAt Which Organization?")
-
-        # 查询 "项目Alpha的文档编写任务" 分配给了谁
-        print_query_results(conn, 
-                            """
-                            MATCH (t:ExtractedEntity {text: '项目Alpha的文档编写任务', label: 'TASK'})
-                                  -[:AssignedTo]->
-                                  (p:ExtractedEntity {label: 'PERSON'})
-                            RETURN t.text AS task, p.text AS assignee
-                            """, 
-                            description="'项目Alpha的文档编写任务' AssignedTo Whom?")
-                            
-        # 查询所有关系 (限制数量)
-        # 注意：KuzuDB 的 Cypher 中，匿名关系可能需要更具体的写法，或者通过节点匹配路径
-        # 尝试获取所有 WorksAt 关系
-        print_query_results(conn, 
-                            """
-                            MATCH (e1:ExtractedEntity)-[r:WorksAt]->(e2:ExtractedEntity)
-                            RETURN e1.text AS from_entity, type(r) AS rel_type, e2.text AS to_entity
-                            LIMIT 10
-                            """, 
-                            description="All WorksAt Relationships (Sample)")
-
-        # 尝试获取所有 AssignedTo 关系
-        print_query_results(conn, 
-                            """
-                            MATCH (e1:ExtractedEntity)-[r:AssignedTo]->(e2:ExtractedEntity)
-                            RETURN e1.text AS from_entity, type(r) AS rel_type, e2.text AS to_entity
-                            LIMIT 10
-                            """, 
-                            description="All AssignedTo Relationships (Sample)")
-                            
-        # 计算总实体数和总关系数
-        try:
-            result_node_count = conn.execute("MATCH (n:ExtractedEntity) RETURN count(n) AS total_nodes")
-            node_count_df = result_node_count.get_as_df()
-            if not node_count_df.empty:
-                print(f"\nTotal ExtractedEntity nodes: {node_count_df['total_nodes'].iloc[0]}")
-            result_node_count.close()
-
-            # 计算关系总数可能需要分别计算每种关系类型的数量然后相加
-            # 或者如果 Kuzu 支持 MATCH ()-[r]-() RETURN count(r)
-            result_rel_count_worksat = conn.execute("MATCH ()-[r:WorksAt]->() RETURN count(r) AS total_worksat")
-            worksat_count_df = result_rel_count_worksat.get_as_df()
-            if not worksat_count_df.empty:
-                print(f"Total WorksAt relationships: {worksat_count_df['total_worksat'].iloc[0]}")
-            result_rel_count_worksat.close()
-            
-            result_rel_count_assignedto = conn.execute("MATCH ()-[r:AssignedTo]->() RETURN count(r) AS total_assignedto")
-            assignedto_count_df = result_rel_count_assignedto.get_as_df()
-            if not assignedto_count_df.empty:
-                print(f"Total AssignedTo relationships: {assignedto_count_df['total_assignedto'].iloc[0]}")
-            result_rel_count_assignedto.close()
-
-        except Exception as e_count:
-            print(f"Error getting counts: {e_count}")
-
+        # --- 执行查询 ---
+        if conn: # 确保连接有效
+            run_queries(conn)
 
     except Exception as e:
-        print(f"An error occurred with KuzuDB: {e}")
+        print(f"An error occurred: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print("\nKuzuDB data verification script finished.")
-        # conn 和 db 对象会在 try 块结束或发生异常时，由于其作用域结束而被 Python 的垃圾回收器处理
-        # KuzuDB 的 Python 对象设计为在 __del__ 中释放资源
-        if conn:
-            # Kuzu Connection 对象没有显式的 close() 方法
-            pass
-        if db:
-            # Kuzu Database 对象也没有显式的 close() 方法，依赖 __del__
-            del db # 可以显式 del 来尝试触发 __del__
-        print("KuzuDB resources (if any were held by script) should be released.")
+        print("\nKuzuDB test script finished.")
+        # Kuzu Connection 没有显式的 close() 方法
+        # Kuzu Database 对象在其 __del__ 方法中处理关闭
+        if db is not None:
+            del db # 确保数据库对象被垃圾回收，从而关闭
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

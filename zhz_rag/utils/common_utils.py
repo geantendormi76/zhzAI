@@ -11,6 +11,8 @@ import uuid
 import logging
 import asyncio #确保 asyncio 被导入
 from typing import List, Dict, Any, Optional
+import re
+import unicodedata
 
 load_dotenv()
 
@@ -241,3 +243,16 @@ def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, An
 
     utils_logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
     return data_list
+
+def normalize_text_for_id(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text) 
+    
+    try:
+        normalized_text = unicodedata.normalize('NFKD', text)
+        normalized_text = normalized_text.lower()
+        normalized_text = normalized_text.strip()
+        normalized_text = re.sub(r'\s+', ' ', normalized_text)
+        return normalized_text
+    except Exception as e:
+        return text
