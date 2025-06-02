@@ -17,7 +17,7 @@ import re # 导入 re 模块
 MODEL_DIR = os.getenv("LOCAL_LLM_MODEL_DIR", "/home/zhz/models/Qwen3-1.7B-GGUF")
 MODEL_FILENAME = os.getenv("LOCAL_LLM_MODEL_FILENAME") 
 N_GPU_LAYERS = int(os.getenv("LOCAL_LLM_N_GPU_LAYERS", 0))
-N_CTX = int(os.getenv("LOCAL_LLM_N_CTX", 2048))
+N_CTX = int(os.getenv("LOCAL_LLM_N_CTX", 4096)) # 尝试增加到 4096
 N_BATCH = int(os.getenv("LOCAL_LLM_N_BATCH", 512))
 SERVICE_PORT = int(os.getenv("LOCAL_LLM_SERVICE_PORT", 8088))
 SERVICE_HOST = "0.0.0.0"
