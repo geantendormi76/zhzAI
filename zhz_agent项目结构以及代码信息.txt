@@ -12,8 +12,1227 @@ Directory: /home/zhz/zhz_agent/
 
     --- END OF FILE CONTENT ---
 
+  File: agent_orchestrator_service.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/zhz_rag/api/agent_orchestrator_service.py
+
+import os
+import asyncio
+import traceback
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from pydantic import BaseModel, Field
+
+# --- LiteLLM (后续会在这里配置和使用) ---
+import litellm 
+
+# --- CrewAI (后续会在这里配置和使用) ---
+# from crewai import Agent, Task, Crew, Process, LLM
+
+# --- 自定义模块导入 (后续会逐步完善) ---
+# from zhz_rag.utils.common_utils import call_mcpo_tool
+# from zhz_rag.crewai_integration.tools import ... # 我们将定义新的核心工具类
+# from zhz_agent_config.agents import create_manager_agent, create_worker_agent # 假设新的配置文件路径
+# from zhz_agent_config.tasks import create_manager_task_definition, process_manager_output_and_execute_worker
+
+# --- 配置 ---
+AGENT_SERVICE_PORT = int(os.getenv("AGENT_SERVICE_PORT", 8090))
+AGENT_SERVICE_HOST = "0.0.0.0"
+# 本地 LLM 服务地址 (Qwen3)
+LOCAL_QWEN_API_BASE = "http://localhost:8088/v1"
+LOCAL_QWEN_MODEL_NAME_FOR_LITELLM = "local/qwen3-1.7b-gguf" # 与 test_litellm_local.py 中一致
+# 云端 LiteLLM 网关地址 (用于 Gemini 等) - 先占位，后续替换为您的实际地址
+CLOUD_LITELLM_GW_API_BASE = os.getenv("CLOUD_LITELLM_GW_API_BASE", "YOUR_CLOUD_LITELLM_GATEWAY_URL_HERE")
+GEMINI_MODEL_NAME_FOR_LITELLM = "gemini/gemini-1.5-flash-latest" # 或您希望通过网关调用的模型
+
+# --- Pydantic 模型定义 ---
+
+class AgentTaskRequest(BaseModel):
+    user_query: str = Field(description="用户的原始文本查询。")
+    # local_file_path: Optional[str] = Field(None, description="如果操作涉及本地特定文件，请提供其绝对路径。")
+    # session_id: Optional[str] = Field(None, description="可选的会话ID，用于支持多轮对话记忆。")
+
+class AgentTaskResponse(BaseModel):
+    answer: str = Field(description="Agent 系统生成的最终答案或响应。")
+    status: str = Field(default="success", description="执行状态: 'success', 'needs_clarification', 'error', 'processing_plan'.")
+    intermediate_plan: Optional[Dict[str, Any]] = Field(None, description="如果status是'processing_plan', 这里包含Manager Agent的规划结果。")
+    error_message: Optional[str] = Field(None, description="如果发生错误，此字段包含错误信息。")
+    debug_info: Optional[Dict[str, Any]] = Field(None, description="包含执行过程中的调试信息。")
+    # token_usage: Optional[Dict[str, Any]] = Field(None, description="LLM token 使用情况统计。")
+
+# --- 全局变量 (在 lifespan 中初始化) ---
+# manager_llm: Optional[Any] = None # 将是 CrewAI LLM 兼容对象
+# worker_llm: Optional[Any] = None  # 同上
+# tool_kit: Dict[str, Any] = {}     # 存储实例化的工具
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global manager_llm, worker_llm, tool_kit
+    print("--- Agent Orchestrator Service: Lifespan startup ---")
+    
+    # TODO: 步骤3 - 初始化 LLM 实例 (通过 LiteLLM)
+    # 例如:
+    # manager_llm = ... # 创建一个使用 Gemini (通过云网关) 的 CrewAI LLM 包装器
+    # worker_llm = ...  # 创建一个使用本地 Qwen3 的 CrewAI LLM 包装器
+
+    # TODO: 步骤3 - 初始化核心工具实例
+    # 例如:
+    # rag_tool = EnhancedRAGTool()
+    # excel_tool = ExecuteExcelSQOTool() # 确保它能正确调用本地代理
+    # search_tool = DuckDuckGoSearchTool() # 确保它能正确调用MCP
+    # tool_kit = {rag_tool.name: rag_tool, excel_tool.name: excel_tool, search_tool.name: search_tool}
+    
+    print("Agent Orchestrator Service: LLM 和工具将在后续步骤中在这里初始化。")
+    yield
+    print("--- Agent Orchestrator Service: Lifespan shutdown ---")
+
+app = FastAPI(
+    title="Agent Orchestrator Service",
+    description="接收用户请求，通过Manager/Worker Agent模型进行任务规划和执行。",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+@app.post("/v1/execute_task", response_model=AgentTaskResponse)
+async def execute_task_endpoint(request: AgentTaskRequest):
+    print(f"Received agent task request: User Query='{request.user_query}'")
+    
+    # --- 临时的占位逻辑 ---
+    # 在这里，我们将逐步集成 Manager Agent 的规划逻辑
+    # 目前，我们先简单返回一个表示正在处理规划的响应
+
+    # 模拟 Manager Agent 的初步规划 (后续替换为真实 CrewAI 调用)
+    manager_plan = {
+        "task_description": request.user_query,
+        "selected_tool_names": ["TODO: Manager will select tools here"],
+        "excel_sqo_payload": None, # 默认为 None
+        "reasoning_for_plan": "TODO: Manager will explain its plan here, including why tools are needed or not."
+    }
+
+    if "excel" in request.user_query.lower() or ".xlsx" in request.user_query.lower():
+        manager_plan["selected_tool_names"] = ["execute_excel_sqo"]
+        manager_plan["excel_sqo_payload"] = [{"operation_type": "TODO: define_sqo_based_on_query"}]
+        manager_plan["reasoning_for_plan"] = "用户请求涉及Excel文件，规划使用Excel工具。"
+    elif "搜索" in request.user_query or "查找" in request.user_query or "最新" in request.user_query:
+        manager_plan["selected_tool_names"] = ["duckduckgo_search"]
+        manager_plan["reasoning_for_plan"] = "用户请求需要从网络获取信息，规划使用搜索工具。"
+    elif "中国的首都是哪里" in request.user_query: # 模拟直接回答
+        manager_plan["selected_tool_names"] = [] # 或者 ["direct_answer"]
+        manager_plan["reasoning_for_plan"] = "这是一个常识性问题，LLM可以直接回答，无需工具。"
+        # 理想情况下，这里 Manager Agent 会直接给出答案，我们暂时只返回规划
+        # return AgentTaskResponse(answer="中国的首都是北京。", status="success", debug_info={"plan": manager_plan})
+
+    return AgentTaskResponse(
+        answer="Manager Agent is planning the task.", 
+        status="processing_plan", # 一个新的状态，表示规划已生成，等待下一步执行
+        intermediate_plan=manager_plan,
+        debug_info={"message": "Full CrewAI logic not yet implemented."}
+    )
+
+if __name__ == "__main__":
+    print(f"--- Starting Agent Orchestrator FastAPI Service on {AGENT_SERVICE_HOST}:{AGENT_SERVICE_PORT} ---")
+    # 注意：如果这个服务由 mcpo 管理，这个 if __name__ == "__main__": 部分通常不会被 mcpo 调用。
+    # mcpo 会直接通过模块和类名（如果服务本身是类）或直接运行脚本（如果服务是顶级 FastAPI app）来启动。
+    # 为了方便独立测试，我们保留这个 uvicorn.run。
+    uvicorn.run(app, host=AGENT_SERVICE_HOST, port=AGENT_SERVICE_PORT)
+    --- END OF FILE CONTENT ---
+
+  File: config.yaml
+    --- START OF FILE CONTENT ---
+# config.yaml
+
+model_list:
+  - model_name: gemini/gemini-1.5-flash-latest # 您已有的 Gemini 配置 (如果存在)
+    litellm_params:
+      model: gemini/gemini-1.5-flash-latest
+      api_key: os.environ/GEMINI_API_KEY
+      # api_base: http://localhost:YOUR_CLASH_PORT # 如果需要
+
+  # --- 修改我们本地的 Qwen3 1.7B 模型配置 ---
+  - model_name: local/qwen3-1.7b-gguf
+    litellm_params:
+      model: openai/my-local-qwen # 使用 "openai/" 前缀，后面可以跟一个自定义的描述符
+      api_base: http://localhost:8088/v1
+      api_key: nokey
+
+# ... (其他 LiteLLM 配置) ...
+    --- END OF FILE CONTENT ---
+
+  File: debug_kuzu_visibility.py
+    --- START OF FILE CONTENT ---
+# debug_kuzu_visibility.py
+import kuzu
+import os
+import shutil
+import time
+import pandas as pd
+
+DB_PATH = "./zhz_rag/stored_data/kuzu_test_visibility_db" # 使用一个新的测试路径
+
+def setup_and_verify_schema():
+    print(f"--- Phase 1: Setup and Initial Verification ---")
+    if os.path.exists(DB_PATH):
+        print(f"Removing existing database at {DB_PATH}")
+        shutil.rmtree(DB_PATH)
+    
+    db_setup = None
+    conn_setup = None
+    try:
+        print(f"Creating new database at {DB_PATH}")
+        db_setup = kuzu.Database(DB_PATH, read_only=False)
+        conn_setup = kuzu.Connection(db_setup)
+        print("Database and connection created for setup.")
+
+        ddl_queries = [
+            "CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))",
+            "CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)",
+            "CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)"
+        ]
+        for query in ddl_queries:
+            print(f"Executing DDL: {query}")
+            conn_setup.execute(query)
+        print("DDL execution complete.")
+
+        print("Executing CHECKPOINT...")
+        conn_setup.execute("CHECKPOINT;")
+        print("CHECKPOINT complete.")
+
+        # Phase 1 Verification
+        print("Verifying tables immediately after creation (same session)...")
+        try:
+            # 尝试 SHOW TABLES;
+            print("Attempting 'SHOW TABLES;' in Phase 1...")
+            result = conn_setup.execute("SHOW TABLES;") # <--- 修改这里
+            df = pd.DataFrame(result.get_as_df())
+            print(f"Tables found using 'SHOW TABLES;' (Phase 1):\n{df}")
+            # 检查 'name' 列是否存在，并且 'ExtractedEntity' 是否在其中
+            if not df.empty and 'name' in df.columns and "ExtractedEntity" in df["name"].tolist():
+                print("Phase 1 Verification (SHOW TABLES;): ExtractedEntity table FOUND.")
+            elif not df.empty and 'name' not in df.columns:
+                print("Phase 1 Verification (SHOW TABLES;): 'name' column not found in SHOW TABLES result.")
+                print(f"Columns available in SHOW TABLES result: {df.columns.tolist()}")
+            else: # df is empty or ExtractedEntity not in name column
+                print("Phase 1 Verification (SHOW TABLES;): ExtractedEntity table NOT FOUND or result was empty.")
+        except Exception as e:
+            print(f"Error during Phase 1 verification with 'SHOW TABLES;': {e}")
+            print("Falling back to direct query for ExtractedEntity in Phase 1...")
+            try:
+                result_direct = conn_setup.execute("MATCH (e:ExtractedEntity) RETURN count(e) AS entity_count;")
+                df_direct = pd.DataFrame(result_direct.get_as_df())
+                print(f"Direct query result (Phase 1):\n{df_direct}")
+                count_val = df_direct['entity_count'].iloc[0] if not df_direct.empty else -1
+                print(f"Phase 1 Verification (Direct Query): ExtractedEntity table SEEMS TO EXIST (count: {count_val}).")
+            except Exception as e_direct_phase1:
+                print(f"Error during Phase 1 direct query verification: {e_direct_phase1}")
+
+    except Exception as e:
+        print(f"Error during Phase 1 setup: {e}")
+    finally:
+        if conn_setup:
+            print("Closing setup connection.")
+            # conn_setup.close() # Kuzu Connection 没有显式 close
+        if db_setup:
+            print("Deleting setup database instance reference (will trigger close).")
+            del db_setup # 依赖 __del__
+        print("--- Phase 1 Complete ---")
+
+def verify_in_new_session():
+    print(f"\n--- Phase 2: Verification in a New Session ---")
+    if not os.path.exists(DB_PATH):
+        print(f"Database at {DB_PATH} does not exist. Cannot perform Phase 2.")
+        return
+
+    db_verify = None
+    conn_verify = None
+    try:
+        print(f"Opening existing database at {DB_PATH} for verification.")
+        db_verify = kuzu.Database(DB_PATH, read_only=False) # 打开同一个数据库
+        conn_verify = kuzu.Connection(db_verify)
+        print("Database and connection created for verification.")
+
+        # Phase 2 Verification
+        print("Verifying tables in new session...")
+        try:
+            # 尝试 SHOW TABLES;
+            print("Attempting 'SHOW TABLES;' in Phase 2...")
+            result = conn_verify.execute("SHOW TABLES;") # <--- 修改这里
+            df = pd.DataFrame(result.get_as_df())
+            print(f"Tables found using 'SHOW TABLES;' (Phase 2):\n{df}")
+            if not df.empty and 'name' in df.columns and "ExtractedEntity" in df["name"].tolist():
+                print("Phase 2 Verification (SHOW TABLES;): ExtractedEntity table FOUND.")
+            elif not df.empty and 'name' not in df.columns:
+                print("Phase 2 Verification (SHOW TABLES;): 'name' column not found in SHOW TABLES result.")
+                print(f"Columns available in SHOW TABLES result: {df.columns.tolist()}")
+            else: # df is empty or ExtractedEntity not in name column
+                print("Phase 2 Verification (SHOW TABLES;): ExtractedEntity table NOT FOUND or result was empty.")
+        except Exception as e:
+            print(f"Error during Phase 2 verification with 'SHOW TABLES;': {e}")
+            print("Falling back to direct query for ExtractedEntity in Phase 2...")
+            try:
+                result_direct = conn_verify.execute("MATCH (e:ExtractedEntity) RETURN count(e) AS entity_count;")
+                df_direct = pd.DataFrame(result_direct.get_as_df())
+                print(f"Direct query result (Phase 2):\n{df_direct}")
+                count_val = df_direct['entity_count'].iloc[0] if not df_direct.empty else -1
+                print(f"Phase 2 Verification (Direct Query): ExtractedEntity table SEEMS TO EXIST (count: {count_val}).")
+            except Exception as e_direct_phase2:
+                print(f"Error during Phase 2 direct query verification: {e_direct_phase2}")
+
+    except Exception as e:
+        print(f"Error during Phase 2 setup: {e}")
+    finally:
+        if conn_verify:
+            print("Closing verification connection.")
+        if db_verify:
+            print("Deleting verification database instance reference.")
+            del db_verify
+        print("--- Phase 2 Complete ---")
+
+if __name__ == "__main__":
+    print(f"Kuzu Python client version: {kuzu.__version__}")
+    setup_and_verify_schema()
+    print("\nWaiting a moment before trying to open in a new session (simulating process switch)...")
+    time.sleep(2) # 短暂等待，模拟进程切换的间隙
+    verify_in_new_session()
+    --- END OF FILE CONTENT ---
+
+  File: local_llm_service.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/local_llm_service.py
+
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional, Union
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from llama_cpp import Llama, LlamaGrammar
+import re # 导入 re 模块
+
+# --- 配置 ---
+MODEL_DIR = os.getenv("LOCAL_LLM_MODEL_DIR", "/home/zhz/models/Qwen3-1.7B-GGUF")
+MODEL_FILENAME = os.getenv("LOCAL_LLM_MODEL_FILENAME") 
+N_GPU_LAYERS = int(os.getenv("LOCAL_LLM_N_GPU_LAYERS", 0))
+N_CTX = int(os.getenv("LOCAL_LLM_N_CTX", 2048))
+N_BATCH = int(os.getenv("LOCAL_LLM_N_BATCH", 512))
+SERVICE_PORT = int(os.getenv("LOCAL_LLM_SERVICE_PORT", 8088))
+SERVICE_HOST = "0.0.0.0"
+
+# --- 全局变量持有 Llama 模型实例 ---
+llama_model: Optional[Llama] = None
+model_path_global: Optional[str] = None
+
+# --- Pydantic 模型定义 (兼容 OpenAI Chat Completion API) ---
+# (Pydantic 模型定义与上一版本完全相同，此处省略以减少篇幅，请保留您已有的定义)
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    temperature: float = 0.7
+    max_tokens: Optional[int] = 512
+    stream: bool = False
+    stop: Optional[Union[str, List[str]]] = None
+
+class ChatCompletionChoiceDelta(BaseModel):
+    content: Optional[str] = None
+    role: Optional[str] = None
+
+class ChatCompletionStreamChoice(BaseModel):
+    index: int
+    delta: ChatCompletionChoiceDelta
+    finish_reason: Optional[str] = None
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionStreamChoice]
+
+class ChatCompletionMessage(BaseModel):
+    role: str
+    content: Optional[str] = None
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: Optional[str] = "stop"
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: UsageInfo
+    system_fingerprint: Optional[str] = None
+
+# --- FastAPI 应用和生命周期管理 ---
+# (lifespan 函数与上一版本完全相同，此处省略，请保留您已有的定义)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global llama_model, model_path_global
+    print("--- Local LLM Service: Lifespan startup ---")
+    
+    model_file_to_load = MODEL_FILENAME
+    if not model_file_to_load:
+        try:
+            gguf_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf")]
+            if not gguf_files:
+                raise RuntimeError(f"No GGUF models found in {MODEL_DIR}")
+            if len(gguf_files) > 1:
+                print(f"Warning: Multiple GGUF models found in {MODEL_DIR}. Using the first one: {gguf_files[0]}")
+            model_file_to_load = gguf_files[0]
+        except FileNotFoundError:
+            raise RuntimeError(f"Model directory not found: {MODEL_DIR}")
+
+
+    model_path_global = os.path.join(MODEL_DIR, model_file_to_load)
+    print(f"Attempting to load Llama model from: {model_path_global}")
+    print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
+
+    try:
+        llama_model = Llama(
+            model_path=model_path_global,
+            n_gpu_layers=N_GPU_LAYERS,
+            n_ctx=N_CTX,
+            n_batch=N_BATCH,
+            verbose=True
+        )
+        print("Llama model loaded successfully.")
+    except Exception as e:
+        print(f"FATAL: Failed to load Llama model: {e}")
+        raise RuntimeError(f"Failed to load Llama model: {e}") from e
+    
+    yield
+    
+    print("--- Local LLM Service: Lifespan shutdown ---")
+
+app = FastAPI(
+    title="Local LLM Service (OpenAI Compatible)",
+    description=f"Provides an OpenAI-compatible API for a locally hosted GGUF model via llama-cpp-python.",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+# --- 辅助函数 ---
+# (convert_messages_to_prompt 函数与上一版本完全相同，此处省略，请保留您已有的定义)
+def convert_messages_to_prompt(messages: List[ChatMessage], model_chat_format: Optional[str]) -> str:
+    if llama_model and hasattr(llama_model, 'chat_format') and llama_model.chat_format:
+        if hasattr(llama_model, 'apply_chat_template'):
+            try:
+                dict_messages = [msg.dict() for msg in messages] # Pydantic V1
+                return llama_model.apply_chat_template(dict_messages, add_generation_prompt=True, tokenize=False)
+            except Exception as e:
+                print(f"Warning: llama_model.apply_chat_template failed: {e}. Falling back to manual formatting.")
+        else:
+             print(f"Warning: llama_model.apply_chat_template not available. Falling back to manual formatting.")
+    
+    prompt = ""
+    for msg in messages:
+        prompt += f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+
+
+def post_process_llm_output(content: Optional[str], finish_reason: Optional[str]) -> Optional[str]:
+    if content is None:
+        return None
+    
+    print(f"DEBUG_POST_PROCESS: Input to post_process_llm_output:\n---\n{content}\n---")
+    print(f"DEBUG_POST_PROCESS: Finish reason: {finish_reason}")
+
+    processed_content = content
+    # 优先尝试移除完整的 <think>...</think> 块
+    # 正则表达式：匹配 <think...> (可能带有属性或空格) 开始，到 </think> 结束的所有内容，包括换行
+    # re.DOTALL 使 . 匹配换行符
+    # re.IGNORECASE 使匹配不区分大小写
+    think_block_pattern = re.compile(r"<think[^>]*>.*?</think>\s*", flags=re.DOTALL | re.IGNORECASE)
+    processed_content = think_block_pattern.sub("", processed_content)
+    
+    print(f"DEBUG_POST_PROCESS: After think_block_pattern.sub:\n---\n{processed_content}\n---")
+
+    # 如果因为长度截断，并且内容仍然以 <think 开头（没有闭合），说明整个输出都是不完整的思考
+    # 这种情况下，我们可能不希望显示它，或者返回一个特定消息
+    if finish_reason == "length" and \
+       re.match(r"<think[^>]*>", processed_content.strip(), flags=re.IGNORECASE) and \
+       not re.search(r"</think\s*>", processed_content, flags=re.IGNORECASE):
+        print("DEBUG_POST_PROCESS: Incomplete think block due to length, returning empty or placeholder.")
+        # 可以选择返回空字符串，或者一个提示信息
+        # return "" 
+        # 或者让后续的strip()处理，如果只剩下一个开头的<think>标签，也会被移除
+        # 但更稳妥的是在这里就处理掉
+
+    # 再次尝试移除可能单独存在的 <think> 或 </think> 标签（以防万一）
+    stray_think_tag_pattern = re.compile(r"</?\s*think[^>]*?>\s*", flags=re.IGNORECASE)
+    processed_content = stray_think_tag_pattern.sub("", processed_content)
+
+    print(f"DEBUG_POST_PROCESS: After stray_think_tag_pattern.sub:\n---\n{processed_content}\n---")
+    
+    final_stripped_content = processed_content.strip()
+    print(f"DEBUG_POST_PROCESS: After final strip:\n---\n{final_stripped_content}\n---")
+
+    return final_stripped_content
+
+# --- API 端点 ---
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def create_chat_completion(request: ChatCompletionRequest):
+    global llama_model, model_path_global
+    if llama_model is None:
+        raise HTTPException(status_code=503, detail="Llama model is not loaded or failed to load.")
+
+    if request.stream:
+        raise HTTPException(status_code=400, detail="Streaming responses are not yet supported by this service.")
+
+    response_content_raw: Optional[str] = None
+    response_content_final: Optional[str] = None
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    finish_reason = "stop" # 默认值
+    
+    request_model_name = request.model
+
+    if hasattr(llama_model, "create_chat_completion"):
+        try:
+            dict_messages = [msg.dict() for msg in request.messages]
+            
+            print(f"DEBUG_FastAPI: Calling llama_model.create_chat_completion with messages: {dict_messages}")
+            completion = llama_model.create_chat_completion(
+                messages=dict_messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                stop=request.stop,
+            )
+            response_content_raw = completion['choices'][0]['message']['content']
+            print(f"DEBUG_FastAPI: Raw content from llama_model: '{response_content_raw}'")
+
+            prompt_tokens = completion['usage']['prompt_tokens']
+            completion_tokens = completion['usage']['completion_tokens']
+            total_tokens = completion['usage']['total_tokens']
+            finish_reason = completion['choices'][0].get('finish_reason', 'stop') # <--- 获取 finish_reason
+        except Exception as e:
+            print(f"Error during llama_model.create_chat_completion: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
+    else:
+        print("Warning: llama_model.create_chat_completion not found. Using direct call with formatted prompt.")
+        prompt_str = convert_messages_to_prompt(request.messages, getattr(llama_model, 'chat_format', None))
+        try:
+            output = llama_model(
+                prompt_str,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                stop=request.stop,
+                echo=False
+            )
+            response_content_raw = output['choices'][0]['text'].strip()
+            print(f"DEBUG_FastAPI: Raw content from llama_model (direct call): '{response_content_raw}'")
+
+            prompt_tokens = output['usage']['prompt_tokens']
+            completion_tokens = output['usage']['completion_tokens']
+            total_tokens = output['usage']['total_tokens']
+            finish_reason = output['choices'][0].get('finish_reason', 'stop') # <--- 获取 finish_reason
+        except Exception as e:
+            print(f"Error during llama_model direct call: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
+
+    # 在调用 post_process_llm_output 时传递 finish_reason
+    response_content_processed = post_process_llm_output(response_content_raw, finish_reason) # <--- 修改点
+    
+    if response_content_processed == "" and response_content_raw and response_content_raw.strip() != "":
+        print(f"Warning: Post-processing resulted in empty content. Original content was: '{response_content_raw[:200]}...' Using raw content instead.")
+        response_content_final = response_content_raw 
+    else:
+        response_content_final = response_content_processed
+    
+    print(f"DEBUG_FastAPI: Final content to be returned: '{response_content_final}'")
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_time = int(time.time())
+    
+    effective_model_name = request_model_name
+    if not effective_model_name and model_path_global:
+        effective_model_name = model_path_global.split('/')[-1]
+    elif not effective_model_name:
+        effective_model_name = "local-llm-unknown"
+
+    return ChatCompletionResponse(
+        id=response_id,
+        object="chat.completion",
+        created=created_time,
+        model=effective_model_name,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChatCompletionMessage(role="assistant", content=response_content_final),
+                finish_reason=finish_reason
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens
+        )
+    )
+
+# (/v1/models 和 if __name__ == "__main__": 部分与上一版本完全相同，此处省略，请保留您已有的定义)
+@app.get("/v1/models", response_model=Dict[str, Any])
+async def list_models():
+    global model_path_global
+    # 这个 ID 应该与 config.yaml 中 litellm_params.model 的 "openai/" 后面的部分匹配
+    model_id_for_clients = "qwen3local" # <--- 修改这里，与 config.yaml 一致
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id_for_clients, 
+                "object": "model",
+                "created": int(os.path.getctime(model_path_global)) if model_path_global and os.path.exists(model_path_global) else int(time.time()),
+                "owned_by": "user",
+            }
+        ]
+    }
+
+if __name__ == "__main__":
+    print(f"--- Starting Local LLM FastAPI Service on {SERVICE_HOST}:{SERVICE_PORT} ---")
+    print(f"--- Model will be loaded from DIR: {MODEL_DIR}, FILE: {MODEL_FILENAME or 'Auto-detected GGUF'} ---")
+    uvicorn.run(app, host=SERVICE_HOST, port=SERVICE_PORT)
+    --- END OF FILE CONTENT ---
+
   File: project_snapshot.txt
-    --- File is empty ---
+    --- START OF FILE CONTENT ---
+Project Root: /home/zhz/zhz_agent
+--- Project Structure and File Contents ---
+
+Directory: /home/zhz/zhz_agent/
+  File (skipped, extension not included): .env
+  File (skipped, extension not included): .envrc
+  File (skipped, extension not included): .gitignore
+  File: README.md
+    --- START OF FILE CONTENT ---
+# zhz_agent
+后端：RAG增强+多agent+dagster
+
+    --- END OF FILE CONTENT ---
+
+  File: agent_orchestrator_service.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/zhz_rag/api/agent_orchestrator_service.py
+
+import os
+import asyncio
+import traceback
+from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from pydantic import BaseModel, Field
+
+# --- LiteLLM (后续会在这里配置和使用) ---
+import litellm 
+
+# --- CrewAI (后续会在这里配置和使用) ---
+# from crewai import Agent, Task, Crew, Process, LLM
+
+# --- 自定义模块导入 (后续会逐步完善) ---
+# from zhz_rag.utils.common_utils import call_mcpo_tool
+# from zhz_rag.crewai_integration.tools import ... # 我们将定义新的核心工具类
+# from zhz_agent_config.agents import create_manager_agent, create_worker_agent # 假设新的配置文件路径
+# from zhz_agent_config.tasks import create_manager_task_definition, process_manager_output_and_execute_worker
+
+# --- 配置 ---
+AGENT_SERVICE_PORT = int(os.getenv("AGENT_SERVICE_PORT", 8090))
+AGENT_SERVICE_HOST = "0.0.0.0"
+# 本地 LLM 服务地址 (Qwen3)
+LOCAL_QWEN_API_BASE = "http://localhost:8088/v1"
+LOCAL_QWEN_MODEL_NAME_FOR_LITELLM = "local/qwen3-1.7b-gguf" # 与 test_litellm_local.py 中一致
+# 云端 LiteLLM 网关地址 (用于 Gemini 等) - 先占位，后续替换为您的实际地址
+CLOUD_LITELLM_GW_API_BASE = os.getenv("CLOUD_LITELLM_GW_API_BASE", "YOUR_CLOUD_LITELLM_GATEWAY_URL_HERE")
+GEMINI_MODEL_NAME_FOR_LITELLM = "gemini/gemini-1.5-flash-latest" # 或您希望通过网关调用的模型
+
+# --- Pydantic 模型定义 ---
+
+class AgentTaskRequest(BaseModel):
+    user_query: str = Field(description="用户的原始文本查询。")
+    # local_file_path: Optional[str] = Field(None, description="如果操作涉及本地特定文件，请提供其绝对路径。")
+    # session_id: Optional[str] = Field(None, description="可选的会话ID，用于支持多轮对话记忆。")
+
+class AgentTaskResponse(BaseModel):
+    answer: str = Field(description="Agent 系统生成的最终答案或响应。")
+    status: str = Field(default="success", description="执行状态: 'success', 'needs_clarification', 'error', 'processing_plan'.")
+    intermediate_plan: Optional[Dict[str, Any]] = Field(None, description="如果status是'processing_plan', 这里包含Manager Agent的规划结果。")
+    error_message: Optional[str] = Field(None, description="如果发生错误，此字段包含错误信息。")
+    debug_info: Optional[Dict[str, Any]] = Field(None, description="包含执行过程中的调试信息。")
+    # token_usage: Optional[Dict[str, Any]] = Field(None, description="LLM token 使用情况统计。")
+
+# --- 全局变量 (在 lifespan 中初始化) ---
+# manager_llm: Optional[Any] = None # 将是 CrewAI LLM 兼容对象
+# worker_llm: Optional[Any] = None  # 同上
+# tool_kit: Dict[str, Any] = {}     # 存储实例化的工具
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global manager_llm, worker_llm, tool_kit
+    print("--- Agent Orchestrator Service: Lifespan startup ---")
+    
+    # TODO: 步骤3 - 初始化 LLM 实例 (通过 LiteLLM)
+    # 例如:
+    # manager_llm = ... # 创建一个使用 Gemini (通过云网关) 的 CrewAI LLM 包装器
+    # worker_llm = ...  # 创建一个使用本地 Qwen3 的 CrewAI LLM 包装器
+
+    # TODO: 步骤3 - 初始化核心工具实例
+    # 例如:
+    # rag_tool = EnhancedRAGTool()
+    # excel_tool = ExecuteExcelSQOTool() # 确保它能正确调用本地代理
+    # search_tool = DuckDuckGoSearchTool() # 确保它能正确调用MCP
+    # tool_kit = {rag_tool.name: rag_tool, excel_tool.name: excel_tool, search_tool.name: search_tool}
+    
+    print("Agent Orchestrator Service: LLM 和工具将在后续步骤中在这里初始化。")
+    yield
+    print("--- Agent Orchestrator Service: Lifespan shutdown ---")
+
+app = FastAPI(
+    title="Agent Orchestrator Service",
+    description="接收用户请求，通过Manager/Worker Agent模型进行任务规划和执行。",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+@app.post("/v1/execute_task", response_model=AgentTaskResponse)
+async def execute_task_endpoint(request: AgentTaskRequest):
+    print(f"Received agent task request: User Query='{request.user_query}'")
+    
+    # --- 临时的占位逻辑 ---
+    # 在这里，我们将逐步集成 Manager Agent 的规划逻辑
+    # 目前，我们先简单返回一个表示正在处理规划的响应
+
+    # 模拟 Manager Agent 的初步规划 (后续替换为真实 CrewAI 调用)
+    manager_plan = {
+        "task_description": request.user_query,
+        "selected_tool_names": ["TODO: Manager will select tools here"],
+        "excel_sqo_payload": None, # 默认为 None
+        "reasoning_for_plan": "TODO: Manager will explain its plan here, including why tools are needed or not."
+    }
+
+    if "excel" in request.user_query.lower() or ".xlsx" in request.user_query.lower():
+        manager_plan["selected_tool_names"] = ["execute_excel_sqo"]
+        manager_plan["excel_sqo_payload"] = [{"operation_type": "TODO: define_sqo_based_on_query"}]
+        manager_plan["reasoning_for_plan"] = "用户请求涉及Excel文件，规划使用Excel工具。"
+    elif "搜索" in request.user_query or "查找" in request.user_query or "最新" in request.user_query:
+        manager_plan["selected_tool_names"] = ["duckduckgo_search"]
+        manager_plan["reasoning_for_plan"] = "用户请求需要从网络获取信息，规划使用搜索工具。"
+    elif "中国的首都是哪里" in request.user_query: # 模拟直接回答
+        manager_plan["selected_tool_names"] = [] # 或者 ["direct_answer"]
+        manager_plan["reasoning_for_plan"] = "这是一个常识性问题，LLM可以直接回答，无需工具。"
+        # 理想情况下，这里 Manager Agent 会直接给出答案，我们暂时只返回规划
+        # return AgentTaskResponse(answer="中国的首都是北京。", status="success", debug_info={"plan": manager_plan})
+
+    return AgentTaskResponse(
+        answer="Manager Agent is planning the task.", 
+        status="processing_plan", # 一个新的状态，表示规划已生成，等待下一步执行
+        intermediate_plan=manager_plan,
+        debug_info={"message": "Full CrewAI logic not yet implemented."}
+    )
+
+if __name__ == "__main__":
+    print(f"--- Starting Agent Orchestrator FastAPI Service on {AGENT_SERVICE_HOST}:{AGENT_SERVICE_PORT} ---")
+    # 注意：如果这个服务由 mcpo 管理，这个 if __name__ == "__main__": 部分通常不会被 mcpo 调用。
+    # mcpo 会直接通过模块和类名（如果服务本身是类）或直接运行脚本（如果服务是顶级 FastAPI app）来启动。
+    # 为了方便独立测试，我们保留这个 uvicorn.run。
+    uvicorn.run(app, host=AGENT_SERVICE_HOST, port=AGENT_SERVICE_PORT)
+    --- END OF FILE CONTENT ---
+
+  File: config.yaml
+    --- START OF FILE CONTENT ---
+# config.yaml
+
+model_list:
+  - model_name: gemini/gemini-1.5-flash-latest # 您已有的 Gemini 配置 (如果存在)
+    litellm_params:
+      model: gemini/gemini-1.5-flash-latest
+      api_key: os.environ/GEMINI_API_KEY
+      # api_base: http://localhost:YOUR_CLASH_PORT # 如果需要
+
+  # --- 修改我们本地的 Qwen3 1.7B 模型配置 ---
+  - model_name: local/qwen3-1.7b-gguf
+    litellm_params:
+      model: openai/my-local-qwen # 使用 "openai/" 前缀，后面可以跟一个自定义的描述符
+      api_base: http://localhost:8088/v1
+      api_key: nokey
+
+# ... (其他 LiteLLM 配置) ...
+    --- END OF FILE CONTENT ---
+
+  File: debug_kuzu_visibility.py
+    --- START OF FILE CONTENT ---
+# debug_kuzu_visibility.py
+import kuzu
+import os
+import shutil
+import time
+import pandas as pd
+
+DB_PATH = "./zhz_rag/stored_data/kuzu_test_visibility_db" # 使用一个新的测试路径
+
+def setup_and_verify_schema():
+    print(f"--- Phase 1: Setup and Initial Verification ---")
+    if os.path.exists(DB_PATH):
+        print(f"Removing existing database at {DB_PATH}")
+        shutil.rmtree(DB_PATH)
+    
+    db_setup = None
+    conn_setup = None
+    try:
+        print(f"Creating new database at {DB_PATH}")
+        db_setup = kuzu.Database(DB_PATH, read_only=False)
+        conn_setup = kuzu.Connection(db_setup)
+        print("Database and connection created for setup.")
+
+        ddl_queries = [
+            "CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))",
+            "CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)",
+            "CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)"
+        ]
+        for query in ddl_queries:
+            print(f"Executing DDL: {query}")
+            conn_setup.execute(query)
+        print("DDL execution complete.")
+
+        print("Executing CHECKPOINT...")
+        conn_setup.execute("CHECKPOINT;")
+        print("CHECKPOINT complete.")
+
+        # Phase 1 Verification
+        print("Verifying tables immediately after creation (same session)...")
+        try:
+            # 尝试 SHOW TABLES;
+            print("Attempting 'SHOW TABLES;' in Phase 1...")
+            result = conn_setup.execute("SHOW TABLES;") # <--- 修改这里
+            df = pd.DataFrame(result.get_as_df())
+            print(f"Tables found using 'SHOW TABLES;' (Phase 1):\n{df}")
+            # 检查 'name' 列是否存在，并且 'ExtractedEntity' 是否在其中
+            if not df.empty and 'name' in df.columns and "ExtractedEntity" in df["name"].tolist():
+                print("Phase 1 Verification (SHOW TABLES;): ExtractedEntity table FOUND.")
+            elif not df.empty and 'name' not in df.columns:
+                print("Phase 1 Verification (SHOW TABLES;): 'name' column not found in SHOW TABLES result.")
+                print(f"Columns available in SHOW TABLES result: {df.columns.tolist()}")
+            else: # df is empty or ExtractedEntity not in name column
+                print("Phase 1 Verification (SHOW TABLES;): ExtractedEntity table NOT FOUND or result was empty.")
+        except Exception as e:
+            print(f"Error during Phase 1 verification with 'SHOW TABLES;': {e}")
+            print("Falling back to direct query for ExtractedEntity in Phase 1...")
+            try:
+                result_direct = conn_setup.execute("MATCH (e:ExtractedEntity) RETURN count(e) AS entity_count;")
+                df_direct = pd.DataFrame(result_direct.get_as_df())
+                print(f"Direct query result (Phase 1):\n{df_direct}")
+                count_val = df_direct['entity_count'].iloc[0] if not df_direct.empty else -1
+                print(f"Phase 1 Verification (Direct Query): ExtractedEntity table SEEMS TO EXIST (count: {count_val}).")
+            except Exception as e_direct_phase1:
+                print(f"Error during Phase 1 direct query verification: {e_direct_phase1}")
+
+    except Exception as e:
+        print(f"Error during Phase 1 setup: {e}")
+    finally:
+        if conn_setup:
+            print("Closing setup connection.")
+            # conn_setup.close() # Kuzu Connection 没有显式 close
+        if db_setup:
+            print("Deleting setup database instance reference (will trigger close).")
+            del db_setup # 依赖 __del__
+        print("--- Phase 1 Complete ---")
+
+def verify_in_new_session():
+    print(f"\n--- Phase 2: Verification in a New Session ---")
+    if not os.path.exists(DB_PATH):
+        print(f"Database at {DB_PATH} does not exist. Cannot perform Phase 2.")
+        return
+
+    db_verify = None
+    conn_verify = None
+    try:
+        print(f"Opening existing database at {DB_PATH} for verification.")
+        db_verify = kuzu.Database(DB_PATH, read_only=False) # 打开同一个数据库
+        conn_verify = kuzu.Connection(db_verify)
+        print("Database and connection created for verification.")
+
+        # Phase 2 Verification
+        print("Verifying tables in new session...")
+        try:
+            # 尝试 SHOW TABLES;
+            print("Attempting 'SHOW TABLES;' in Phase 2...")
+            result = conn_verify.execute("SHOW TABLES;") # <--- 修改这里
+            df = pd.DataFrame(result.get_as_df())
+            print(f"Tables found using 'SHOW TABLES;' (Phase 2):\n{df}")
+            if not df.empty and 'name' in df.columns and "ExtractedEntity" in df["name"].tolist():
+                print("Phase 2 Verification (SHOW TABLES;): ExtractedEntity table FOUND.")
+            elif not df.empty and 'name' not in df.columns:
+                print("Phase 2 Verification (SHOW TABLES;): 'name' column not found in SHOW TABLES result.")
+                print(f"Columns available in SHOW TABLES result: {df.columns.tolist()}")
+            else: # df is empty or ExtractedEntity not in name column
+                print("Phase 2 Verification (SHOW TABLES;): ExtractedEntity table NOT FOUND or result was empty.")
+        except Exception as e:
+            print(f"Error during Phase 2 verification with 'SHOW TABLES;': {e}")
+            print("Falling back to direct query for ExtractedEntity in Phase 2...")
+            try:
+                result_direct = conn_verify.execute("MATCH (e:ExtractedEntity) RETURN count(e) AS entity_count;")
+                df_direct = pd.DataFrame(result_direct.get_as_df())
+                print(f"Direct query result (Phase 2):\n{df_direct}")
+                count_val = df_direct['entity_count'].iloc[0] if not df_direct.empty else -1
+                print(f"Phase 2 Verification (Direct Query): ExtractedEntity table SEEMS TO EXIST (count: {count_val}).")
+            except Exception as e_direct_phase2:
+                print(f"Error during Phase 2 direct query verification: {e_direct_phase2}")
+
+    except Exception as e:
+        print(f"Error during Phase 2 setup: {e}")
+    finally:
+        if conn_verify:
+            print("Closing verification connection.")
+        if db_verify:
+            print("Deleting verification database instance reference.")
+            del db_verify
+        print("--- Phase 2 Complete ---")
+
+if __name__ == "__main__":
+    print(f"Kuzu Python client version: {kuzu.__version__}")
+    setup_and_verify_schema()
+    print("\nWaiting a moment before trying to open in a new session (simulating process switch)...")
+    time.sleep(2) # 短暂等待，模拟进程切换的间隙
+    verify_in_new_session()
+    --- END OF FILE CONTENT ---
+
+  File: local_llm_service.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/local_llm_service.py
+
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional, Union
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from llama_cpp import Llama, LlamaGrammar
+import re # 导入 re 模块
+
+# --- 配置 ---
+MODEL_DIR = os.getenv("LOCAL_LLM_MODEL_DIR", "/home/zhz/models/Qwen3-1.7B-GGUF")
+MODEL_FILENAME = os.getenv("LOCAL_LLM_MODEL_FILENAME") 
+N_GPU_LAYERS = int(os.getenv("LOCAL_LLM_N_GPU_LAYERS", 0))
+N_CTX = int(os.getenv("LOCAL_LLM_N_CTX", 2048))
+N_BATCH = int(os.getenv("LOCAL_LLM_N_BATCH", 512))
+SERVICE_PORT = int(os.getenv("LOCAL_LLM_SERVICE_PORT", 8088))
+SERVICE_HOST = "0.0.0.0"
+
+# --- 全局变量持有 Llama 模型实例 ---
+llama_model: Optional[Llama] = None
+model_path_global: Optional[str] = None
+
+# --- Pydantic 模型定义 (兼容 OpenAI Chat Completion API) ---
+# (Pydantic 模型定义与上一版本完全相同，此处省略以减少篇幅，请保留您已有的定义)
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    temperature: float = 0.7
+    max_tokens: Optional[int] = 512
+    stream: bool = False
+    stop: Optional[Union[str, List[str]]] = None
+
+class ChatCompletionChoiceDelta(BaseModel):
+    content: Optional[str] = None
+    role: Optional[str] = None
+
+class ChatCompletionStreamChoice(BaseModel):
+    index: int
+    delta: ChatCompletionChoiceDelta
+    finish_reason: Optional[str] = None
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionStreamChoice]
+
+class ChatCompletionMessage(BaseModel):
+    role: str
+    content: Optional[str] = None
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: Optional[str] = "stop"
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: UsageInfo
+    system_fingerprint: Optional[str] = None
+
+# --- FastAPI 应用和生命周期管理 ---
+# (lifespan 函数与上一版本完全相同，此处省略，请保留您已有的定义)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global llama_model, model_path_global
+    print("--- Local LLM Service: Lifespan startup ---")
+    
+    model_file_to_load = MODEL_FILENAME
+    if not model_file_to_load:
+        try:
+            gguf_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf")]
+            if not gguf_files:
+                raise RuntimeError(f"No GGUF models found in {MODEL_DIR}")
+            if len(gguf_files) > 1:
+                print(f"Warning: Multiple GGUF models found in {MODEL_DIR}. Using the first one: {gguf_files[0]}")
+            model_file_to_load = gguf_files[0]
+        except FileNotFoundError:
+            raise RuntimeError(f"Model directory not found: {MODEL_DIR}")
+
+
+    model_path_global = os.path.join(MODEL_DIR, model_file_to_load)
+    print(f"Attempting to load Llama model from: {model_path_global}")
+    print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
+
+    try:
+        llama_model = Llama(
+            model_path=model_path_global,
+            n_gpu_layers=N_GPU_LAYERS,
+            n_ctx=N_CTX,
+            n_batch=N_BATCH,
+            verbose=True
+        )
+        print("Llama model loaded successfully.")
+    except Exception as e:
+        print(f"FATAL: Failed to load Llama model: {e}")
+        raise RuntimeError(f"Failed to load Llama model: {e}") from e
+    
+    yield
+    
+    print("--- Local LLM Service: Lifespan shutdown ---")
+
+app = FastAPI(
+    title="Local LLM Service (OpenAI Compatible)",
+    description=f"Provides an OpenAI-compatible API for a locally hosted GGUF model via llama-cpp-python.",
+    version="0.1.0",
+    lifespan=lifespan
+)
+
+# --- 辅助函数 ---
+# (convert_messages_to_prompt 函数与上一版本完全相同，此处省略，请保留您已有的定义)
+def convert_messages_to_prompt(messages: List[ChatMessage], model_chat_format: Optional[str]) -> str:
+    if llama_model and hasattr(llama_model, 'chat_format') and llama_model.chat_format:
+        if hasattr(llama_model, 'apply_chat_template'):
+            try:
+                dict_messages = [msg.dict() for msg in messages] # Pydantic V1
+                return llama_model.apply_chat_template(dict_messages, add_generation_prompt=True, tokenize=False)
+            except Exception as e:
+                print(f"Warning: llama_model.apply_chat_template failed: {e}. Falling back to manual formatting.")
+        else:
+             print(f"Warning: llama_model.apply_chat_template not available. Falling back to manual formatting.")
+    
+    prompt = ""
+    for msg in messages:
+        prompt += f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>\n"
+    prompt += "<|im_start|>assistant\n"
+    return prompt
+
+
+def post_process_llm_output(content: Optional[str], finish_reason: Optional[str]) -> Optional[str]:
+    if content is None:
+        return None
+    
+    print(f"DEBUG_POST_PROCESS: Input to post_process_llm_output:\n---\n{content}\n---")
+    print(f"DEBUG_POST_PROCESS: Finish reason: {finish_reason}")
+
+    processed_content = content
+    # 优先尝试移除完整的 <think>...</think> 块
+    # 正则表达式：匹配 <think...> (可能带有属性或空格) 开始，到 </think> 结束的所有内容，包括换行
+    # re.DOTALL 使 . 匹配换行符
+    # re.IGNORECASE 使匹配不区分大小写
+    think_block_pattern = re.compile(r"<think[^>]*>.*?</think>\s*", flags=re.DOTALL | re.IGNORECASE)
+    processed_content = think_block_pattern.sub("", processed_content)
+    
+    print(f"DEBUG_POST_PROCESS: After think_block_pattern.sub:\n---\n{processed_content}\n---")
+
+    # 如果因为长度截断，并且内容仍然以 <think 开头（没有闭合），说明整个输出都是不完整的思考
+    # 这种情况下，我们可能不希望显示它，或者返回一个特定消息
+    if finish_reason == "length" and \
+       re.match(r"<think[^>]*>", processed_content.strip(), flags=re.IGNORECASE) and \
+       not re.search(r"</think\s*>", processed_content, flags=re.IGNORECASE):
+        print("DEBUG_POST_PROCESS: Incomplete think block due to length, returning empty or placeholder.")
+        # 可以选择返回空字符串，或者一个提示信息
+        # return "" 
+        # 或者让后续的strip()处理，如果只剩下一个开头的<think>标签，也会被移除
+        # 但更稳妥的是在这里就处理掉
+
+    # 再次尝试移除可能单独存在的 <think> 或 </think> 标签（以防万一）
+    stray_think_tag_pattern = re.compile(r"</?\s*think[^>]*?>\s*", flags=re.IGNORECASE)
+    processed_content = stray_think_tag_pattern.sub("", processed_content)
+
+    print(f"DEBUG_POST_PROCESS: After stray_think_tag_pattern.sub:\n---\n{processed_content}\n---")
+    
+    final_stripped_content = processed_content.strip()
+    print(f"DEBUG_POST_PROCESS: After final strip:\n---\n{final_stripped_content}\n---")
+
+    return final_stripped_content
+
+# --- API 端点 ---
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def create_chat_completion(request: ChatCompletionRequest):
+    global llama_model, model_path_global
+    if llama_model is None:
+        raise HTTPException(status_code=503, detail="Llama model is not loaded or failed to load.")
+
+    if request.stream:
+        raise HTTPException(status_code=400, detail="Streaming responses are not yet supported by this service.")
+
+    response_content_raw: Optional[str] = None
+    response_content_final: Optional[str] = None
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    finish_reason = "stop" # 默认值
+    
+    request_model_name = request.model
+
+    if hasattr(llama_model, "create_chat_completion"):
+        try:
+            dict_messages = [msg.dict() for msg in request.messages]
+            
+            print(f"DEBUG_FastAPI: Calling llama_model.create_chat_completion with messages: {dict_messages}")
+            completion = llama_model.create_chat_completion(
+                messages=dict_messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                stop=request.stop,
+            )
+            response_content_raw = completion['choices'][0]['message']['content']
+            print(f"DEBUG_FastAPI: Raw content from llama_model: '{response_content_raw}'")
+
+            prompt_tokens = completion['usage']['prompt_tokens']
+            completion_tokens = completion['usage']['completion_tokens']
+            total_tokens = completion['usage']['total_tokens']
+            finish_reason = completion['choices'][0].get('finish_reason', 'stop') # <--- 获取 finish_reason
+        except Exception as e:
+            print(f"Error during llama_model.create_chat_completion: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
+    else:
+        print("Warning: llama_model.create_chat_completion not found. Using direct call with formatted prompt.")
+        prompt_str = convert_messages_to_prompt(request.messages, getattr(llama_model, 'chat_format', None))
+        try:
+            output = llama_model(
+                prompt_str,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                stop=request.stop,
+                echo=False
+            )
+            response_content_raw = output['choices'][0]['text'].strip()
+            print(f"DEBUG_FastAPI: Raw content from llama_model (direct call): '{response_content_raw}'")
+
+            prompt_tokens = output['usage']['prompt_tokens']
+            completion_tokens = output['usage']['completion_tokens']
+            total_tokens = output['usage']['total_tokens']
+            finish_reason = output['choices'][0].get('finish_reason', 'stop') # <--- 获取 finish_reason
+        except Exception as e:
+            print(f"Error during llama_model direct call: {e}")
+            raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
+
+    # 在调用 post_process_llm_output 时传递 finish_reason
+    response_content_processed = post_process_llm_output(response_content_raw, finish_reason) # <--- 修改点
+    
+    if response_content_processed == "" and response_content_raw and response_content_raw.strip() != "":
+        print(f"Warning: Post-processing resulted in empty content. Original content was: '{response_content_raw[:200]}...' Using raw content instead.")
+        response_content_final = response_content_raw 
+    else:
+        response_content_final = response_content_processed
+    
+    print(f"DEBUG_FastAPI: Final content to be returned: '{response_content_final}'")
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_time = int(time.time())
+    
+    effective_model_name = request_model_name
+    if not effective_model_name and model_path_global:
+        effective_model_name = model_path_global.split('/')[-1]
+    elif not effective_model_name:
+        effective_model_name = "local-llm-unknown"
+
+    return ChatCompletionResponse(
+        id=response_id,
+        object="chat.completion",
+        created=created_time,
+        model=effective_model_name,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChatCompletionMessage(role="assistant", content=response_content_final),
+                finish_reason=finish_reason
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens
+        )
+    )
+
+# (/v1/models 和 if __name__ == "__main__": 部分与上一版本完全相同，此处省略，请保留您已有的定义)
+@app.get("/v1/models", response_model=Dict[str, Any])
+async def list_models():
+    global model_path_global
+    # 这个 ID 应该与 config.yaml 中 litellm_params.model 的 "openai/" 后面的部分匹配
+    model_id_for_clients = "qwen3local" # <--- 修改这里，与 config.yaml 一致
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id_for_clients, 
+                "object": "model",
+                "created": int(os.path.getctime(model_path_global)) if model_path_global and os.path.exists(model_path_global) else int(time.time()),
+                "owned_by": "user",
+            }
+        ]
+    }
+
+if __name__ == "__main__":
+    print(f"--- Starting Local LLM FastAPI Service on {SERVICE_HOST}:{SERVICE_PORT} ---")
+    print(f"--- Model will be loaded from DIR: {MODEL_DIR}, FILE: {MODEL_FILENAME or 'Auto-detected GGUF'} ---")
+    uvicorn.run(app, host=SERVICE_HOST, port=SERVICE_PORT)
+    --- END OF FILE CONTENT ---
 
   File: requirements.txt
     --- START OF FILE CONTENT ---
@@ -305,280 +1524,6 @@ zstandard==0.23.0
 
     --- END OF FILE CONTENT ---
 
-  File: test_kuzu.py
-    --- START OF FILE CONTENT ---
-import kuzu
-import os
-import shutil
-
-# 定义数据库文件的存储路径 (可以放在项目的一个临时目录或数据目录)
-DB_PATH = "./kuzu_test_db" # 相对路径，将在脚本运行的目录下创建
-# 为了每次测试都有一个干净的环境，先删除已存在的数据库目录
-if os.path.exists(DB_PATH):
-    shutil.rmtree(DB_PATH)
-    print(f"Removed existing KuzuDB directory: {DB_PATH}")
-
-try:
-    # 1. 初始化数据库和连接
-    # KuzuDB 可以是内存数据库 (不传 db_path) 或磁盘数据库
-    db = kuzu.Database(DB_PATH) # 创建或连接到磁盘上的数据库
-    conn = kuzu.Connection(db)
-    print(f"KuzuDB initialized. Database path: {os.path.abspath(DB_PATH)}")
-
-    # 2. 定义 Schema (类似我们项目的 :ExtractedEntity 和关系)
-    print("\n--- Defining Schema ---")
-    # 节点表：ExtractedEntity，包含 text 和 label 属性
-    # KuzuDB 中，主键是必需的，我们可以用一个自动生成的内部ID，或者指定一个属性作为主键。
-    # 为了简单，我们先不显式定义主键，KuzuDB会使用内部ID。
-    # 或者，我们可以将 text 属性作为主键，但这要求 text 值唯一。
-    # 考虑到实体文本可能不唯一（例如，不同上下文的“张三”），使用内部ID可能更好。
-    # KuzuDB 的 STRING 类型可以作为主键。我们先尝试用 text 作为主键，如果遇到问题再调整。
-    # 或者，我们可以增加一个唯一的 entity_id 字段。
-    # 为了更接近我们现有的Neo4j，我们先不强制text唯一，依赖内部ID。
-    # KuzuDB 要求主键，我们将使用一个名为 'id_prop' 的属性作为主键。
-    conn.execute("CREATE NODE TABLE ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))")
-    print("Created NODE TABLE ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))")
-
-    # 关系表：WORKS_AT (从 ExtractedEntity 到 ExtractedEntity)
-    # 关系可以有属性，我们暂时不为关系添加属性以简化
-    conn.execute("CREATE REL TABLE WorksAt (FROM ExtractedEntity TO ExtractedEntity)")
-    print("Created REL TABLE WorksAt (FROM ExtractedEntity TO ExtractedEntity)")
-
-    # 关系表：ASSIGNED_TO (从 ExtractedEntity 到 ExtractedEntity)
-    conn.execute("CREATE REL TABLE AssignedTo (FROM ExtractedEntity TO ExtractedEntity)")
-    print("Created REL TABLE AssignedTo (FROM ExtractedEntity TO ExtractedEntity)")
-
-    # 3. 插入数据 (模拟从 "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。" 提取的信息)
-    print("\n--- Inserting Data ---")
-    # 插入实体节点
-    # 为每个实体生成一个唯一的 id_prop 值
-    conn.execute("CREATE (e:ExtractedEntity {id_prop: 'task_alpha_doc', text: '项目Alpha的文档编写任务', label: 'TASK'})")
-    conn.execute("CREATE (e:ExtractedEntity {id_prop: 'person_zhangsan', text: '张三', label: 'PERSON'})")
-    conn.execute("CREATE (e:ExtractedEntity {id_prop: 'org_google', text: '谷歌', label: 'ORGANIZATION'})")
-    print("Inserted 3 ExtractedEntity nodes.")
-
-    # 插入关系
-    # ASSIGNED_TO: (项目Alpha的文档编写任务)-[ASSIGNED_TO]->(张三)
-    conn.execute("""
-        MATCH (task:ExtractedEntity {id_prop: 'task_alpha_doc'}), (person:ExtractedEntity {id_prop: 'person_zhangsan'})
-        CREATE (task)-[:WorksAt]->(person) 
-    """) 
-    # 更正：应该是 (task)-[:AssignedTo]->(person)
-    # conn.execute("""
-    #     MATCH (task:ExtractedEntity {id_prop: 'task_alpha_doc'}), (person:ExtractedEntity {id_prop: 'person_zhangsan'})
-    #     CREATE (task)-[:AssignedTo]->(person)
-    # """)
-    # print("Created AssignedTo relationship.")
-    #
-    # # WORKS_AT: (张三)-[WORKS_AT]->(谷歌)
-    # conn.execute("""
-    #     MATCH (person:ExtractedEntity {id_prop: 'person_zhangsan'}), (org:ExtractedEntity {id_prop: 'org_google'})
-    #     CREATE (person)-[:WorksAt]->(org)
-    # """)
-    # print("Created WorksAt relationship.")
-    
-    # KuzuDB 的 CREATE RELATIONSHIP 语法可能与 Neo4j 有细微差别，特别是对于匿名关系。
-    # 根据 KuzuDB 文档，更标准的可能是通过单独的 CREATE 语句或在 MATCH 后直接 CREATE。
-    # 让我们尝试更明确的 KuzuDB 风格的边创建 (如果上面的方式有问题)
-    # KuzuDB 的关系创建通常是 MATCH (a), (b) CREATE (a)-[r:REL_TABLE]->(b)
-    # 确保关系表名 (WorksAt, AssignedTo) 与 CREATE REL TABLE 中定义的一致。
-
-    conn.execute("""
-        MATCH (a:ExtractedEntity), (b:ExtractedEntity)
-        WHERE a.id_prop = 'task_alpha_doc' AND b.id_prop = 'person_zhangsan'
-        CREATE (a)-[:AssignedTo]->(b)
-    """)
-    print("Created AssignedTo relationship.")
-
-    conn.execute("""
-        MATCH (a:ExtractedEntity), (b:ExtractedEntity)
-        WHERE a.id_prop = 'person_zhangsan' AND b.id_prop = 'org_google'
-        CREATE (a)-[:WorksAt]->(b)
-    """)
-    print("Created WorksAt relationship.")
-
-
-    # 4. 执行查询
-    print("\n--- Querying Data ---")
-    # 查询张三在哪里工作
-    query_zhangsan_works_at = """
-        MATCH (p:ExtractedEntity)-[r:WorksAt]->(o:ExtractedEntity)
-        WHERE p.text = '张三' AND p.label = 'PERSON' AND o.label = 'ORGANIZATION'
-        RETURN o.text AS organization_name
-    """
-    results = conn.execute(query_zhangsan_works_at)
-    print(f"Query: {query_zhangsan_works_at.strip()}")
-    while results.has_next():
-        print(f"  Result: {results.get_next()}")
-    results.close() # 关闭结果集
-
-    # 查询项目Alpha的文档编写任务分配给了谁
-    query_task_assigned_to = """
-        MATCH (t:ExtractedEntity)-[r:AssignedTo]->(p:ExtractedEntity)
-        WHERE t.text = '项目Alpha的文档编写任务' AND t.label = 'TASK' AND p.label = 'PERSON'
-        RETURN p.text AS person_name
-    """
-    results = conn.execute(query_task_assigned_to)
-    print(f"\nQuery: {query_task_assigned_to.strip()}")
-    while results.has_next():
-        print(f"  Result: {results.get_next()}")
-    results.close()
-    
-    # 查询所有实体
-    print("\n--- All Entities ---")
-    results = conn.execute("MATCH (n:ExtractedEntity) RETURN n.id_prop, n.text, n.label ORDER BY n.id_prop")
-    while results.has_next():
-        print(f"  Entity: {results.get_next()}")
-    results.close()
-
-except Exception as e:
-    print(f"An error occurred with KuzuDB: {e}")
-    import traceback
-    traceback.print_exc()
-finally:
-    print("\nKuzuDB test script finished.")
-    # KuzuDB 连接和数据库对象在退出时会自动关闭和释放资源，
-    # 但显式关闭（如果SDK提供）或确保没有活动的事务也是好习惯。
-    # 目前的Python SDK似乎没有显式的 conn.close() 或 db.close()
-    --- END OF FILE CONTENT ---
-
-  File: test_llama_cpp.py
-    --- START OF FILE CONTENT ---
-from llama_cpp import Llama
-import os
-
-MODEL_DIR = "/home/zhz/models/Qwen3-1.7B-GGUF" # 您存放模型的目录
-# 列出该目录下所有的 .gguf 文件，让用户选择或自动选择一个
-gguf_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf")]
-
-if not gguf_files:
-    print(f"No GGUF models found in {MODEL_DIR}")
-    exit()
-
-print("Available GGUF models:")
-for i, fname in enumerate(gguf_files):
-    print(f"{i+1}. {fname}")
-
-# 为了测试，我们直接使用您下载的 Qwen 模型文件名
-# 您可以根据实际文件名修改，或者实现一个选择逻辑
-# 假设您的模型文件名中包含 "Qwen1.7B-GGUF" 或类似标识
-qwen_model_filename = None
-for fname in gguf_files:
-    if "Qwen" in fname and "1.7B" in fname and fname.endswith(".gguf"): # 简单匹配
-        qwen_model_filename = fname
-        break
-
-if not qwen_model_filename:
-    print("Could not automatically find a Qwen 1.7B GGUF model. Please specify one.")
-    # 或者让用户输入选择：
-    # choice = int(input(f"Select a model by number (1-{len(gguf_files)}): ")) - 1
-    # qwen_model_filename = gguf_files[choice]
-    exit()
-
-MODEL_PATH = os.path.join(MODEL_DIR, qwen_model_filename)
-print(f"\nUsing model: {MODEL_PATH}")
-
-# --- LLM 初始化参数 ---
-# n_gpu_layers: 设置为 > 0 可以将部分层卸载到 GPU (如果兼容且已安装 GPU 支持的 llama.cpp 版本)
-# 设置为 0 则完全使用 CPU。对于 RTX 3060 (12GB)，可以尝试设置一个较大的值，例如 20-30，具体取决于模型大小和VRAM。
-# 对于1.7B模型，如果VRAM足够，可以尝试更高的值，甚至 -1 (全部卸载)。
-# 我们先从 CPU 开始测试，n_gpu_layers=0
-N_GPU_LAYERS = 0
-N_CTX = 2048 #模型的上下文窗口大小，Qwen1.7B 可能支持更长的，具体查阅模型卡片
-N_BATCH = 512 # 提示处理的批处理大小
-
-try:
-    print(f"Initializing Llama model from: {MODEL_PATH}...")
-    print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
-    
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_gpu_layers=N_GPU_LAYERS,
-        n_ctx=N_CTX,
-        n_batch=N_BATCH,
-        verbose=True # 打印更多加载信息
-    )
-    print("Llama model initialized successfully.")
-
-    # --- 测试 1: 简单文本生成 ---
-    prompt_simple = "中国的首都是哪里？请用中文回答。"
-    print(f"\n--- Test 1: Simple Text Generation ---")
-    print(f"Prompt: {prompt_simple}")
-    output_simple = llm(
-        prompt_simple,
-        max_tokens=50, # 生成的最大 token 数
-        stop=["\n", " Human:", " Assistant:"], # 停止词
-        echo=False # 不回显 prompt
-    )
-    print(f"LLM Output: {output_simple['choices'][0]['text'].strip()}")
-
-    # --- 测试 2: Text-to-Cypher (初步) ---
-    # 使用简化的 Schema 和问题进行测试
-    # 您可以将 NEW_KG_SCHEMA_DESCRIPTION 从 constants.py 复制过来或导入
-    # 这里为了独立性，我们先用一个极简的描述
-    kg_schema_simple = """
-    节点标签: ExtractedEntity (属性: text, label)
-    关系类型: WORKS_AT (从 PERSON 到 ORGANIZATION), ASSIGNED_TO (从 TASK 到 PERSON)
-    实体标签值: PERSON, ORGANIZATION, TASK
-    """
-    user_question_cypher = "张三在哪里工作？"
-    prompt_cypher = f"""
-    你是一个将自然语言问题转换为Cypher查询的助手。
-    严格根据以下Schema生成Cypher查询：
-    {kg_schema_simple}
-    用户问题: {user_question_cypher}
-    Cypher查询: MATCH (p:ExtractedEntity {{text: '张三', label: 'PERSON'}})-[:WORKS_AT]->(o:ExtractedEntity {{label: 'ORGANIZATION'}}) RETURN o.text
-    用户问题: 项目Alpha分配给了谁？
-    Cypher查询: MATCH (t:ExtractedEntity {{text: '项目Alpha', label: 'TASK'}})-[:ASSIGNED_TO]->(p:ExtractedEntity {{label: 'PERSON'}}) RETURN p.text
-    用户问题: {user_question_cypher}
-    Cypher查询:""" # Few-shot prompting
-
-    print(f"\n--- Test 2: Text-to-Cypher (Simple) ---")
-    print(f"User question for Cypher: {user_question_cypher}")
-    # print(f"Cypher Prompt (simplified): {prompt_cypher}") # Prompt 可能很长
-    
-    output_cypher = llm(
-        prompt_cypher,
-        max_tokens=150,
-        stop=["\n", "用户问题:"],
-        temperature=0.1, # 对于代码生成，低temperature通常更好
-        echo=False
-    )
-    generated_cypher = output_cypher['choices'][0]['text'].strip()
-    print(f"Generated Cypher: {generated_cypher}")
-
-    # --- 测试 3: 上下文问答 (初步) ---
-    context_qa = "根据KuzuDB的文档，它是一个嵌入式的图数据库，支持Cypher查询语言。"
-    user_question_qa = "KuzuDB支持什么查询语言？"
-    prompt_qa = f"""
-    根据以下上下文回答问题。
-    上下文: {context_qa}
-    问题: {user_question_qa}
-    答案:"""
-
-    print(f"\n--- Test 3: Contextual QA (Simple) ---")
-    print(f"Context: {context_qa}")
-    print(f"User question for QA: {user_question_qa}")
-    output_qa = llm(
-        prompt_qa,
-        max_tokens=100,
-        stop=["\n", "问题:"],
-        temperature=0.2,
-        echo=False
-    )
-    generated_answer_qa = output_qa['choices'][0]['text'].strip()
-    print(f"Generated Answer: {generated_answer_qa}")
-
-except Exception as e:
-    print(f"An error occurred with Llama.cpp: {e}")
-    import traceback
-    traceback.print_exc()
-finally:
-    print("\nLlama.cpp test script finished.")
-    if 'llm' in locals() and hasattr(llm, 'close'): # llama_cpp Llama对象没有close方法
-         pass # llm对象在Python中通常通过垃圾回收来释放资源
-    --- END OF FILE CONTENT ---
-
   File: workspace.yaml
     --- START OF FILE CONTENT ---
 load_from:
@@ -739,31 +1684,73 @@ class PydanticListJsonIOManager(UPathIOManager):
 import dagster as dg
 import os
 
+# 导入 in_process_executor
+from dagster import define_asset_job, in_process_executor
+
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.ingestion_assets import all_ingestion_assets
-from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import all_processing_assets
+from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import (
+    all_processing_assets,
+    # 单独导入 Kuzu 相关的资产，以便放入特定作业
+    kuzu_schema_initialized_asset,
+    kuzu_entity_nodes_asset,
+    kuzu_entity_relations_asset,
+    # 也需要 kg_extractions 作为上游
+    kg_extraction_asset,
+    # 以及 kg_extractions 的上游
+    clean_chunk_text_asset# 假设 kg_extraction_asset 的上游是 text_chunks
+)
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.evaluation_assets import all_evaluation_assets
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     SentenceTransformerResource, SentenceTransformerResourceConfig,
     ChromaDBResource, ChromaDBResourceConfig,
     SGLangAPIResource, SGLangAPIResourceConfig,
-    KuzuDBReadWriteResource, KuzuDBReadWriteResourceConfig, # 使用具体的配置类
-    KuzuDBReadOnlyResource, KuzuDBReadOnlyResourceConfig,   # 使用具体的配置类
+    KuzuDBReadWriteResource, 
+    KuzuDBReadOnlyResource,
     GeminiAPIResource, GeminiAPIResourceConfig
-    # KuzuDBBaseConfig 移除了，因为我们直接用更具体的 KuzuDBReadWriteResourceConfig 和 KuzuDBReadOnlyResourceConfig
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.custom_io_managers import PydanticListJsonIOManager
 
-all_project_assets = all_ingestion_assets + all_processing_assets + all_evaluation_assets
+# 将所有非 Kuzu 写操作的资产组合起来
+# 注意：我们需要从 all_processing_assets 中移除 Kuzu 相关的写资产
+# 或者更简单的方式是，明确列出哪些资产属于哪个作业或全局资产组
+non_kuzu_write_processing_assets = [
+    asset for asset in all_processing_assets 
+    if asset.key not in [
+        kuzu_schema_initialized_asset.key, 
+        kuzu_entity_nodes_asset.key, 
+        kuzu_entity_relations_asset.key
+    ]
+]
+# kg_extraction_asset 虽然是 kg_building 组，但它不直接写 KuzuDB，而是产生供下游写入的数据
+# text_chunks_asset 是 kg_extraction_asset 的上游，也需要包含
 
-# 实例化具体的配置对象以获取默认值或进行配置
-kuzu_rw_config = KuzuDBReadWriteResourceConfig()
-kuzu_ro_config = KuzuDBReadOnlyResourceConfig()
+# 所有资产（用于默认加载，或者如果某些资产不属于特定作业）
+# all_project_assets = all_ingestion_assets + non_kuzu_write_processing_assets + all_evaluation_assets
+# 实际上，定义了作业后，我们主要通过作业来执行。
+# 我们可以将所有资产都列在 Definitions 的 assets 中，然后作业通过 selection 选择。
 
-# IO Manager (路径由其内部默认或配置决定)
-pydantic_io_manager_instance = PydanticListJsonIOManager() # 使用IOManager内部定义的默认路径
+all_defined_assets = all_ingestion_assets + all_processing_assets + all_evaluation_assets
+
+
+# 定义 KuzuDB 写入作业
+kuzu_kg_write_job = define_asset_job(
+    name="kuzu_kg_write_job",
+    selection=[ # 选择所有参与 KuzuDB 知识图谱构建的资产
+        clean_chunk_text_asset, # kg_extraction_asset 的上游
+        kg_extraction_asset,
+        kuzu_schema_initialized_asset,
+        kuzu_entity_nodes_asset,
+        kuzu_entity_relations_asset
+    ],
+    executor_def=in_process_executor # <--- 使用单进程执行器
+)
+
+# IO Manager
+pydantic_io_manager_instance = PydanticListJsonIOManager()
 
 defs = dg.Definitions(
-    assets=all_project_assets,
+    assets=all_defined_assets, # 列出所有资产
+    jobs=[kuzu_kg_write_job],  # <--- 添加作业
     resources={
         "embedder": SentenceTransformerResource(
             model_name_or_path=SentenceTransformerResourceConfig().model_name_or_path
@@ -778,11 +1765,11 @@ defs = dg.Definitions(
             default_max_new_tokens=SGLangAPIResourceConfig().default_max_new_tokens
         ),
         "kuzu_readwrite_db": KuzuDBReadWriteResource(
-            db_path_str=kuzu_rw_config.db_path_str,
-            clear_on_startup_for_testing=kuzu_rw_config.clear_on_startup_for_testing
+            # 使用资源类中定义的默认值
+            # clear_on_startup_for_testing=True # 测试时可以设为True，确保从干净状态开始
         ),
         "kuzu_readonly_db": KuzuDBReadOnlyResource(
-            db_path_str=kuzu_ro_config.db_path_str
+            # 使用资源类中定义的默认值
         ),
         "gemini_api": GeminiAPIResource(
             model_name=GeminiAPIResourceConfig().model_name,
@@ -790,7 +1777,8 @@ defs = dg.Definitions(
             default_temperature=GeminiAPIResourceConfig().default_temperature,
             default_max_tokens=GeminiAPIResourceConfig().default_max_tokens
         ),
-        "pydantic_json_io_manager": pydantic_io_manager_instance
+        "pydantic_json_io_manager": pydantic_io_manager_instance,
+        # 如果 KuzuDB 资源被其他非此作业的资产使用，确保它们使用 KuzuDBReadOnlyResource
     }
 )
     --- END OF FILE CONTENT ---
@@ -1170,13 +2158,14 @@ all_ingestion_assets = [load_documents_asset, parse_document_asset]
 
   File: processing_assets.py
     --- START OF FILE CONTENT ---
-# zhz_rag_pipeline/processing_assets.py
+# /home/zhz/zhz_agent/zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
 import dagster as dg
 from typing import List, Dict, Any, Optional
 import uuid
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import hashlib
-import pandas as pd # 确保导入 pandas 用于显示结果
+import pandas as pd 
+from zhz_rag.utils.common_utils import normalize_text_for_id
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
     ChunkOutput,
     ParsedDocumentOutput,
@@ -1189,8 +2178,8 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     SentenceTransformerResource,
     ChromaDBResource,
     SGLangAPIResource,
-    KuzuDBReadWriteResource, # 假设您在这里也用绝对导入，或者根据实际情况调整
-    KuzuDBReadOnlyResource # 确保只读资源也被导入，如果需要的话
+    KuzuDBReadWriteResource,
+    KuzuDBReadOnlyResource
 )
 import jieba
 import bm25s
@@ -1614,7 +2603,14 @@ async def kg_extraction_asset(
             if isinstance(entities_data, list):
                 for entity_dict in entities_data:
                     if isinstance(entity_dict, dict) and "text" in entity_dict and "label" in entity_dict:
-                        extracted_entities_list.append(ExtractedEntity(**entity_dict))
+                        # --- 规范化实体文本和标签 ---
+                        normalized_entity_text = normalize_text_for_id(entity_dict["text"])
+                        # 标签通常已经是大写或特定枚举值，但如果LLM可能返回不同大小写，也应规范化
+                        normalized_entity_label = entity_dict["label"].upper() # 保持标签大写
+                        extracted_entities_list.append(ExtractedEntity(
+                            text=normalized_entity_text, # <--- 使用规范化后的文本
+                            label=normalized_entity_label  # <--- 使用规范化/统一后的标签
+                        ))
                     else:
                         context.log.warning(f"Skipping malformed entity data in chunk {chunk.chunk_id}: {entity_dict}")
             else:
@@ -1629,7 +2625,20 @@ async def kg_extraction_asset(
                     if (isinstance(rel_dict, dict) and
                         all(key in rel_dict for key in ["head_entity_text", "head_entity_label", 
                                                         "relation_type", "tail_entity_text", "tail_entity_label"])):
-                        extracted_relations_list.append(ExtractedRelation(**rel_dict))
+                        # --- 规范化关系中的实体文本和标签 ---
+                        normalized_head_text = normalize_text_for_id(rel_dict["head_entity_text"])
+                        normalized_head_label = rel_dict["head_entity_label"].upper()
+                        normalized_tail_text = normalize_text_for_id(rel_dict["tail_entity_text"])
+                        normalized_tail_label = rel_dict["tail_entity_label"].upper()
+                        # 关系类型通常也应该是规范的
+                        normalized_relation_type = rel_dict["relation_type"].upper()
+                        extracted_relations_list.append(ExtractedRelation(
+                            head_entity_text=normalized_head_text,
+                            head_entity_label=normalized_head_label,
+                            relation_type=normalized_relation_type,
+                            tail_entity_text=normalized_tail_text,
+                            tail_entity_label=normalized_tail_label
+                        ))
                     else:
                         context.log.warning(f"Skipping malformed relation data in chunk {chunk.chunk_id}: {rel_dict}")
             else:
@@ -1671,64 +2680,75 @@ KUZU_WRITE_CONCURRENCY_KEY = "kuzu_write_access"
     name="kuzu_schema_initialized",
     description="Ensures KuzuDB is initialized and schema (tables) are ready, and performs DDL/Checkpoint.",
     group_name="kg_building",
-    deps=[], # This asset should run first or have no upstream Kuzu-writing deps.
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "300", "dagster/concurrency_key": KUZU_WRITE_CONCURRENCY_KEY} 
+    # deps=[], # 依赖通过参数自动推断，或者如果资源不作为参数传入，则不需要显式 deps
+    tags={dg.MAX_RUNTIME_SECONDS_TAG: "300"} # KUZU_WRITE_CONCURRENCY_KEY 在 in_process 作业中意义不大
 )
 def kuzu_schema_initialized_asset(
     context: dg.AssetExecutionContext,
-    kuzu_readwrite_db: KuzuDBReadWriteResource 
+    kuzu_readwrite_db: KuzuDBReadWriteResource # 注入资源
 ) -> dg.Output[str]:
-    db_path_used = kuzu_readwrite_db._resolved_db_path # Access the resolved path
-    context.log.info(f"KuzuDBReadWriteResource available for DB at: {db_path_used}.")
-    context.log.info("Calling ensure_schema_and_checkpoint on KuzuDBReadWriteResource.")
-    try:
-        kuzu_readwrite_db.ensure_schema_and_checkpoint() # This method now handles the session
-        context.log.info(f"KuzuDB schema DDL and CHECKPOINT executed successfully via resource method.")
+    db_path_used = kuzu_readwrite_db._resolved_db_path # 可以从资源获取路径信息
+    context.log.info(f"Using KuzuDB at: {db_path_used}.")
+    
+    conn = kuzu_readwrite_db.get_connection() # <--- 从资源获取连接
 
-        # Verification step
+    try:
+        context.log.info("Executing DDL statements for schema creation...")
+        schema_ddl_queries = [
+            "CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))",
+            "CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)",
+            "CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)"
+        ]
+        for ddl_query in schema_ddl_queries:
+            context.log.debug(f"Executing DDL: {ddl_query}")
+            conn.execute(ddl_query)
+        context.log.info("DDL statements execution completed.")
+        
+        context.log.info("Executing manual CHECKPOINT.")
+        conn.execute("CHECKPOINT;")
+        context.log.info("Manual CHECKPOINT completed.")
+
         context.log.info("Verifying table existence after schema initialization...")
-        # Use the readonly connection context manager for verification to avoid RW session if not needed
-        # However, if this is part of the *initialization* and might be the *only* step running,
-        # using a write session to verify is also okay, as the concurrency tag protects it.
-        # The provided snippet used _get_write_db_session, so we'll stick to that for consistency with the source.
-        with kuzu_readwrite_db._get_write_db_session(perform_clear=False) as conn_verify:
-            query_result = conn_verify.execute("CALL kuzu_tables() RETURN name;")
-            tables_df = pd.DataFrame(query_result.get_as_df() if query_result else []) # Ensure DataFrame creation is safe
-            context.log.info(f"Tables found after schema initialization and checkpoint:\n{tables_df}")
-            
-            table_names_found = tables_df['name'].tolist() if not tables_df.empty else []
-            
-            required_tables = ["ExtractedEntity", "WorksAt", "AssignedTo"]
-            all_found = True
-            for tbl in required_tables:
-                if tbl not in table_names_found:
-                    context.log.error(f"Verification FAILED: Table '{tbl}' NOT found after schema initialization.")
-                    all_found = False
-            if all_found:
-                context.log.info("Verification SUCCESS: All required tables found.")
-            else:
-                raise dg.Failure("Schema verification failed post initialization.")
+        node_table_names = conn._get_node_table_names()
+        rel_tables_info = conn._get_rel_table_names()
+        rel_table_names = [info['name'] for info in rel_tables_info]
+        all_defined_tables = node_table_names + rel_table_names
+        context.log.info(f"All defined tables in KuzuDB: {all_defined_tables}")
+        
+        required_tables = ["ExtractedEntity", "WorksAt", "AssignedTo"]
+        all_found = True
+        missing_tables = []
+        for tbl in required_tables:
+            if tbl not in all_defined_tables:
+                all_found = False
+                missing_tables.append(tbl)
+        
+        if all_found:
+            context.log.info("Verification SUCCESS: All required tables found in KuzuDB.")
+        else:
+            raise dg.Failure(f"Schema verification failed. Missing tables: {', '.join(missing_tables)}")
 
     except Exception as e:
         context.log.error(f"Failed during KuzuDB schema DDL/CHECKPOINT/Verification: {e}", exc_info=True)
         raise dg.Failure(f"KuzuDB schema initialization/verification failed: {e}")
         
-    return dg.Output("KuzuDB schema ensured and checkpointed.", metadata={"db_path": db_path_used})
-
+    return dg.Output("KuzuDB schema ensured, checkpointed, and verified.", metadata={"db_path": db_path_used, "defined_tables": all_defined_tables})
 
 @dg.asset(
     name="kuzu_entity_nodes",
     description="Stores extracted entities as nodes in KuzuDB knowledge graph.",
     group_name="kg_building",
-    deps=[kuzu_schema_initialized_asset], # Depends on schema being ready
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600", "dagster/concurrency_key": KUZU_WRITE_CONCURRENCY_KEY}
+    # deps=[kuzu_schema_initialized_asset], # 通过参数推断
+    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600"}
 )
 def kuzu_entity_nodes_asset(
     context: dg.AssetExecutionContext,
     kg_extractions: List[KGTripleSetOutput],
-    kuzu_readwrite_db: KuzuDBReadWriteResource
+    kuzu_schema_initialized: str, # 依赖上游资产的输出
+    kuzu_readwrite_db: KuzuDBReadWriteResource # 注入资源
 ) -> None:
     context.log.info(f"Received {len(kg_extractions)} KG extraction sets to store entities in KuzuDB.")
+    context.log.info(f"Upstream kuzu_schema_initialized_asset reported: {kuzu_schema_initialized}")
 
     if not kg_extractions:
         context.log.warning("No KG extractions received, nothing to store in KuzuDB.")
@@ -1740,16 +2760,21 @@ def kuzu_entity_nodes_asset(
 
     for kg_output_set in kg_extractions:
         for entity in kg_output_set.extracted_entities:
-            total_nodes_processed += 1
-            entity_id_prop = hashlib.md5((entity.text + entity.label.upper()).encode('utf-8')).hexdigest()
+            # 假设 entity.text 和 entity.label 已经是规范化过的
+            text_for_id = entity.text 
+            label_for_id = entity.label # 假设已经是大写
+            id_prop_input_string = text_for_id + label_for_id # <--- 用于生成哈希的字符串
+            entity_id_prop = hashlib.md5(id_prop_input_string.encode('utf-8')).hexdigest()  
+            context.log.info(f"NODE CREATION: text='{entity.text}', label='{entity.label}', "
+                             f"id_prop_input='{id_prop_input_string}', generated_id_prop='{entity_id_prop}'")
             query = """
                 MERGE (e:ExtractedEntity {id_prop: $id_prop})
-                ON CREATE SET e.text = $text, e.label = $label_upper
+                ON CREATE SET e.text = $text, e.label = $label 
             """
             params = {
                 "id_prop": entity_id_prop,
-                "text": entity.text,
-                "label_upper": entity.label.upper()
+                "text": entity.text, 
+                "label": entity.label
             }
             dml_statements.append((query, params))
 
@@ -1757,15 +2782,20 @@ def kuzu_entity_nodes_asset(
         context.log.info("No valid entities found to store in KuzuDB after processing extractions.")
         context.add_output_metadata(metadata={"nodes_created_or_merged": 0, "status": "No entities to store"})
         return
-
+    
+    conn = kuzu_readwrite_db.get_connection() # <--- 从资源获取连接
     try:
         context.log.info(f"Executing {len(dml_statements)} MERGE operations for entities in KuzuDB...")
-        kuzu_readwrite_db.execute_batch_dml_in_session(dml_statements) # Call the new session-based method
-        context.log.info("Successfully stored/merged entities in KuzuDB.")
+        executed_count = 0
+        for query, params in dml_statements:
+            context.log.debug(f"Executing DML: {query} with params: {params}")
+            conn.execute(query, parameters=params)
+            executed_count +=1
+        context.log.info(f"Executed {executed_count} DML statements successfully for entities.")
         
         context.add_output_metadata(
             metadata={
-                "nodes_created_or_merged": total_nodes_processed, # Using total_nodes_processed based on intent
+                "nodes_created_or_merged": executed_count, # 使用实际执行数量
                 "status": "Success"
             }
         )
@@ -1777,80 +2807,173 @@ def kuzu_entity_nodes_asset(
     name="kuzu_entity_relations",
     description="Creates relationships in KuzuDB based on extracted KG data.",
     group_name="kg_building",
-    ins={
-        "kg_extractions": dg.AssetIn(),
-        "kuzu_schema_initialized_asset": dg.AssetIn(asset_key=dg.AssetKey("kuzu_schema_initialized")) # Explicit dep
-    },
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600", "dagster/concurrency_key": KUZU_WRITE_CONCURRENCY_KEY}
+    deps=[kuzu_entity_nodes_asset.key], # 显式声明对 kuzu_entity_nodes_asset 的依赖
+    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600"}
 )
+
 def kuzu_entity_relations_asset(
     context: dg.AssetExecutionContext,
     kg_extractions: List[KGTripleSetOutput],
+    kuzu_schema_initialized: str, # 依赖 kuzu_schema_initialized_asset 的输出
     kuzu_readwrite_db: KuzuDBReadWriteResource
 ) -> None:
     context.log.info(f"Received {len(kg_extractions)} KG extraction sets to create relations in KuzuDB.")
+    context.log.info(f"Upstream kuzu_schema_initialized_asset reported: {kuzu_schema_initialized}")
+
+    conn = kuzu_readwrite_db.get_connection()
+
+    # --- Schema验证日志 ---
+    try:
+        context.log.info("Verifying table existence at the START of kuzu_entity_relations_asset...")
+        node_tables_at_start = conn._get_node_table_names()
+        rel_tables_info_at_start = conn._get_rel_table_names()
+        rel_tables_at_start = [info['name'] for info in rel_tables_info_at_start]
+        all_tables_at_start_actual_case = node_tables_at_start + rel_tables_at_start
+        
+        # 我们期望的表名（在DDL中定义的大小写）
+        expected_relation_tables_in_schema = ["AssignedTo", "WorksAt"] 
+
+        context.log.info(f"Node tables at start of relations asset: {node_tables_at_start}")
+        context.log.info(f"Rel tables at start of relations asset (actual case): {rel_tables_at_start}")
+        context.log.info(f"All tables at start of relations asset (actual case): {all_tables_at_start_actual_case}")
+
+        for expected_table in expected_relation_tables_in_schema:
+            # 检查时，我们将从数据库获取的表名与期望的表名进行比较
+            # KuzuDB 返回的表名是区分大小写的，与 DDL 一致
+            if expected_table not in all_tables_at_start_actual_case:
+                context.log.error(f"CRITICAL: Expected table '{expected_table}' NOT FOUND at the very start of kuzu_entity_relations_asset on the shared connection!")
+            else:
+                context.log.info(f"Expected table '{expected_table}' IS PRESENT at the start of kuzu_entity_relations_asset.")
+    except Exception as e_verify_start:
+        context.log.error(f"Error verifying tables at start of kuzu_entity_relations_asset: {e_verify_start}")
+    # --- Schema验证日志结束 ---
 
     if not kg_extractions:
         context.log.warning("No KG extractions received, nothing to store for relations.")
         context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No data"})
         return
 
-    dml_statements: List[tuple[str, Dict[str, Any]]] = []
-    relations_processed_count = 0
+    relations_to_create_params: List[Dict[str, Any]] = []
+    relation_type_for_cypher_map: List[str] = [] # 用于存储 Cypher 查询中实际使用的关系表名
 
     for kg_output_set in kg_extractions:
-        for rel in kg_output_set.extracted_relations:
-            relations_processed_count += 1
-            
-            if rel.relation_type.upper() not in ["WORKS_AT", "ASSIGNED_TO"]:
-                context.log.warning(f"Skipping unknown relation type: '{rel.relation_type}'")
-                continue
+        for rel_idx, rel in enumerate(kg_output_set.extracted_relations):
+            context.log.info(f"Processing relation {rel_idx+1} from chunk {kg_output_set.chunk_id}: "
+                             f"{rel.head_entity_text} -[{rel.relation_type}]-> {rel.tail_entity_text}")
 
-            head_entity_id_prop = hashlib.md5((rel.head_entity_text + rel.head_entity_label.upper()).encode('utf-8')).hexdigest()
-            tail_entity_id_prop = hashlib.md5((rel.tail_entity_text + rel.tail_entity_label.upper()).encode('utf-8')).hexdigest()
-            relation_table_name = rel.relation_type.upper()
+            head_text_for_id = rel.head_entity_text
+            head_label_for_id = rel.head_entity_label 
+            tail_text_for_id = rel.tail_entity_text
+            tail_label_for_id = rel.tail_entity_label
 
-            # Ensure correct table casing as defined in schema
-            if relation_table_name == "WORKSAT": relation_table_name = "WorksAt"
-            if relation_table_name == "ASSIGNEDTO": relation_table_name = "AssignedTo"
+            head_id_prop_input_string = head_text_for_id + head_label_for_id
+            head_entity_id_prop = hashlib.md5(head_id_prop_input_string.encode('utf-8')).hexdigest()
             
+            tail_id_prop_input_string = tail_text_for_id + tail_label_for_id
+            tail_entity_id_prop = hashlib.md5(tail_id_prop_input_string.encode('utf-8')).hexdigest()
+            
+            context.log.info(f"  Attempting to match Head: text='{rel.head_entity_text}', label='{rel.head_entity_label}', "
+                             f"id_prop_input='{head_id_prop_input_string}', generated_head_id_prop='{head_entity_id_prop}'")
+            context.log.info(f"  Attempting to match Tail: text='{rel.tail_entity_text}', label='{rel.tail_entity_label}', "
+                             f"id_prop_input='{tail_id_prop_input_string}', generated_tail_id_prop='{tail_entity_id_prop}'")
+
+            head_found = False
+            tail_found = False
+            try:
+                head_check_result = conn.execute("MATCH (n:ExtractedEntity {id_prop: $id}) RETURN n.text, n.label", {"id": head_entity_id_prop})
+                if head_check_result.has_next():
+                    head_data = head_check_result.get_next()
+                    context.log.info(f"    VERIFIED Head Node: id_prop='{head_entity_id_prop}', text='{head_data[0]}', label='{head_data[1]}'")
+                    head_found = True
+                else:
+                    context.log.error(f"    VERIFICATION FAILED: Head Node with id_prop='{head_entity_id_prop}' (from text='{rel.head_entity_text}') NOT FOUND.")
+                head_check_result.close()
+
+                tail_check_result = conn.execute("MATCH (n:ExtractedEntity {id_prop: $id}) RETURN n.text, n.label", {"id": tail_entity_id_prop})
+                if tail_check_result.has_next():
+                    tail_data = tail_check_result.get_next()
+                    context.log.info(f"    VERIFIED Tail Node: id_prop='{tail_entity_id_prop}', text='{tail_data[0]}', label='{tail_data[1]}'")
+                    tail_found = True
+                else:
+                    context.log.error(f"    VERIFICATION FAILED: Tail Node with id_prop='{tail_entity_id_prop}' (from text='{rel.tail_entity_text}') NOT FOUND.")
+                tail_check_result.close()
+            except Exception as e_verify:
+                context.log.error(f"    Error during node verification for relation: {e_verify}")
+
+            if head_found and tail_found:
+                # rel.relation_type 应该是从 kg_extraction_asset 传来的全大写形式，例如 "ASSIGNED_TO"
+                relation_type_from_extraction = rel.relation_type 
+                
+                # 将其映射到 DDL 中定义的实际表名（首字母大写）
+                actual_cypher_table_name = ""
+                if relation_type_from_extraction == "ASSIGNED_TO":
+                    actual_cypher_table_name = "AssignedTo"
+                elif relation_type_from_extraction == "WORKS_AT":
+                    actual_cypher_table_name = "WorksAt"
+                
+                if actual_cypher_table_name: # 如果是我们支持的关系类型
+                    relations_to_create_params.append({
+                        "head_id_prop": head_entity_id_prop,
+                        "tail_id_prop": tail_entity_id_prop,
+                    })
+                    relation_type_for_cypher_map.append(actual_cypher_table_name)
+                else:
+                    context.log.warning(f"  Skipping relation due to unmapped original type: '{relation_type_from_extraction}'")
+            else:
+                context.log.warning(f"  Skipping relation creation for '{rel.head_entity_text} -[{rel.relation_type}]-> {rel.tail_entity_text}' because one or both nodes were not found with generated id_props.")
+            
+    if not relations_to_create_params:
+        context.log.info("No valid relations to create after node verification and type mapping.")
+        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No valid relations after node/type check"})
+        return
+            
+    executed_count = 0
+    try:
+        context.log.info(f"Attempting to execute {len(relations_to_create_params)} CREATE operations for relations in KuzuDB...")
+        for i, params in enumerate(relations_to_create_params):
+            rel_table_for_cypher = relation_type_for_cypher_map[i]
             query = f"""
                 MATCH (h:ExtractedEntity {{id_prop: $head_id_prop}}), (t:ExtractedEntity {{id_prop: $tail_id_prop}})
-                CREATE (h)-[r:{relation_table_name}]->(t)
+                CREATE (h)-[r:{rel_table_for_cypher}]->(t)
             """
-            params = {
-                "head_id_prop": head_entity_id_prop,
-                "tail_id_prop": tail_entity_id_prop,
-            }
-            dml_statements.append((query, params))
-            
-    if not dml_statements:
-        context.log.info("No valid relations found to create in KuzuDB after filtering.")
-        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No valid relations to create"})
-        return
+            context.log.debug(f"Executing DML for relation type '{rel_table_for_cypher}': {query} with params: {params}")
+            conn.execute(query, parameters=params)
+            executed_count += 1
+        context.log.info(f"Successfully submitted {executed_count} DML statements for relations.")
         
-    try:
-        context.log.info(f"Executing {len(dml_statements)} CREATE operations for relations in KuzuDB...")
-        kuzu_readwrite_db.execute_batch_dml_in_session(dml_statements) # Call the new session-based method
-        context.log.info(f"Successfully created {len(dml_statements)} relations in KuzuDB.")
-        
+        context.log.info("Final verification of relation counts after DML execution...")
+        final_rel_counts = {}
+        unique_relation_types_attempted = set(relation_type_for_cypher_map)
+        for rel_type_to_check_in_cypher in unique_relation_types_attempted:
+            try:
+                count_query_result = conn.execute(f"MATCH ()-[r:{rel_type_to_check_in_cypher}]->() RETURN count(r) AS count")
+                count_df = pd.DataFrame(count_query_result.get_as_df())
+                actual_count_in_db_raw = count_df['count'].iloc[0] if not count_df.empty else 0
+                actual_count_in_db = int(actual_count_in_db_raw) # <--- 修改这里：转换为Python int
+                final_rel_counts[rel_type_to_check_in_cypher] = actual_count_in_db
+                context.log.info(f"  Relation table '{rel_type_to_check_in_cypher}' final count in DB: {actual_count_in_db}")
+            except Exception as e_count_final:
+                context.log.error(f"  Error during final count for relation table '{rel_type_to_check_in_cypher}': {e_count_final}")
         context.add_output_metadata(
             metadata={
-                "relations_created_or_merged": len(dml_statements), # Use len(dml_statements) as it's the actual executed count
-                "status": "Success"
+                "relations_attempted_creation": len(relations_to_create_params),
+                "relations_dml_submitted_and_executed_by_kuzu": executed_count, # 更准确的描述
+                "final_relation_counts_in_db": final_rel_counts,
+                "status": "Success" if executed_count == len(relations_to_create_params) and executed_count > 0 else "Partial Success or Issues" if executed_count > 0 else "No relations created"
             }
         )
     except Exception as e:
-        context.log.error(f"Failed to create relations in KuzuDB: {e}", exc_info=True)
+        context.log.error(f"Failed during DML execution for relations: {e}", exc_info=True)
         raise dg.Failure(description=f"Failed to create relations in KuzuDB: {str(e)}")
-
+    
+# 确保 all_processing_assets 列表正确
 all_processing_assets = [
     clean_chunk_text_asset,
     generate_embeddings_asset,
     vector_storage_asset,
     keyword_index_asset,
     kg_extraction_asset,
-    kuzu_schema_initialized_asset, # Added based on new strategy
+    kuzu_schema_initialized_asset,
     kuzu_entity_nodes_asset,
     kuzu_entity_relations_asset
 ]
@@ -1917,24 +3040,24 @@ class KGTripleSetOutput(BaseModel):
   File: resources.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/zhz_rag_pipeline_dagster/zhz_rag_pipeline/resources.py
-
 import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
 from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator
-import logging # logging for non-dagster loggers if needed by libraries
+import logging
 import httpx
 import asyncio
 import json
-from neo4j import GraphDatabase, Driver, Result
+# from neo4j import GraphDatabase, Driver, Result # Neo4j不再直接用于此资源
 import litellm
 import os
-import kuzu
+import kuzu # 确保导入 kuzu
 import shutil
-from pydantic import PrivateAttr, Field as PydanticField # Renamed to avoid conflict with dg.Field
+from pydantic import PrivateAttr, Field as PydanticField
 from contextlib import contextmanager
-# portalocker is removed as per the new strategy in the provided text file
+import portalocker # <--- 重新导入 portalocker
+import time # <--- 导入 time，可能用于短暂等待
 
 # --- SentenceTransformerResource ---
 class SentenceTransformerResourceConfig(dg.Config):
@@ -2151,116 +3274,72 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
         )
     )
     clear_on_startup_for_testing: bool = PydanticField(
-        default=False, 
-        description="If true, delete and re-initialize the DB for the first schema operation. USE WITH CAUTION."
+        default=False, # 生产中通常为 False，测试时可设为 True
+        description="If true, delete and re-initialize the DB when the resource is first set up. USE WITH CAUTION."
     )
-    # lock_timeout is no longer needed here as portalocker is removed.
 
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
     _resolved_db_path: str = PrivateAttr()
+    _db: Optional[kuzu.Database] = PrivateAttr(default=None) # <--- 持有 Database 实例
+    _conn: Optional[kuzu.Connection] = PrivateAttr(default=None) # <--- 持有 Connection 实例
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._resolved_db_path = os.path.abspath(self.db_path_str) if not os.path.isabs(self.db_path_str) else self.db_path_str
+        if os.path.isabs(self.db_path_str):
+            self._resolved_db_path = self.db_path_str
+        else:
+            self._resolved_db_path = os.path.abspath(self.db_path_str)
+        
         self._logger.info(
-            f"KuzuDBReadWriteResource setup: path='{self._resolved_db_path}', "
-            f"clear_on_startup_for_testing (applies to first schema op)={self.clear_on_startup_for_testing}"
+            f"KuzuDBReadWriteResource setup: resolved_path='{self._resolved_db_path}', "
+            f"clear_on_startup_for_testing={self.clear_on_startup_for_testing}"
         )
-        # No database instance is created or held by the resource itself.
+
+        if self.clear_on_startup_for_testing:
+            if os.path.exists(self._resolved_db_path):
+                self._logger.warning(f"Clearing KuzuDB directory: {self._resolved_db_path}")
+                try:
+                    shutil.rmtree(self._resolved_db_path)
+                    self._logger.info(f"Successfully removed KuzuDB directory.")
+                except OSError as e:
+                    self._logger.error(f"Failed to remove KuzuDB directory {self._resolved_db_path}: {e}", exc_info=True)
+                    raise
+        
+        try:
+            os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
+            self._db = kuzu.Database(self._resolved_db_path, read_only=False)
+            self._conn = kuzu.Connection(self._db)
+            self._logger.info(f"KuzuDB Database and Connection initialized successfully at {self._resolved_db_path}.")
+        except Exception as e:
+            self._logger.error(f"Failed to initialize KuzuDB: {e}", exc_info=True)
+            raise
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.info("KuzuDBReadWriteResource teardown complete.")
-        # No database instance to clean up here.
+        self._logger.info(f"Tearing down KuzuDBReadWriteResource for {self._resolved_db_path}...")
+        if self._conn is not None:
+            # 可以在这里选择性地执行最后的 CHECKPOINT，但通常 KuzuDB 关闭时会处理
+            # try:
+            #     self._logger.info("Executing final CHECKPOINT on KuzuDB connection before teardown.")
+            #     self._conn.execute("CHECKPOINT;")
+            #     self._logger.info("Final CHECKPOINT successful.")
+            # except Exception as e_chk:
+            #     self._logger.error(f"Error during final CHECKPOINT: {e_chk}")
+            del self._conn # Kuzu Connection 没有 close()
+            self._conn = None
+        if self._db is not None:
+            del self._db # 依赖 KuzuDB Database 的 __del__ 方法进行清理和锁释放
+            self._db = None
+        self._logger.info("KuzuDBReadWriteResource teardown complete.")
 
-    @contextmanager
-    def _get_write_db_session(self, perform_clear: bool = False) -> Iterator[kuzu.Connection]:
-        """Manages a short-lived KuzuDB read-write session."""
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        db_instance: Optional[kuzu.Database] = None
-        
-        logger_instance.info(f"Attempting to open KuzuDB(RW) at {self._resolved_db_path}. Clear: {perform_clear}")
-        if perform_clear and os.path.exists(self._resolved_db_path):
-            logger_instance.warning(f"Clearing KuzuDB directory: {self._resolved_db_path}")
-            try:
-                shutil.rmtree(self._resolved_db_path)
-                logger_instance.info(f"Successfully removed KuzuDB directory.")
-            except OSError as e:
-                logger_instance.error(f"Failed to remove KuzuDB directory {self._resolved_db_path}: {e}", exc_info=True)
-                raise
-
-        try:
-            db_instance = kuzu.Database(self._resolved_db_path, read_only=False)
-            logger_instance.info(f"KuzuDB(RW) session opened at {self._resolved_db_path}")
-            # It's crucial that the Database object exists as long as the connection is used.
-            # Kuzu docs indicate Connection(Database_object) is the way.
-            conn = kuzu.Connection(db_instance)
-            yield conn
-        except Exception as e:
-            logger_instance.error(f"Error during KuzuDB(RW) session: {e}", exc_info=True)
-            raise
-        finally:
-            # The Kuzu Database object (db_instance) needs to be explicitly closed or deleted
-            # to ensure its resources, including locks, are released.
-            # Relying on Python's garbage collection (`del`) is an option,
-            # or using the database as a context manager if the API supports it directly
-            # (Kuzu's Python API for Database object itself might not be a context manager,
-            # but connections can be).
-            # Explicitly deleting ensures timely release.
-            if db_instance:
-                # Before deleting the db_instance, ensure any connections derived from it are closed.
-                # In this design, 'conn' goes out of scope when the 'yield' returns,
-                # and its destructor should handle its cleanup.
-                # Then, we can delete the database instance.
-                del db_instance # Relies on Kuzu's __del__ to close the database and release locks.
-                logger_instance.info(f"KuzuDB(RW) Database object for session at {self._resolved_db_path} dereferenced (closed).")
-
-    def ensure_schema_and_checkpoint(self):
-        """Creates schema if not exists and performs a checkpoint. Should be called once by the schema asset."""
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        
-        # Determine if clearing should happen for this specific call (typically only the first one).
-        perform_clear_for_this_call = self.clear_on_startup_for_testing
-        
-        with self._get_write_db_session(perform_clear=perform_clear_for_this_call) as conn:
-            schema_ddl_queries = [
-                "CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))",
-                "CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)",
-                "CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)"
-            ]
-            logger_instance.info("Executing DDL statements for schema creation...")
-            for ddl_query in schema_ddl_queries:
-                logger_instance.debug(f"Executing DDL: {ddl_query}")
-                conn.execute(ddl_query)
-            logger_instance.info("DDL statements execution completed.")
+    def get_connection(self) -> kuzu.Connection:
+        """Returns the managed KuzuDB connection."""
+        if self._conn is None:
+            # 这种错误不应该在 in_process_executor 下发生，因为 setup_for_execution 会先运行
+            self._logger.error("KuzuDB connection not available. Resource might not have been set up correctly.")
+            raise Exception("KuzuDB connection not available. Resource might not have been set up correctly.")
+        return self._conn
             
-            logger_instance.info("Executing manual CHECKPOINT.")
-            conn.execute("CHECKPOINT;")
-            logger_instance.info("Manual CHECKPOINT completed.")
-            # Note: `clear_on_startup_for_testing` effect is for this call. If this resource is reused
-            # by the same asset (e.g. retry), it might clear again. A more robust clear-once mechanism
-            # might involve external state or a different asset design if that's a concern.
-            # For now, this matches the provided strategy.
-
-    def execute_batch_dml_in_session(self, dml_statements: List[tuple[str, Dict[str, Any]]]) -> None:
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        with self._get_write_db_session(perform_clear=False) as conn: # DML operations should never clear the DB.
-            logger_instance.info(f"Executing batch DML statements ({len(dml_statements)} statements).")
-            executed_count = 0
-            query_debug: str = "N/A" # For logging in case of error
-            params_debug: Dict[str, Any] = {} # For logging in case of error
-            try:
-                for query, params in dml_statements:
-                    query_debug = query
-                    params_debug = params
-                    logger_instance.debug(f"Executing DML: {query} with params: {params}")
-                    conn.execute(query, parameters=params)
-                    executed_count +=1
-                logger_instance.info(f"Executed {executed_count} DML statements successfully.")
-            except Exception as e:
-                logger_instance.error(f"Error during batch DML. Last Query: {query_debug}. Params: {params_debug}. Error: {e}", exc_info=True)
-                raise
-
+# KuzuDBReadOnlyResource 定义保持不变
 class KuzuDBReadOnlyResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
         default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
@@ -2274,15 +3353,14 @@ class KuzuDBReadOnlyResource(dg.ConfigurableResource):
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._resolved_db_path = os.path.abspath(self.db_path_str) if not os.path.isabs(self.db_path_str) else self.db_path_str
-        self._logger.info(f"KuzuDBReadOnlyResource setup: path='{self._resolved_db_path}'")
+        if os.path.isabs(self.db_path_str):
+            self._resolved_db_path = self.db_path_str
+        else:
+            self._resolved_db_path = os.path.abspath(self.db_path_str)
+
+        self._logger.info(f"KuzuDBReadOnlyResource setup: resolved_path='{self._resolved_db_path}'")
         if not os.path.exists(self._resolved_db_path):
-            # This check should ideally happen before trying to open,
-            # but _get_readonly_db_session will also fail.
-            self._logger.error(f"KuzuDB path {self._resolved_db_path} does not exist. Read-only resource cannot create it.")
-            # Depending on strictness, could raise FileNotFoundError here or let _get_readonly_db_session handle it.
-            # For now, log and let the session attempt handle the error to keep setup clean.
-            # raise FileNotFoundError(f"KuzuDB directory {self._resolved_db_path} not found for read-only access.")
+            self._logger.error(f"KuzuDB path {self._resolved_db_path} does not exist for ReadOnly access. Operations will likely fail.")
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
@@ -2310,7 +3388,6 @@ class KuzuDBReadOnlyResource(dg.ConfigurableResource):
             if db_instance:
                 del db_instance
                 logger_instance.info(f"KuzuDB(RO) Database object for session at {self._resolved_db_path} dereferenced (closed).")
-
     --- END OF FILE CONTENT ---
 
   File: 获取当前目录下的所有py格式文件.py
@@ -3288,6 +4365,8 @@ import uuid
 import logging
 import asyncio #确保 asyncio 被导入
 from typing import List, Dict, Any, Optional
+import re
+import unicodedata
 
 load_dotenv()
 
@@ -3518,6 +4597,19 @@ def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, An
 
     utils_logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
     return data_list
+
+def normalize_text_for_id(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text) 
+    
+    try:
+        normalized_text = unicodedata.normalize('NFKD', text)
+        normalized_text = normalized_text.lower()
+        normalized_text = normalized_text.strip()
+        normalized_text = re.sub(r'\s+', ' ', normalized_text)
+        return normalized_text
+    except Exception as e:
+        return text
     --- END OF FILE CONTENT ---
 
   File: db_utils.py
@@ -6870,6 +7962,16 @@ Directory: zhz_rag/stored_data/chromadb_index/fc39f817-3d12-4574-a52b-5bdfe2d8f2
   File (skipped, extension not included): length.bin
   File (skipped, extension not included): link_lists.bin
 
+Directory: zhz_rag/stored_data/kuzu_test_visibility_db/
+  File (skipped, extension not included): .lock
+  File (skipped, extension not included): .shadow
+  File (skipped, extension not included): .wal
+  File (skipped, extension not included): catalog.kz
+  File (skipped, extension not included): data.kz
+  File (skipped, extension not included): metadata.kz
+  File (skipped, extension not included): n-0.hindex
+  File (skipped, extension not included): n-0.hindex.ovf
+
 Directory: zhz_rag/stored_data/bm25_index/
   File (skipped, extension not included): data.csc.index.npy
   File (skipped, extension not included): doc_ids.pkl
@@ -9510,6 +10612,348 @@ Directory: data/raw_documents/
     --- START OF FILE CONTENT ---
 第二个文档讨论了自然语言处理技术。
 
+    --- END OF FILE CONTENT ---
+
+
+Directory: scripts/
+
+Directory: scripts/manual_tests/
+  File: test_kuzu.py
+    --- START OF FILE CONTENT ---
+# test_kuzu.py
+import kuzu
+import os
+import pandas as pd
+import re # <--- 添加导入
+import unicodedata # <--- 添加导入
+
+def normalize_text_for_id(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
+    try:
+        normalized_text = unicodedata.normalize('NFKD', text)
+        normalized_text = normalized_text.lower()
+        normalized_text = normalized_text.strip()
+        normalized_text = re.sub(r'\s+', ' ', normalized_text)
+        return normalized_text
+    except Exception as e:
+        return text
+
+DB_PATH = "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db"
+
+def run_queries(conn: kuzu.Connection):
+    print("\n--- Querying Data ---")
+
+    # 规范化查询条件中的文本
+    task_text_orig = "项目Alpha的文档编写任务"
+    person_text_orig = "张三"
+    org_text_orig = "谷歌"
+
+    task_text_norm = normalize_text_for_id(task_text_orig)
+    person_text_norm = normalize_text_for_id(person_text_orig)
+    org_text_norm = normalize_text_for_id(org_text_orig)
+
+    print(f"Normalized for query: '{task_text_orig}' -> '{task_text_norm}'")
+    print(f"Normalized for query: '{person_text_orig}' -> '{person_text_norm}'")
+    print(f"Normalized for query: '{org_text_orig}' -> '{org_text_norm}'")
+
+
+    queries_to_run = {
+        "Total ExtractedEntity Nodes": "MATCH (n:ExtractedEntity) RETURN count(n) AS total_entities;",
+        "All ExtractedEntity Nodes (Limit 5)": "MATCH (n:ExtractedEntity) RETURN n.id_prop, n.text, n.label LIMIT 5;",
+        # 使用规范化后的文本进行查询
+        "Specific Entity (张三 - normalized)": f"MATCH (n:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}}) RETURN n.id_prop, n.text, n.label;",
+        "Specific Entity (项目Alpha... - normalized)": f"MATCH (n:ExtractedEntity {{text: '{task_text_norm}', label: 'TASK'}}) RETURN n.id_prop, n.text, n.label;",
+        "Specific Entity (谷歌 - normalized)": f"MATCH (n:ExtractedEntity {{text: '{org_text_norm}', label: 'ORGANIZATION'}}) RETURN n.id_prop, n.text, n.label;",
+        
+        "Total WorksAt Relationships": "MATCH ()-[r:WorksAt]->() RETURN count(r) AS total_works_at_rels;",
+        "Total AssignedTo Relationships": "MATCH ()-[r:AssignedTo]->() RETURN count(r) AS total_assigned_to_rels;",
+        
+        # 关系查询也使用规范化文本（如果条件中包含文本）
+        "Who works at 谷歌? (normalized)": f"MATCH (p:ExtractedEntity {{label: 'PERSON'}})-[r:WorksAt]->(o:ExtractedEntity {{text: '{org_text_norm}', label: 'ORGANIZATION'}}) RETURN p.text AS person_name;",
+        "Where does 张三 work? (normalized)": f"MATCH (p:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}})-[r:WorksAt]->(o:ExtractedEntity {{label: 'ORGANIZATION'}}) RETURN o.text AS organization_name;",
+        "What task is assigned to 张三? (normalized)": f"MATCH (t:ExtractedEntity {{label: 'TASK'}})-[r:AssignedTo]->(p:ExtractedEntity {{text: '{person_text_norm}', label: 'PERSON'}}) RETURN t.text AS task_name;",
+        "Who is the task '项目Alpha...' assigned to? (normalized)": f"MATCH (t:ExtractedEntity {{text: '{task_text_norm}', label: 'TASK'}})-[r:AssignedTo]->(p:ExtractedEntity {{label: 'PERSON'}}) RETURN p.text AS person_name;",
+        
+        "All WorksAt Relationships (Source and Target Text)": "MATCH (src:ExtractedEntity)-[r:WorksAt]->(tgt:ExtractedEntity) RETURN src.text AS source_text, src.label AS source_label, tgt.text AS target_text, tgt.label AS target_label;",
+        "All AssignedTo Relationships (Source and Target Text)": "MATCH (src:ExtractedEntity)-[r:AssignedTo]->(tgt:ExtractedEntity) RETURN src.text AS source_text, src.label AS source_label, tgt.text AS target_text, tgt.label AS target_label;",
+    }
+
+    for description, query_str in queries_to_run.items():
+        print(f"\nExecuting Query: {description}")
+        print(f"Cypher: {query_str}")
+        try:
+            results = conn.execute(query_str)
+            # 使用 pandas 显示结果更美观
+            df = pd.DataFrame(results.get_as_df())
+            if not df.empty:
+                print(df.to_string())
+            else:
+                print("  Query returned no results.")
+            results.close() # 记得关闭结果集
+        except Exception as e:
+            print(f"  Error executing query: {e}")
+
+def main():
+    print(f"Kuzu Python client version: {kuzu.__version__}")
+    print(f"Attempting to connect to KuzuDB at: {DB_PATH}")
+
+    if not os.path.exists(DB_PATH):
+        print(f"ERROR: Database directory not found at {DB_PATH}")
+        print("Please ensure the Dagster KuzuDB pipeline has run successfully and created the database.")
+        return
+
+    db = None
+    conn = None
+    try:
+        # --- 连接到已存在的数据库 (只读模式足够用于查询) ---
+        # 如果需要执行写操作（例如，在测试中临时修改），可以使用 read_only=False
+        db = kuzu.Database(DB_PATH, read_only=True)
+        conn = kuzu.Connection(db)
+        print(f"Successfully connected to KuzuDB. Database path: {os.path.abspath(DB_PATH)}")
+
+        # --- 列出所有表 (使用我们从研究报告中知道的方法) ---
+        print("\n--- Listing Tables ---")
+        try:
+            node_tables = conn._get_node_table_names()
+            print(f"Node Tables: {node_tables}")
+            rel_tables_info = conn._get_rel_table_names()
+            rel_tables = [info['name'] for info in rel_tables_info]
+            print(f"Rel Tables: {rel_tables}")
+            all_tables = node_tables + rel_tables
+            print(f"All Tables: {all_tables}")
+
+            # 验证核心表是否存在
+            expected_tables = ["ExtractedEntity", "WorksAt", "AssignedTo"]
+            missing = [t for t in expected_tables if t not in all_tables]
+            if not missing:
+                print("Core tables (ExtractedEntity, WorksAt, AssignedTo) are present.")
+            else:
+                print(f"WARNING: Missing core tables: {missing}")
+
+        except Exception as e_list_tables:
+            print(f"Error listing tables: {e_list_tables}")
+            print("This might indicate an issue with the KuzuDB connection or version compatibility for these internal methods.")
+
+        # --- 执行查询 ---
+        if conn: # 确保连接有效
+            run_queries(conn)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nKuzuDB test script finished.")
+        # Kuzu Connection 没有显式的 close() 方法
+        # Kuzu Database 对象在其 __del__ 方法中处理关闭
+        if db is not None:
+            del db # 确保数据库对象被垃圾回收，从而关闭
+
+if __name__ == "__main__":
+    main()
+    --- END OF FILE CONTENT ---
+
+  File: test_litellm_local.py
+    --- START OF FILE CONTENT ---
+# test_litellm_local.py
+import litellm
+import os
+import traceback
+import json
+
+# 不再依赖 LITELLM_CONFIG_PATH 来测试这个本地模型
+# if "LITELLM_CONFIG_PATH" in os.environ:
+#     del os.environ["LITELLM_CONFIG_PATH"] # 确保它不干扰
+
+litellm.set_verbose = True 
+
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "中国的首都是哪里？请用中文回答。并简要介绍一下它。"}
+]
+
+custom_llm_model_name_in_litellm = "local/qwen3-1.7b-gguf" 
+custom_llm_api_base = "http://localhost:8088/v1"        
+custom_llm_api_key = "nokey"                            
+
+print("--- Test Case: Calling local LLM via LiteLLM with direct parameters ---")
+try:
+    print(f"Attempting to call '{custom_llm_model_name_in_litellm}' via LiteLLM...")
+    print(f"  Target API Base: {custom_llm_api_base}")
+    print(f"  Using API Key: {custom_llm_api_key}")
+    print(f"  Messages: {json.dumps(messages, ensure_ascii=False, indent=2)}")
+    
+    response = litellm.completion(
+        model=custom_llm_model_name_in_litellm,
+        messages=messages,
+        max_tokens=1024, 
+        temperature=0.7,
+        custom_llm_provider="openai", 
+        api_base=custom_llm_api_base,
+        api_key=custom_llm_api_key 
+    )
+    
+    print(f"\n--- Response from '{custom_llm_model_name_in_litellm}' ---")
+    if response.choices and response.choices[0].message and response.choices[0].message.content is not None:
+        print("\nProcessed Content (from LiteLLM response):")
+        print(response.choices[0].message.content)
+    else:
+        print("\nNo content found in LiteLLM response choices.")
+        print("Full Response (if any):")
+        print(response)
+
+    print("\nUsage Information (from LiteLLM response):")
+    if response.usage:
+        print(f"  Prompt Tokens: {response.usage.prompt_tokens}")
+        print(f"  Completion Tokens: {response.usage.completion_tokens}")
+        print(f"  Total Tokens: {response.usage.total_tokens}")
+    else:
+        print("  Usage information not available.")
+
+except Exception as e:
+    print(f"\n--- ERROR ---")
+    print(f"Error calling '{custom_llm_model_name_in_litellm}' via LiteLLM: {e}")
+    traceback.print_exc()
+
+print("\n--- test_litellm_local.py finished ---")
+    --- END OF FILE CONTENT ---
+
+  File: test_llama_cpp.py
+    --- START OF FILE CONTENT ---
+from llama_cpp import Llama
+import os
+
+MODEL_DIR = "/home/zhz/models/Qwen3-1.7B-GGUF" # 您存放模型的目录
+# 列出该目录下所有的 .gguf 文件，让用户选择或自动选择一个
+gguf_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf")]
+
+if not gguf_files:
+    print(f"No GGUF models found in {MODEL_DIR}")
+    exit()
+
+print("Available GGUF models:")
+for i, fname in enumerate(gguf_files):
+    print(f"{i+1}. {fname}")
+
+# 为了测试，我们直接使用您下载的 Qwen 模型文件名
+# 您可以根据实际文件名修改，或者实现一个选择逻辑
+# 假设您的模型文件名中包含 "Qwen1.7B-GGUF" 或类似标识
+qwen_model_filename = None
+for fname in gguf_files:
+    if "Qwen" in fname and "1.7B" in fname and fname.endswith(".gguf"): # 简单匹配
+        qwen_model_filename = fname
+        break
+
+if not qwen_model_filename:
+    print("Could not automatically find a Qwen 1.7B GGUF model. Please specify one.")
+    # 或者让用户输入选择：
+    # choice = int(input(f"Select a model by number (1-{len(gguf_files)}): ")) - 1
+    # qwen_model_filename = gguf_files[choice]
+    exit()
+
+MODEL_PATH = os.path.join(MODEL_DIR, qwen_model_filename)
+print(f"\nUsing model: {MODEL_PATH}")
+
+# --- LLM 初始化参数 ---
+# n_gpu_layers: 设置为 > 0 可以将部分层卸载到 GPU (如果兼容且已安装 GPU 支持的 llama.cpp 版本)
+# 设置为 0 则完全使用 CPU。对于 RTX 3060 (12GB)，可以尝试设置一个较大的值，例如 20-30，具体取决于模型大小和VRAM。
+# 对于1.7B模型，如果VRAM足够，可以尝试更高的值，甚至 -1 (全部卸载)。
+# 我们先从 CPU 开始测试，n_gpu_layers=0
+N_GPU_LAYERS = 0
+N_CTX = 2048 #模型的上下文窗口大小，Qwen1.7B 可能支持更长的，具体查阅模型卡片
+N_BATCH = 512 # 提示处理的批处理大小
+
+try:
+    print(f"Initializing Llama model from: {MODEL_PATH}...")
+    print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
+    
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_gpu_layers=N_GPU_LAYERS,
+        n_ctx=N_CTX,
+        n_batch=N_BATCH,
+        verbose=True # 打印更多加载信息
+    )
+    print("Llama model initialized successfully.")
+
+    # --- 测试 1: 简单文本生成 ---
+    prompt_simple = "中国的首都是哪里？请用中文回答。"
+    print(f"\n--- Test 1: Simple Text Generation ---")
+    print(f"Prompt: {prompt_simple}")
+    output_simple = llm(
+        prompt_simple,
+        max_tokens=50, # 生成的最大 token 数
+        stop=["\n", " Human:", " Assistant:"], # 停止词
+        echo=False # 不回显 prompt
+    )
+    print(f"LLM Output: {output_simple['choices'][0]['text'].strip()}")
+
+    # --- 测试 2: Text-to-Cypher (初步) ---
+    # 使用简化的 Schema 和问题进行测试
+    # 您可以将 NEW_KG_SCHEMA_DESCRIPTION 从 constants.py 复制过来或导入
+    # 这里为了独立性，我们先用一个极简的描述
+    kg_schema_simple = """
+    节点标签: ExtractedEntity (属性: text, label)
+    关系类型: WORKS_AT (从 PERSON 到 ORGANIZATION), ASSIGNED_TO (从 TASK 到 PERSON)
+    实体标签值: PERSON, ORGANIZATION, TASK
+    """
+    user_question_cypher = "张三在哪里工作？"
+    prompt_cypher = f"""
+    你是一个将自然语言问题转换为Cypher查询的助手。
+    严格根据以下Schema生成Cypher查询：
+    {kg_schema_simple}
+    用户问题: {user_question_cypher}
+    Cypher查询: MATCH (p:ExtractedEntity {{text: '张三', label: 'PERSON'}})-[:WORKS_AT]->(o:ExtractedEntity {{label: 'ORGANIZATION'}}) RETURN o.text
+    用户问题: 项目Alpha分配给了谁？
+    Cypher查询: MATCH (t:ExtractedEntity {{text: '项目Alpha', label: 'TASK'}})-[:ASSIGNED_TO]->(p:ExtractedEntity {{label: 'PERSON'}}) RETURN p.text
+    用户问题: {user_question_cypher}
+    Cypher查询:""" # Few-shot prompting
+
+    print(f"\n--- Test 2: Text-to-Cypher (Simple) ---")
+    print(f"User question for Cypher: {user_question_cypher}")
+    # print(f"Cypher Prompt (simplified): {prompt_cypher}") # Prompt 可能很长
+    
+    output_cypher = llm(
+        prompt_cypher,
+        max_tokens=150,
+        stop=["\n", "用户问题:"],
+        temperature=0.1, # 对于代码生成，低temperature通常更好
+        echo=False
+    )
+    generated_cypher = output_cypher['choices'][0]['text'].strip()
+    print(f"Generated Cypher: {generated_cypher}")
+
+    # --- 测试 3: 上下文问答 (初步) ---
+    context_qa = "根据KuzuDB的文档，它是一个嵌入式的图数据库，支持Cypher查询语言。"
+    user_question_qa = "KuzuDB支持什么查询语言？"
+    prompt_qa = f"""
+    根据以下上下文回答问题。
+    上下文: {context_qa}
+    问题: {user_question_qa}
+    答案:"""
+
+    print(f"\n--- Test 3: Contextual QA (Simple) ---")
+    print(f"Context: {context_qa}")
+    print(f"User question for QA: {user_question_qa}")
+    output_qa = llm(
+        prompt_qa,
+        max_tokens=100,
+        stop=["\n", "问题:"],
+        temperature=0.2,
+        echo=False
+    )
+    generated_answer_qa = output_qa['choices'][0]['text'].strip()
+    print(f"Generated Answer: {generated_answer_qa}")
+
+except Exception as e:
+    print(f"An error occurred with Llama.cpp: {e}")
+    import traceback
+    traceback.print_exc()
+finally:
+    print("\nLlama.cpp test script finished.")
+    if 'llm' in locals() and hasattr(llm, 'close'): # llama_cpp Llama对象没有close方法
+         pass # llm对象在Python中通常通过垃圾回收来释放资源
     --- END OF FILE CONTENT ---
 
 
