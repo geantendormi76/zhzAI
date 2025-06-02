@@ -1,0 +1,17 @@
+# config.yaml
+
+model_list:
+  - model_name: gemini/gemini-1.5-flash-latest # 您已有的 Gemini 配置 (如果存在)
+    litellm_params:
+      model: gemini/gemini-1.5-flash-latest
+      api_key: os.environ/GEMINI_API_KEY
+      # api_base: http://localhost:YOUR_CLASH_PORT # 如果需要
+
+  # --- 修改我们本地的 Qwen3 1.7B 模型配置 ---
+  - model_name: local/qwen3-1.7b-gguf
+    litellm_params:
+      model: openai/my-local-qwen # 使用 "openai/" 前缀，后面可以跟一个自定义的描述符
+      api_base: http://localhost:8088/v1
+      api_key: nokey
+
+# ... (其他 LiteLLM 配置) ...
