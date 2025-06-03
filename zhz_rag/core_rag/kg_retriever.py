@@ -1,303 +1,188 @@
-# zhz_agent/kg.py
-import json
+# zhz_rag/core_rag/kg_retriever.py
 import os
-from typing import List, Dict, Any, Optional
-from neo4j import GraphDatabase, basic_auth, Result, Record 
-from neo4j.graph import Node, Relationship, Path
-import asyncio
+import json
+import kuzu
+import pandas as pd
+from typing import List, Dict, Any, Optional, Callable, Iterator # 确保 Iterator 已导入
 import logging
-from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+from contextlib import contextmanager
 
-# --- 日志配置 (保持您之前的优秀配置) ---
-_kg_py_dir = os.path.dirname(os.path.abspath(__file__))
-log_file_path = os.path.join(_kg_py_dir, 'kg_retriever.log')
+# 导入您的Cypher生成函数和Schema描述
+from zhz_rag.llm.sglang_wrapper import generate_cypher_query # 确保路径正确
+from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # 确保路径正确
+
+# 日志配置
 kg_logger = logging.getLogger(__name__) 
-kg_logger.setLevel(logging.DEBUG) 
-kg_logger.propagate = False
-if kg_logger.hasHandlers():
-    kg_logger.handlers.clear()
-try:
-    file_handler = logging.FileHandler(log_file_path, mode='w') 
-    file_handler.setLevel(logging.DEBUG) 
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(name)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    kg_logger.addHandler(file_handler)
-    kg_logger.info("--- KG logging reconfigured to write to kg_retriever.log (dedicated handler) ---")
-except Exception as e:
-    print(f"CRITICAL: Failed to configure file handler for kg_logger: {e}")
+# 确保 kg_logger 的级别和处理器已在 zhz_rag_mcp_service 或其他主入口配置，
+# 或者在这里为它单独配置 handler 和 formatter，例如：
+if not kg_logger.hasHandlers():
+    kg_logger.setLevel(logging.DEBUG) # 开发时可以设为 DEBUG
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+    ch.setFormatter(formatter)
+    kg_logger.addHandler(ch)
+    kg_logger.propagate = False # 避免重复日志（如果根logger也配置了handler）
+kg_logger.info("KGRetriever (KuzuDB) logger initialized/reconfirmed.")
 
-from zhz_rag.llm.sglang_wrapper import generate_cypher_query
-from zhz_rag.config.pydantic_models import RetrievedDocument
-from dotenv import load_dotenv
-load_dotenv()
 
 class KGRetriever:
-    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "zhz199276")
-    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+    KUZU_DB_PATH_ENV = os.getenv("KUZU_DB_PATH", "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db")
 
-    def __init__(self, llm_cypher_generator_func: callable = generate_cypher_query):
+    def __init__(self, db_path: Optional[str] = None, llm_cypher_generator_func: Callable = generate_cypher_query):
+        self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
         self.llm_cypher_generator_func = llm_cypher_generator_func
-        self._driver: Optional[GraphDatabase.driver] = None
-                # --- 在连接前打印出将要使用的连接参数 ---
-        kg_logger.info(f"KGRetriever attempting to connect with URI: {self.NEO4J_URI}, User: {self.NEO4J_USER}, DB: {self.NEO4J_DATABASE}")
-        
-        self._connect_to_neo4j()
-        kg_logger.info(f"KGRetriever initialized. Connected to Neo4j: {self._driver is not None}")
+        self._db: Optional[kuzu.Database] = None
+        kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. Attempting to connect to DB path: {self.db_path}")
+        self._connect_to_kuzu()
+        # 这条日志现在移到 _connect_to_kuzu 成功之后打印
 
-    def _connect_to_neo4j(self):
-        if self._driver is not None:
-            try:
-                self._driver.verify_connectivity()
-                kg_logger.info("Neo4j connection already active and verified.")
-                return
-            except Exception:
-                kg_logger.warning("Existing Neo4j driver failed connectivity test, attempting to reconnect.")
-                try:
-                    self._driver.close()
-                except: pass
-                self._driver = None
+    def _connect_to_kuzu(self):
+        kg_logger.info(f"Attempting to load KuzuDB from path: {self.db_path}")
         try:
-            self._driver = GraphDatabase.driver(self.NEO4J_URI, auth=basic_auth(self.NEO4J_USER, self.NEO4J_PASSWORD))
-            with self._driver.session(database=self.NEO4J_DATABASE) as session:
-                session.run("RETURN 1").consume()
-            kg_logger.info(f"Successfully connected to Neo4j at {self.NEO4J_URI} on database '{self.NEO4J_DATABASE}'.")
+            if not os.path.exists(self.db_path):
+                kg_logger.error(f"KuzuDB path does not exist: {self.db_path}. KGRetriever cannot connect.")
+                self._db = None
+                return # 明确返回
+            
+            # 对于检索，通常只读即可，除非有特殊写需求
+            # 如果 mcpo 服务可能并发访问，需要考虑 KuzuDB 的并发处理能力和锁机制
+            self._db = kuzu.Database(self.db_path, read_only=True) 
+            kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path}. KGRetriever (KuzuDB) initialized and connected.")
         except Exception as e:
-            kg_logger.error(f"Failed to connect to Neo4j: {e}", exc_info=True)
-            self._driver = None
-    
-    def close(self):
-        if self._driver:
-            self._driver.close()
-            kg_logger.info("Closed Neo4j connection.")
-            self._driver = None
+            kg_logger.error(f"Failed to connect to KuzuDB at {self.db_path}: {e}", exc_info=True)
+            self._db = None
 
-    def _convert_neo4j_value_to_json_serializable(self, value: Any) -> Any: # <--- 覆盖整个方法
-        """
-        递归地将Neo4j返回的各种值转换为JSON可序列化的Python原生类型。
-        """
-        if isinstance(value, Node):
-            # Node对象可以直接通过dict(node)获取其所有属性
-            # element_id 是推荐的唯一标识符
-            return {"_element_id": value.element_id, "_labels": list(value.labels), "properties": dict(value)}
+    @contextmanager
+    def _get_connection(self) -> Iterator[kuzu.Connection]:
+        if not self._db:
+            kg_logger.warning("KuzuDB database object is None in _get_connection. Attempting to reconnect...")
+            self._connect_to_kuzu() # 尝试重新连接
+            if not self._db: # 再次检查
+                kg_logger.error("KuzuDB reconnection failed. Cannot get a connection.")
+                raise ConnectionError("KuzuDB is not connected or failed to reconnect. Cannot get a connection.")
         
-        elif isinstance(value, Relationship):
-            # Relationship对象也可以通过dict(relationship)获取其属性
-            return {
-                "_element_id": value.element_id,
-                "_type": value.type,
-                "_start_node_element_id": value.start_node.element_id,
-                "_end_node_element_id": value.end_node.element_id,
-                "properties": dict(value) # 关系的属性
-            }
-            
-        elif isinstance(value, Path):
-            # Path对象包含一系列交替的节点和关系
-            return {
-                "nodes": [self._convert_neo4j_value_to_json_serializable(n) for n in value.nodes],
-                "relationships": [self._convert_neo4j_value_to_json_serializable(r) for r in value.relationships]
-            }
-            
-        elif isinstance(value, list) or isinstance(value, tuple) or isinstance(value, set):
-            return [self._convert_neo4j_value_to_json_serializable(item) for item in value]
-            
-        elif isinstance(value, dict):
-            # 检查是否已经是我们转换后的格式，避免重复处理和无限递归
-            if "_element_id" in value and ("_labels" in value or "_type" in value): 
-                return value
-            return {k: self._convert_neo4j_value_to_json_serializable(v) for k, v in value.items()}
-            
-        elif isinstance(value, (str, int, float, bool)) or value is None:
-            return value
-            
-        else:
-            kg_logger.warning(f"KGRetriever: Encountered an unhandled Neo4j type ({type(value)}), attempting to convert to string: {str(value)}")
-            try:
-                return str(value)
-            except Exception as e_str:
-                kg_logger.error(f"KGRetriever: Failed to convert unhandled type {type(value)} to string: {e_str}")
-                return f"[Unserializable object: {type(value)}]"
+        conn = None # 初始化 conn
+        try:
+            conn = kuzu.Connection(self._db)
+            kg_logger.debug("KuzuDB connection obtained.")
+            yield conn
+        except Exception as e_conn: # 捕获 kuzu.Connection() 可能的异常
+            kg_logger.error(f"Failed to create KuzuDB connection object: {e_conn}", exc_info=True)
+            raise ConnectionError(f"Failed to create KuzuDB connection: {e_conn}")
+        finally:
+            # Kuzu Connection 对象没有显式的 close() 方法。
+            # 它通常在其关联的 Database 对象被销毁时或垃圾回收时关闭。
+            kg_logger.debug("KuzuDB connection context manager exiting.")
+            pass 
+
+    def close(self):
+        kg_logger.info(f"Closing KuzuDB for retriever using path: {self.db_path}")
+        if self._db:
+            # KuzuDB Database 对象在其 __del__ 方法中处理关闭和资源释放。
+            # 显式删除引用有助于触发垃圾回收，但不保证立即关闭。
+            # KuzuDB 没有显式的 db.close() 方法。
+            del self._db
+            self._db = None
+            kg_logger.info("KuzuDB Database object dereferenced (closed).")
 
     def execute_cypher_query_sync(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        if not self._driver:
-            kg_logger.error("Neo4j driver not initialized in execute_cypher_query_sync.")
-            return []        
-        kg_logger.info(f"--- Executing SYNC Cypher ---") # <--- 修改日志级别为INFO，确保能看到
+        if not self._db:
+            kg_logger.error("KuzuDB not initialized in execute_cypher_query_sync. Cannot execute query.")
+            return []
+        
+        kg_logger.info(f"--- Executing KuzuDB Cypher ---")
         kg_logger.info(f"Query: {query}")
-        kg_logger.info(f"Params: {parameters}")
+        kg_logger.info(f"Params: {parameters if parameters else 'No parameters'}")
+        
         results_list: List[Dict[str, Any]] = []
         try:
-            with self._driver.session(database=self.NEO4J_DATABASE) as session:
-                result_obj: Result = session.run(query, parameters)
-                raw_records = list(result_obj) # 将迭代器具体化为列表
-                kg_logger.info(f"Neo4j raw_records count: {len(raw_records)}")
-
-                for record_instance in raw_records: 
-                    record_as_dict = {}
-                    for key, value in record_instance.items():
-                        record_as_dict[key] = self._convert_neo4j_value_to_json_serializable(value)
-                    results_list.append(record_as_dict)
-
-            # --- 打印转换后的结果数量和前几条 ---
-            kg_logger.info(f"SYNC Cypher executed. Converted records count: {len(results_list)}")
-            if results_list:
-                kg_logger.debug(f"First converted record (sample): {json.dumps(results_list[0], ensure_ascii=False, indent=2)}")
-            else:
-                kg_logger.debug("No records converted.")
+            with self._get_connection() as conn: # 使用上下文管理器获取连接
+                prepared_statement = conn.prepare(query)
+                # 注意：KuzuDB 的 execute 方法对参数的处理方式。
+                # 如果 parameters 为 None 或空字典，应传递 None 或 {}。
+                # 如果查询本身不包含参数占位符，传递参数字典可能会导致错误。
+                # 我们需要确保Cypher查询中的参数占位符（如 $param）与parameters字典中的键匹配。
                 
+                actual_params = parameters if parameters else {} # 确保是字典
+                query_result = conn.execute(prepared_statement, **actual_params) # 使用 ** 解包参数
+                
+                df = query_result.get_as_df()
+                results_list = df.to_dict(orient='records')
+                
+                kg_logger.info(f"KuzuDB Cypher executed. Records count: {len(results_list)}")
+                if results_list:
+                    kg_logger.debug(f"First KuzuDB record (sample): {json.dumps(results_list[0], ensure_ascii=False, indent=2, default=str)}")
+                else:
+                    kg_logger.debug("KuzuDB query returned no records.")
+        except RuntimeError as kuzu_runtime_error: # KuzuDB Python API 通常抛出 RuntimeError
+             kg_logger.error(f"KuzuDB RuntimeError during Cypher execution: '{query}' with params: {parameters}. Error: {kuzu_runtime_error}", exc_info=True)
+             # 可以考虑将 KuzuDB 的错误信息包装后向上抛出或返回
+             # return [{"error": f"KuzuDB execution error: {kuzu_runtime_error}"}] 
+        except ConnectionError as conn_err: # 如果 _get_connection 内部抛出
+             kg_logger.error(f"KuzuDB ConnectionError during Cypher execution: {conn_err}", exc_info=True)
         except Exception as e:
-            kg_logger.error(f"Failed to execute SYNC Cypher query: '{query}' with params: {parameters}. Error: {e}", exc_info=True)
+            kg_logger.error(f"Unexpected error executing KuzuDB Cypher query: '{query}' with params: {parameters}. Error: {e}", exc_info=True)
         return results_list
 
-    def _format_neo4j_record_for_retrieval(self, record_data: Dict[str, Any]) -> str:
-        """
-        将单条已转换为纯Python字典的Neo4j记录格式化为一段描述性文本。
-        """
+    # ... ( _format_kuzu_record_for_retrieval 和 retrieve_with_llm_cypher 保持不变，
+    # 但 retrieve_with_llm_cypher 内部对 execute_cypher_query_sync 的调用现在会经过新的错误处理) ...
+    def _format_kuzu_record_for_retrieval(self, record_data: Dict[str, Any]) -> str:
+        # ... (保持不变)
         parts = []
         for key, value in record_data.items():
-            if isinstance(value, dict):
-                # 尝试提取节点的text和label属性，或关系的type
-                if '_labels' in value and 'text' in value: # 假设是转换后的Node
-                    parts.append(f"{key}({value['text']}:{'/'.join(value['_labels'])})")
-                elif '_type' in value: # 假设是转换后的Relationship
-                    rel_props_str = ", ".join([f"{k_prop}: {v_prop}" for k_prop, v_prop in value.items() if not k_prop.startswith('_')])
-                    parts.append(f"{key}(TYPE={value['_type']}{', PROPS=[' + rel_props_str + ']' if rel_props_str else ''})")
-                else: # 其他字典
-                    # 为了避免过长的输出，可以限制value的打印长度或深度
-                    value_str = json.dumps(value, ensure_ascii=False, indent=None)
+            if isinstance(value, dict): 
+                if 'label' in value and 'text' in value: 
+                    parts.append(f"{key}({value['text']}:{value['label']})")
+                elif '_label' in value and '_src' in value and '_dst' in value: 
+                     parts.append(f"{key}(TYPE={value['_label']})")
+                else:
+                    value_str = json.dumps(value, ensure_ascii=False, default=str) 
                     if len(value_str) > 100: value_str = value_str[:100] + "..."
                     parts.append(f"{key}: {value_str}")
             elif value is not None:
                 parts.append(f"{key}: {str(value)}")
+        return " | ".join(parts) if parts else "No specific details found in this KuzuDB record."
+
+
+    async def retrieve_with_llm_cypher(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        kg_logger.info(f"Starting KG retrieval (KuzuDB) with LLM-generated Cypher for query: '{query}', top_k: {top_k}")
         
-        return " | ".join(parts) if parts else "No specific details found in this record."
-
-    async def retrieve_with_llm_cypher(self, query: str, top_k: int = 3) -> List[RetrievedDocument]:
-        kg_logger.info(f"Starting KG retrieval with LLM-generated Cypher for query: '{query}', top_k: {top_k}")
-        if not self._driver:
-            kg_logger.warning("Neo4j driver not initialized. Cannot perform KG query.")
-            return []
-
-        kg_logger.info(f"Calling LLM to generate Cypher query using new schema...")
-        cypher_query = await self.llm_cypher_generator_func(
+        kg_logger.info(f"Calling LLM to generate Cypher query for KuzuDB...")
+        # 将接收结果的变量名统一为 cypher_query_or_unable_msg
+        cypher_query_or_unable_msg = await self.llm_cypher_generator_func(
             user_question=query,
             kg_schema_description=NEW_KG_SCHEMA_DESCRIPTION 
         )
-        kg_logger.info(f"LLM generated Cypher query:\n---\n{cypher_query}\n---")
+        kg_logger.info(f"LLM generated Cypher query/message for KuzuDB:\n---\n{cypher_query_or_unable_msg}\n---")
 
-        if not cypher_query or cypher_query == "无法生成Cypher查询。":
-            kg_logger.warning("LLM could not generate a valid Cypher query.")
-            return []
+        # --- [使用正确的变量名进行检查] ---
+        if not cypher_query_or_unable_msg or cypher_query_or_unable_msg == "无法生成Cypher查询.":
+            kg_logger.warning("LLM could not generate a valid Cypher query for KuzuDB or returned 'unable to generate' message.")
+            return [] # 直接返回空列表
 
-        results = self.execute_cypher_query_sync(cypher_query)
+        # 如果是有效的 Cypher 查询，则继续
+        cypher_to_execute = cypher_query_or_unable_msg # <--- 使用正确的变量名
         
-        retrieved_docs = []
-        for record_dict in results[:top_k]:
-            content = self._format_neo4j_record_for_retrieval(record_dict)
-            retrieved_docs.append(
-                RetrievedDocument(
-                    source_type="knowledge_graph",
-                    content=content,
-                    score=1.0, 
-                    metadata={"cypher_query": cypher_query, "original_query": query}
-                )
-            )
-        kg_logger.info(f"Retrieved {len(retrieved_docs)} documents from KG using LLM-generated Cypher.")
-        return retrieved_docs
+        cypher_query_with_limit: str # 明确类型
+        if "LIMIT" not in cypher_to_execute.upper(): # 保持大小写不敏感的检查
+            cypher_query_with_limit = f"{cypher_to_execute} LIMIT {top_k}"
+        else: 
+            cypher_query_with_limit = cypher_to_execute
+            kg_logger.info(f"Query already contains LIMIT, using as is: {cypher_query_with_limit}")
 
-    def get_entity_details_manual(self, entity_text: str, entity_type_attr: Optional[str] = None) -> List[Dict[str, Any]]:
-        if entity_type_attr:
-            cypher = "MATCH (e:ExtractedEntity {text: $text, label: $label_attr}) RETURN e"
-            params = {"text": entity_text, "label_attr": entity_type_attr.upper()}
-        else:
-            cypher = "MATCH (e:ExtractedEntity {text: $text}) RETURN e"
-            params = {"text": entity_text}
-        return self.execute_cypher_query_sync(cypher, params)
-
-    def get_relations_manual(self, entity_text: str, entity_type_attr: str, relation_type: Optional[str] = None, direction: str = "BOTH") -> List[Dict[str, Any]]:
-        rel_type_cypher = f":{relation_type.upper()}" if relation_type else "r" # 关系类型转大写
+        results_from_kuzu = self.execute_cypher_query_sync(cypher_query_with_limit)
         
-        if direction.upper() == "OUT":
-            rel_clause = f"-[{rel_type_cypher}]->"
-        elif direction.upper() == "IN":
-            rel_clause = f"<-[{rel_type_cypher}]-"
-        else: # BOTH
-            rel_clause = f"-[{rel_type_cypher}]-"
-            
-        cypher = (
-            f"MATCH (e:ExtractedEntity {{text: $text, label: $label_attr}}){rel_clause}(neighbor:ExtractedEntity) "
-            f"RETURN e as entity, {rel_type_cypher if not relation_type else 'r'} as relationship, neighbor as related_entity"
-        )
-        # 如果 relation_type 为 None, Cypher 中 r 会匹配任何关系类型，但我们返回时仍用 'r' 作为键
-        # 如果 relation_type 指定了，Cypher 中会用具体的类型，返回时也用 'r' 作为键
-        # 为了统一，我们让 RETURN 语句中的关系变量总是 'r'
-        if relation_type: # 如果指定了关系类型，确保返回的变量是 r
-             cypher = (
-                f"MATCH (e:ExtractedEntity {{text: $text, label: $label_attr}})-[r:{relation_type.upper()}]"
-                f"{'->' if direction.upper() == 'OUT' else '<-' if direction.upper() == 'IN' else '-'}"
-                f"(neighbor:ExtractedEntity) "
-                f"RETURN e as entity, r as relationship, neighbor as related_entity"
-            )
-        else: # 如果没有指定关系类型，匹配任何关系
-            cypher = (
-                f"MATCH (e:ExtractedEntity {{text: $text, label: $label_attr}})-[r]-"
-                f"{'(neighbor:ExtractedEntity)' if direction.upper() != 'BOTH' else '(neighbor:ExtractedEntity)'} " # 确保neighbor被定义
-                f"RETURN e as entity, r as relationship, neighbor as related_entity"
-            )
+        retrieved_docs_for_rag: List[Dict[str, Any]] = []
+        for record_dict in results_from_kuzu:
+            content_str = self._format_kuzu_record_for_retrieval(record_dict)
+            doc_data = {
+                "source_type": "knowledge_graph_kuzu",
+                "content": content_str,
+                "score": 1.0, 
+                # 使用 cypher_to_execute (即原始的、未加 LIMIT 的 Cypher) 进行记录
+                "metadata": {"cypher_query": cypher_to_execute, "original_query": query, "raw_kuzu_record": record_dict}
+            }
+            retrieved_docs_for_rag.append(doc_data)
 
-
-        params = {"text": entity_text, "label_attr": entity_type_attr.upper()}
-        return self.execute_cypher_query_sync(cypher, params)
-
-async def main_test():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-    kg_logger.info("--- KGRetriever New Test ---")
-    try:
-        kg_retriever = KGRetriever() 
-        if kg_retriever._driver is None:
-            print("Failed to connect to Neo4j. Exiting test.")
-            return 
-
-        print("\n--- Test 1: Get entity details for '张三' (PERSON) ---")
-        zhang_san_details = kg_retriever.get_entity_details_manual("张三", "PERSON")
-        if zhang_san_details:
-            print(json.dumps(zhang_san_details, indent=2, ensure_ascii=False))
-        else:
-            print("'张三' (PERSON) not found.")
-
-        print("\n--- Test 2: Get 'WORKS_AT' relations for '张三' (PERSON) ---")
-        zhang_san_relations = kg_retriever.get_relations_manual("张三", "PERSON", relation_type="WORKS_AT", direction="OUT")
-        if zhang_san_relations:
-            print(f"Found {len(zhang_san_relations)} WORKS_AT relations for '张三':")
-            for item in zhang_san_relations:
-                print(json.dumps(item, indent=2, ensure_ascii=False))
-        else:
-            print("No WORKS_AT relations found for '张三'.")
-
-        print("\n--- Test 3: Retrieve with LLM-generated Cypher for '张三在哪里工作？' ---")
-        llm_results_zs = await kg_retriever.retrieve_with_llm_cypher("张三在哪里工作？")
-        if llm_results_zs:
-            print(f"LLM query results for '张三在哪里工作？':")
-            for doc in llm_results_zs:
-                print(f"  Content: {doc.content}")
-                print(f"  Metadata: {doc.metadata}")
-        else:
-            print("LLM query for '张三在哪里工作？' returned no results or failed.")
-
-        print("\n--- Test 4: Retrieve with LLM-generated Cypher for '项目Alpha的文档编写任务分配给了谁？' ---")
-        llm_results_task = await kg_retriever.retrieve_with_llm_cypher("项目Alpha的文档编写任务分配给了谁？")
-        if llm_results_task:
-            print(f"LLM query results for '项目Alpha的文档编写任务分配给了谁？':")
-            for doc in llm_results_task:
-                print(f"  Content: {doc.content}")
-                print(f"  Metadata: {doc.metadata}")
-        else:
-            print("LLM query for '项目Alpha的文档编写任务分配给了谁？' returned no results or failed.")
-
-        kg_retriever.close()
-    except Exception as e:
-        print(f"An error occurred during the KGRetriever test: {e}")
-
-if __name__ == '__main__':
-    asyncio.run(main_test())
+        kg_logger.info(f"Retrieved {len(retrieved_docs_for_rag)} documents from KuzuDB using LLM-generated Cypher.")
+        return retrieved_docs_for_rag

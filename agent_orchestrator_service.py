@@ -486,45 +486,68 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     print(f"Worker Task Inputs: {worker_task_inputs}")
     
     worker_final_result: str = ""
+    worker_crew_usage_metrics: Optional[Dict[str, Any]] = None # 用于存储 token usage
     try:
-        # 如果 worker_task_inputs 为空，则不传递 inputs 参数
-        task_execution_args = {}
-        if worker_task_inputs:
-            task_execution_args['inputs'] = worker_task_inputs
+        # --- [关键修改] 为 Worker Task 创建并运行一个 Crew ---
+        worker_crew = Crew(
+            agents=[worker_agent_instance], # Worker Agent
+            tasks=[worker_task],             # 它要执行的单个任务
+            process=Process.sequential,
+            verbose=True # 可以设为 True 或 2 来查看 Worker Crew 的详细日志
+        )
+        
+        # 如果 worker_task_inputs 为空，则 inputs={}
+        # CrewAI 的 kickoff 方法期望 inputs 是一个字典
+        task_execution_inputs = worker_task_inputs if worker_task_inputs else {}
             
-        worker_output = worker_task.execute(**task_execution_args)
+        # 执行 Worker Crew
+        # kickoff 返回的是 CrewOutput 对象，或者在某些旧版本/配置下可能直接是结果字符串或 TaskOutput
+        worker_crew_output = worker_crew.kickoff(inputs=task_execution_inputs)
+        
+        # 从 Worker Crew 的输出中提取结果
+        # 这与我们处理 Manager Crew 输出的逻辑类似
+        actual_worker_task_output: Optional[Any] = None
+        if hasattr(worker_crew_output, 'tasks_output') and isinstance(worker_crew_output.tasks_output, list) and worker_crew_output.tasks_output:
+            actual_worker_task_output = worker_crew_output.tasks_output[0] # 我们只有一个 worker_task
+        elif hasattr(worker_crew_output, 'raw_output'): # 兼容直接返回 TaskOutput
+            actual_worker_task_output = worker_crew_output
+        elif isinstance(worker_crew_output, str): # 直接返回字符串
+            actual_worker_task_output = worker_crew_output
+        else: # 其他意外情况
+            actual_worker_task_output = str(worker_crew_output)
 
-        if isinstance(worker_output, str):
-            worker_final_result = worker_output
-        elif hasattr(worker_output, 'raw_output'): # CrewAI 0.30.0+
-            worker_final_result = worker_output.raw_output
-        elif hasattr(worker_output, 'raw'): # Older CrewAI
-            worker_final_result = worker_output.raw
-        else:
-            worker_final_result = str(worker_output)
-            
+        # 从 actual_worker_task_output 中提取最终的字符串结果
+        if hasattr(actual_worker_task_output, 'raw') and isinstance(actual_worker_task_output.raw, str):
+            worker_final_result = actual_worker_task_output.raw.strip()
+        elif isinstance(actual_worker_task_output, str):
+            worker_final_result = actual_worker_task_output.strip()
+        else: # Fallback
+            worker_final_result = str(actual_worker_task_output)
+        
         print(f"Worker Task executed. Result: {worker_final_result}")
         
-        # (可选) 获取 Worker Crew 的 token usage
-        worker_token_usage = None
-        if hasattr(worker_task, 'agent') and hasattr(worker_task.agent, 'crew') and worker_task.agent.crew and hasattr(worker_task.agent.crew, 'usage_metrics'):
-             worker_token_usage = worker_task.agent.crew.usage_metrics
-             print(f"Worker Crew token usage: {worker_token_usage}")
+        # 获取 Worker Crew 的 token usage
+        if hasattr(worker_crew, 'usage_metrics'):
+            worker_crew_usage_metrics = worker_crew.usage_metrics
+            print(f"Worker Crew token usage: {worker_crew_usage_metrics}")
+        # --- [结束关键修改] ---
 
 
         return AgentTaskResponse(
-            answer=worker_final_result,
-            status="success",
-            debug_info={
-                "manager_plan": manager_plan_object.model_dump(),
-                "worker_tool_used": selected_tool_name,
-                "worker_task_inputs": worker_task_inputs
-            },
-            token_usage=worker_token_usage.model_dump() if worker_token_usage else None
-        )
+        answer=worker_final_result,
+        status="success",
+        debug_info={
+            "manager_plan": manager_plan_object.model_dump(),
+            "worker_tool_used": selected_tool_name,
+            "worker_task_inputs": worker_task_inputs # 记录原始传递给 Worker Task 的输入
+        },
+        token_usage=worker_crew_usage_metrics.model_dump() if worker_crew_usage_metrics and hasattr(worker_crew_usage_metrics, 'model_dump') else worker_crew_usage_metrics if worker_crew_usage_metrics else None
+    )
 
     except Exception as e:
-        print(f"Error executing Worker Task for tool {selected_tool_name}: {e}", exc_info=True)
+    # 使用 traceback 打印详细错误
+        print(f"Error executing Worker Task for tool {selected_tool_name}: {e}")
+        traceback.print_exc() 
         return AgentTaskResponse(
             answer=f"执行工具 '{selected_tool_name}' 时发生错误。",
             status="error",
