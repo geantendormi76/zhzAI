@@ -52,6 +52,15 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
         **kwargs: Any # 其他传递给 LiteLLM 的参数
     ):
         super().__init__(model=model) # 调用父类的构造函数
+
+        # --- 新增日志 ---
+        logger.info(f"CustomLiteLLMWrapper __init__ for '{model}': Received agent_tools type: {type(agent_tools)}")
+        if agent_tools is not None:
+            logger.info(f"CustomLiteLLMWrapper __init__ for '{model}': agent_tools content (names): {[tool.name for tool in agent_tools if hasattr(tool, 'name')]}")
+        else:
+            logger.info(f"CustomLiteLLMWrapper __init__ for '{model}': agent_tools is None.")
+        # --- 结束新增日志 ---
+        
         self.model_name = model
         self.api_base = api_base
         self.api_key = api_key
@@ -211,14 +220,31 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
 
         # 移除值为 None 的参数，因为 litellm.completion 不喜欢 None 的 api_key 等
         litellm_call_args_cleaned = {k: v for k, v in litellm_call_args.items() if v is not None}
+
+        # --- 新增：如果 api_base 为 None (表示直接调用云端模型)，则尝试使用 LITELLM_PROXY_URL ---
+        if self.api_base is None:
+            local_proxy_url = os.getenv("LITELLM_PROXY_URL")
+            if local_proxy_url:
+                litellm_call_args_cleaned["proxy"] = { # LiteLLM 的 proxy 参数期望一个字典
+                    "http": local_proxy_url,
+                    "https": local_proxy_url,
+                }
+                logger.info(f"  Using local proxy for direct cloud call: {local_proxy_url}")
+            else:
+                logger.info("  api_base is None, but LITELLM_PROXY_URL is not set. Proceeding without proxy.")
+        # --- 结束新增代理逻辑 ---
         
-        logger.info(f"  Attempting to call litellm.completion for model '{self.model_name}'...") # <--- 添加日志
-        logger.debug(f"  LiteLLM Call Args (cleaned, messages excluded): "
-                    f"{ {k: v for k, v in litellm_call_args_cleaned.items() if k != 'messages'} }")
+        logger.info(f"  Attempting to call litellm.completion for model '{self.model_name}'...")
+        # 在打印参数前确保 proxy 参数也被包含（如果设置了）
+        debug_params_to_print = {k: v for k, v in litellm_call_args_cleaned.items() if k != 'messages'}
+        if "proxy" in litellm_call_args_cleaned: # 确保打印时能看到 proxy
+            debug_params_to_print["proxy_used"] = litellm_call_args_cleaned["proxy"]
+            
+        logger.debug(f"  LiteLLM Call Args (cleaned, messages excluded, proxy shown if used): {debug_params_to_print}")
         
-        response = None # <--- 初始化 response
+        response = None 
         try:
-            response = litellm.completion(**litellm_call_args_cleaned) # <--- 这是关键的调用
+            response = litellm.completion(**litellm_call_args_cleaned) 
             logger.info(f"  litellm.completion call for '{self.model_name}' succeeded.") # <--- 添加日志
             logger.debug(f"  LiteLLM Raw Response object type: {type(response)}")
             if hasattr(response, 'model_dump_json'):
@@ -234,30 +260,31 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
         # LiteLLM 的 ModelResponse 结构与 OpenAI 的 ChatCompletion 类似
         llm_message_response = response.choices[0].message
         
-        if llm_message_response.tool_calls: # 检查是否有工具调用
-            first_tool_call = llm_message_response.tool_calls[0]
-            tool_name = first_tool_call.function.name
-            tool_arguments_str = first_tool_call.function.arguments # 这是一个JSON字符串
+        if hasattr(llm_message_response, 'tool_calls') and llm_message_response.tool_calls:
+            logger.info(f"  LLM returned structured tool_calls: {llm_message_response.tool_calls}")
+            # 构造 ReAct 格式的字符串
+            tool_call = llm_message_response.tool_calls[0] # 假设只有一个工具调用
+            action = tool_call.function.name
+            action_input = tool_call.function.arguments # 这是 JSON 字符串
             
-            try:
-                tool_arguments_dict = json.loads(tool_arguments_str)
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse tool arguments JSON: {tool_arguments_str}")
-                # 如果参数解析失败，可能需要返回一个错误或一个简化的表示
-                return f"LLM_TOOL_CALL_ERROR: 无法解析工具 '{tool_name}' 的参数: {tool_arguments_str}"
+            # Gemini 可能也会在 content 中生成 Thought，如果它遵循 ReAct
+            thought_prefix = ""
+            if llm_message_response.content and "Thought:" in llm_message_response.content:
+                thought_prefix = llm_message_response.content.split("Action:")[0] # 取 Action:之前的部分作为 Thought
 
-            # CrewAI 期望的 ReAct 格式
-            # 注意：这里的 action_input 应该是参数的 JSON 字符串形式，而不是解析后的字典
-            react_string = f"Action: {tool_name}\nAction Input: {tool_arguments_str}" # 使用原始JSON字符串
-            logger.info(f"  LLM requested tool call (ReAct format): {react_string}")
-            return react_string
-            
+            react_string = f"{thought_prefix.strip()}\nAction: {action}\nAction Input: {action_input}"
+            logger.info(f"  Constructed ReAct string from tool_calls: {react_string}")
+            return react_string.strip() # 返回 ReAct 字符串
+        
         elif llm_message_response.content:
-            logger.info(f"  LLM returned text content (first 200 chars): {llm_message_response.content[:200]}")
-            return llm_message_response.content
+            content_str = llm_message_response.content
+            logger.info(f"  LLM returned content (first 200 chars): {content_str[:200]}")
+            # 如果 content 本身就是 ReAct 格式，也直接返回
+            return content_str.strip() # 返回字符串
+        
         else:
-            logger.warning("  LLM response did not contain content or tool calls.")
-            return "" # 返回空字符串或特定错误消息
+            logger.warning("  LLM response did not contain structured tool_calls or text content.")
+            return ""
 
     def get_token_ids(self, text: str) -> List[int]:
         """

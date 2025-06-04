@@ -171,7 +171,6 @@ rag_mcp_application = FastMCP(
     lifespan=app_lifespan_for_rag_service,
 )
 
-# --- MCP 工具定义 ---
 @rag_mcp_application.tool()
 async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果需要)
     ctx: Context,
@@ -189,12 +188,21 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
     response_payload = {} 
     original_query_for_response = query 
     final_json_output = ""
+    # --- [新增日志变量] ---
+    log_all_raw_retrievals_summary: List[Dict[str, Any]] = []
+    log_final_context_docs_summary: List[Dict[str, Any]] = []
+    log_fused_context_text_for_llm_snippet: str = "N/A"
+    log_final_answer_from_llm: str = "N/A"
+    log_intent_classification_result: Optional[Dict[str, Any]] = None
+    log_expanded_queries: Optional[List[str]] = None
+    # --- [结束新增日志变量] ---
 
     try:
-        # --- 1. LLM 驱动的意图分类和澄清触发 (保持不变) ---
+        # --- 1. LLM 驱动的意图分类和澄清触发 ---
         rag_logger.info(f"--- [TIME] 开始意图分类 at {time.time() - start_time_total:.2f}s ---")
         start_time_intent = time.time()
         intent_classification_result = await generate_intent_classification(query)
+        log_intent_classification_result = intent_classification_result # <--- 记录日志
         rag_logger.info(f"--- [TIME] 结束意图分类, 耗时: {time.time() - start_time_intent:.2f}s. Result: {intent_classification_result}")
 
         if intent_classification_result.get("clarification_needed"):
@@ -208,239 +216,177 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
             }
             rag_logger.info(f"--- 需要澄清，返回: {response_payload}")
             final_json_output = json.dumps(response_payload, ensure_ascii=False)
-            sys.stdout.flush(); sys.stderr.flush()
-            return final_json_output
+            # --- [修改日志记录点] 将日志记录移至 try-except-finally 外部的统一记录点 ---
+            # sys.stdout.flush(); sys.stderr.flush() # 这行可以移除，MCP会处理
+            # return final_json_output # 暂时不返回，确保日志被记录
 
-        # --- 2. 查询扩展 (保持不变) ---
-        rag_logger.info(f"--- 查询清晰，无需澄清。开始查询扩展 for: {query} ---")
-        start_time_expansion = time.time()
-        expanded_queries = await generate_expanded_queries(query) # 假设返回 List[str]
-        rag_logger.info(f"--- 扩展查询列表 (共 {len(expanded_queries)} 个): {expanded_queries}. 耗时: {time.time() - start_time_expansion:.2f}s ---")
-        
-        all_raw_retrievals: List[RetrievedDocument] = []
-        
-        # --- 3. 并行多路召回 (使用新的检索器) ---
-        # 我们将为原始查询和每个扩展查询都执行三路召回
-        queries_to_process = [query] + expanded_queries 
-        # 或者，如果觉得扩展查询过多，可以只用原始查询或选择性使用扩展查询
-        # queries_to_process = [query] # 简化：仅使用原始查询进行召回
-
-        rag_logger.info(f"--- [TIME] 开始并行召回 for {len(queries_to_process)} queries at {time.time() - start_time_total:.2f}s ---")
-        start_time_retrieval = time.time()
-
-        for current_query_text in queries_to_process:
-            rag_logger.info(f"Processing retrievals for query: '{current_query_text}'")
+        else: # 如果不需要澄清，则继续RAG流程
+            # --- 暂时禁用查询扩展 ---
+            rag_logger.info(f"--- 查询清晰，无需澄清。RAG流程将仅针对原始查询 '{query}' 执行 (查询扩展已暂时禁用) ---")
+            # start_time_expansion = time.time() # 注释掉
+            # expanded_queries = await generate_expanded_queries(query) # 注释掉
+            log_expanded_queries = [] # 将其设置为空列表，以便 finally 块中的日志记录
+            # rag_logger.info(f"--- 扩展查询列表 (共 {len(expanded_queries)} 个): {expanded_queries}. 耗时: {time.time() - start_time_expansion:.2f}s ---") # 注释掉
             
-            # 向量检索 (ChromaDB)
-            if app_ctx.chroma_retriever:
-                try:
-                    chroma_docs_raw = app_ctx.chroma_retriever.retrieve(query_text=current_query_text, n_results=top_k_vector)
-                    for doc_raw in chroma_docs_raw:
-                        all_raw_retrievals.append(
-                            RetrievedDocument(
+            all_raw_retrievals: List[RetrievedDocument] = []
+            
+            queries_to_process = [query] # <--- 修改：只处理原始查询
+            rag_logger.info(f"--- [TIME] 开始并行召回 for 1 query (original query only) at {time.time() - start_time_total:.2f}s ---")
+            start_time_retrieval = time.time()
+
+            for current_query_text in queries_to_process:
+                rag_logger.info(f"Processing retrievals for query: '{current_query_text}'")
+                
+                # 向量检索 (ChromaDB)
+                if app_ctx.chroma_retriever:
+                    try:
+                        chroma_docs_raw = app_ctx.chroma_retriever.retrieve(query_text=current_query_text, n_results=top_k_vector)
+                        rag_logger.debug(f"  ChromaDB for '{current_query_text}' raw output: {chroma_docs_raw}") # <--- 新增详细日志
+                        for doc_raw in chroma_docs_raw:
+                            retrieved_doc = RetrievedDocument(
                                 source_type="vector_chroma",
                                 content=doc_raw.get("text", ""),
                                 score=doc_raw.get("score", 0.0),
-                                metadata={**doc_raw.get("metadata", {}), "original_query_part": current_query_text} # 添加原始查询部分
+                                metadata={**doc_raw.get("metadata", {}), "original_query_part": current_query_text}
                             )
-                        )
-                    rag_logger.info(f"  ChromaDB for '{current_query_text}': found {len(chroma_docs_raw)} docs.")
-                except Exception as e_chroma:
-                    rag_logger.error(f"  Error during ChromaDB retrieval for '{current_query_text}': {e_chroma}", exc_info=True)
-            
-            # 关键词检索 (BM25)
-            if app_ctx.file_bm25_retriever:
-                try:
-                    bm25_docs_raw = app_ctx.file_bm25_retriever.retrieve(query_text=current_query_text, n_results=top_k_bm25)
-                    # BM25只返回ID和分数，我们需要补充文本。
-                    # 策略：尝试从已有的ChromaDB召回结果中匹配ID补充文本，或标记为待补充。
-                    for doc_raw_bm25 in bm25_docs_raw:
-                        bm25_chunk_id = doc_raw_bm25.get("id")
-                        text_content_for_bm25 = f"[BM25: Text for ID {bm25_chunk_id} pending]"
-                        # 简单的补充逻辑：
-                        found_in_chroma = False
-                        for chroma_doc in all_raw_retrievals: # 检查已有的（主要是chroma的）
-                            if chroma_doc.metadata.get("chunk_id") == bm25_chunk_id or chroma_doc.metadata.get("id") == bm25_chunk_id : # ChromaDBRetriever的id是chunk_id
-                                text_content_for_bm25 = chroma_doc.content
-                                found_in_chroma = True
-                                break
-                        if not found_in_chroma and app_ctx.chroma_retriever: # 如果没找到，尝试从ChromaDB单独获取
-                            try:
-                                # 假设ChromaDB存储时ID就是chunk_id
-                                # get()方法返回更完整的文档信息
-                                specific_chroma_doc = app_ctx.chroma_retriever._collection.get(ids=[bm25_chunk_id], include=["metadatas"])
-                                if specific_chroma_doc and specific_chroma_doc.get("metadatas") and specific_chroma_doc.get("metadatas")[0]:
-                                    text_content_for_bm25 = specific_chroma_doc["metadatas"][0].get("chunk_text", text_content_for_bm25)
-                            except Exception as e_chroma_get:
-                                rag_logger.warning(f"  Failed to get text for BM25 ID {bm25_chunk_id} from Chroma: {e_chroma_get}")
-                                
-                        all_raw_retrievals.append(
-                            RetrievedDocument(
+                            all_raw_retrievals.append(retrieved_doc)
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
+                        rag_logger.info(f"  ChromaDB for '{current_query_text}': found {len(chroma_docs_raw)} docs.")
+                    except Exception as e_chroma:
+                        rag_logger.error(f"  Error during ChromaDB retrieval for '{current_query_text}': {e_chroma}", exc_info=True)
+                
+                # 关键词检索 (BM25)
+                if app_ctx.file_bm25_retriever:
+                    try:
+                        bm25_docs_raw = app_ctx.file_bm25_retriever.retrieve(query_text=current_query_text, n_results=top_k_bm25)
+                        rag_logger.debug(f"  BM25 for '{current_query_text}' raw output (IDs and scores): {bm25_docs_raw}") # <--- 新增详细日志
+                        for doc_raw_bm25 in bm25_docs_raw:
+                            bm25_chunk_id = doc_raw_bm25.get("id")
+                            text_content_for_bm25 = f"[BM25: Text for ID {bm25_chunk_id} pending]"
+                            found_in_chroma = False
+                            for existing_doc in all_raw_retrievals: 
+                                if (existing_doc.metadata and (existing_doc.metadata.get("chunk_id") == bm25_chunk_id or existing_doc.metadata.get("id") == bm25_chunk_id)):
+                                    text_content_for_bm25 = existing_doc.content
+                                    found_in_chroma = True
+                                    break
+                            if not found_in_chroma and app_ctx.chroma_retriever and bm25_chunk_id: 
+                                try:
+                                    specific_chroma_doc = app_ctx.chroma_retriever._collection.get(ids=[bm25_chunk_id], include=["metadatas"])
+                                    if specific_chroma_doc and specific_chroma_doc.get("metadatas") and specific_chroma_doc.get("metadatas")[0]:
+                                        text_content_for_bm25 = specific_chroma_doc["metadatas"][0].get("chunk_text", text_content_for_bm25)
+                                except Exception as e_chroma_get:
+                                    rag_logger.warning(f"  Failed to get text for BM25 ID {bm25_chunk_id} from Chroma: {e_chroma_get}")
+                            
+                            retrieved_doc = RetrievedDocument(
                                 source_type="keyword_bm25s",
                                 content=text_content_for_bm25,
                                 score=doc_raw_bm25.get("score", 0.0),
                                 metadata={"chunk_id": bm25_chunk_id, "original_query_part": current_query_text}
                             )
-                        )
-                    rag_logger.info(f"  BM25s for '{current_query_text}': found {len(bm25_docs_raw)} potential docs.")
-                except Exception as e_bm25:
-                    rag_logger.error(f"  Error during BM25 retrieval for '{current_query_text}': {e_bm25}", exc_info=True)
+                            all_raw_retrievals.append(retrieved_doc)
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
+                        rag_logger.info(f"  BM25s for '{current_query_text}': found {len(bm25_docs_raw)} potential docs.")
+                    except Exception as e_bm25:
+                        rag_logger.error(f"  Error during BM25 retrieval for '{current_query_text}': {e_bm25}", exc_info=True)
 
-            # 知识图谱检索 (Neo4j)
-            if app_ctx.kg_retriever:
-                try:
-                    rag_logger.info(f"  Performing KG retrieval for query: '{current_query_text}'") # 添加日志
-                    kg_docs = await app_ctx.kg_retriever.retrieve_with_llm_cypher(
-                        query=current_query_text, # <--- 修改这里
-                        top_k=top_k_kg
-                    )
-                    # retrieve_with_llm_cypher 已经返回 List[RetrievedDocument]
-                    for kg_doc in kg_docs: # 添加原始查询部分到元数据
-                        if kg_doc.metadata:
-                            kg_doc.metadata["original_query_part"] = current_query_text
-                        else:
-                            kg_doc.metadata = {"original_query_part": current_query_text}
-                    all_raw_retrievals.extend(kg_docs)
-                    rag_logger.info(f"  KG Retrieval for '{current_query_text}': found {len(kg_docs)} results.")
-                except Exception as e_kg:
-                    rag_logger.error(f"  Error during KG retrieval for '{current_query_text}': {e_kg}", exc_info=True)
-        
-        rag_logger.info(f"--- [TIME] 结束所有召回, 耗时: {time.time() - start_time_retrieval:.2f}s ---")
-        rag_logger.info(f"--- 总计从各路召回（所有查询处理后）的结果数: {len(all_raw_retrievals)} ---")
-        for i_doc, doc_retrieved in enumerate(all_raw_retrievals[:10]): # 日志只打印前10条
-            rag_logger.debug(f"  Raw Doc {i_doc}: type={doc_retrieved.source_type}, score={doc_retrieved.score}, content='{str(doc_retrieved.content)[:100]}...'")
-
-        if not all_raw_retrievals: 
-            # ... (无召回结果的处理，与您之前的代码类似) ...
-            response_payload = {
-                "status": "success", 
-                "final_answer": "抱歉，根据您提供的查询，未能从知识库中找到相关信息。",
-                "original_query": original_query_for_response,
-                "debug_info": {"message": "No documents retrieved from any source."}
-            }
-            final_json_output = json.dumps(response_payload, ensure_ascii=False)
-            sys.stdout.flush(); sys.stderr.flush()
-            return final_json_output
-
-        # --- 4. 结果融合与重排序 (使用FusionEngine) ---
-        rag_logger.info(f"--- [TIME] 开始结果融合与重排序 at {time.time() - start_time_total:.2f}s ---")
-        start_time_fusion = time.time()
-        if not app_ctx.fusion_engine:
-            rag_logger.error("FusionEngine not available! Skipping fusion and reranking.")
-            # 如果没有融合引擎，直接使用原始召回结果（可能需要截断和简单排序）
-            # 这里简化处理：直接取 all_raw_retrievals，按分数初排（如果分数可比）
-            # 或者只用向量检索结果
-            # 为了演示，我们假设至少需要向量结果，或者返回错误
-            final_context_docs = sorted(all_raw_retrievals, key=lambda d: d.score, reverse=True)[:top_k_final]
-        else:
-            # FusionEngine的 fuse_results 方法在您的代码中是异步的
-            final_context_docs = await app_ctx.fusion_engine.fuse_results(
-                all_raw_retrievals, 
-                original_query_for_response, # 传递原始查询给融合引擎
-                top_n_final=top_k_final # 传递最终需要的文档数
-            ) 
-        rag_logger.info(f"--- [TIME] 结束结果融合与重排序, 耗时: {time.time() - start_time_fusion:.2f}s. Final context docs: {len(final_context_docs)} ---")
-        
-        # --- 5. 准备上下文并生成答案 (与您之前的代码类似) ---
-        # 注意：您的FusionEngine.fuse_results 返回的是融合后的文本字符串，而不是RetrievedDocument列表
-        # 我们需要调整这里，或者调整FusionEngine使其返回RetrievedDocument列表
-        # 假设FusionEngine返回的是RetrievedDocument列表 (需要修改FusionEngine)
-        
-        if not final_context_docs: # 如果融合后没有文档
-            fused_context_text_for_llm = "未在知识库中找到相关信息。"
-            final_answer_from_llm = "根据现有知识，未能找到您查询的相关信息。"
-            response_payload = {
-                "status": "success",
-                "final_answer": final_answer_from_llm,
-                "original_query": original_query_for_response,
-                "debug_info": {"message": "No relevant context found after fusion."}
-            }
-        else:
-            # 假设 final_context_docs 是 List[RetrievedDocument]
-            context_strings_for_llm = [
-                f"Source Type: {doc.source_type}, Score: {doc.score:.4f}\nContent: {doc.content}" 
-                for doc in final_context_docs
-            ]
-            fused_context_text_for_llm = "\n\n---\n\n".join(context_strings_for_llm)
-
-            rag_logger.info(f"\n--- FUSED CONTEXT for LLM (length: {len(fused_context_text_for_llm)} chars) ---")
-            rag_logger.info(f"{fused_context_text_for_llm[:1000]}...") # 日志打印部分上下文
-            rag_logger.info(f"--- END OF FUSED CONTEXT ---\n")
-
-            rag_logger.info(f"--- [TIME] 开始最终答案生成 at {time.time() - start_time_total:.2f}s ---")
-            start_time_answer_gen = time.time()
-            final_answer_from_llm = await generate_answer_from_context(query, fused_context_text_for_llm)
-            rag_logger.info(f"--- [TIME] 结束最终答案生成, 耗时: {time.time() - start_time_answer_gen:.2f}s ---")
-
-            if not final_answer_from_llm or final_answer_from_llm.strip() == NO_ANSWER_PHRASE_ANSWER_CLEAN:
-                final_answer_from_llm = "根据您提供的信息，我暂时无法给出明确的回答。"
+                # 知识图谱检索
+                if app_ctx.kg_retriever:
+                    try:
+                        rag_logger.info(f"  Performing KG retrieval for query: '{current_query_text}'")
+                        kg_docs = await app_ctx.kg_retriever.retrieve_with_llm_cypher(query=current_query_text, top_k=top_k_kg)
+                        rag_logger.debug(f"  KG for '{current_query_text}' raw output: {kg_docs}") # <--- 新增详细日志
+                        for kg_doc_data in kg_docs: # kg_docs is List[Dict], needs conversion
+                            retrieved_doc = RetrievedDocument(**kg_doc_data) # Convert dict to Pydantic model
+                            if retrieved_doc.metadata:
+                                retrieved_doc.metadata["original_query_part"] = current_query_text
+                            else:
+                                retrieved_doc.metadata = {"original_query_part": current_query_text}
+                            all_raw_retrievals.append(retrieved_doc)
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
+                        rag_logger.info(f"  KG Retrieval for '{current_query_text}': found {len(kg_docs)} results.")
+                    except Exception as e_kg:
+                        rag_logger.error(f"  Error during KG retrieval for '{current_query_text}': {e_kg}", exc_info=True)
             
-            response_payload = {
-                "status": "success",
-                "final_answer": final_answer_from_llm,
-                "original_query": original_query_for_response,
-                "retrieved_context_docs": [doc.model_dump() for doc in final_context_docs], # 返回用于生成答案的文档
-                "debug_info": {"total_raw_retrievals_count": len(all_raw_retrievals)}
-            }
+            rag_logger.info(f"--- [TIME] 结束所有召回, 耗时: {time.time() - start_time_retrieval:.2f}s ---")
+            rag_logger.info(f"--- 总计从各路召回（所有查询处理后）的结果数: {len(all_raw_retrievals)} ---")
+            if all_raw_retrievals:
+                for i_doc, doc_retrieved in enumerate(all_raw_retrievals[:3]): # 日志只打印前3条摘要
+                     rag_logger.debug(f"  Raw Doc {i_doc} (Summary): type={doc_retrieved.source_type}, score={doc_retrieved.score}, content='{str(doc_retrieved.content)[:50]}...'")
 
-        # --- 添加顶层RAG交互日志记录 (新添加) ---
-        if response_payload.get("status") == "success" and final_answer_from_llm and final_context_docs:
-            try:
-                context_content_for_hash = " ".join(sorted([doc.content for doc in final_context_docs]))
-                context_hash = hashlib.md5(context_content_for_hash.encode('utf-8')).hexdigest()
-                current_app_version = "0.1.0" # 假设的应用版本，后续可以从配置读取
-
-                top_level_rag_log_data = {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "interaction_id": str(uuid.uuid4()),
-                    "task_type": "rag_query_processing_success",
-                    "user_query": original_query_for_response,
-                    "processed_llm_output": final_answer_from_llm, # RAG的最终答案
-                    "retrieved_context_hash": context_hash,
-                    "retrieved_documents_summary": [ # 摘要信息
-                        {"source": doc.source_type, "score": doc.score, "id": doc.metadata.get("chunk_id") if doc.metadata else doc.metadata.get("id") if doc.metadata else None, "content_preview": doc.content[:50] + "..." if doc.content else ""}
+            if not all_raw_retrievals: 
+                response_payload = {
+                    "status": "success", 
+                    "final_answer": "抱歉，根据您提供的查询，未能从知识库中找到相关信息。",
+                    "original_query": original_query_for_response,
+                    "retrieved_context_docs": [], # <--- 确保即使没有结果也返回空列表
+                    "debug_info": {"message": "No documents retrieved from any source."}
+                }
+                # final_json_output = json.dumps(response_payload, ensure_ascii=False) # 移到 finally 外部
+                # return final_json_output # 移到 finally 外部
+            else:
+                rag_logger.info(f"--- [TIME] 开始结果融合与重排序 at {time.time() - start_time_total:.2f}s ---")
+                start_time_fusion = time.time()
+                if not app_ctx.fusion_engine:
+                    rag_logger.error("FusionEngine not available! Skipping fusion and reranking.")
+                    final_context_docs = sorted(all_raw_retrievals, key=lambda d: d.score if d.score is not None else -float('inf'), reverse=True)[:top_k_final]
+                else:
+                    final_context_docs = await app_ctx.fusion_engine.fuse_results(
+                        all_raw_retrievals, 
+                        original_query_for_response,
+                        top_n_final=top_k_final
+                    ) 
+                log_final_context_docs_summary = [doc.model_dump() for doc in final_context_docs] # <--- 记录日志
+                rag_logger.info(f"--- [TIME] 结束结果融合与重排序, 耗时: {time.time() - start_time_fusion:.2f}s. Final context docs: {len(final_context_docs)} ---")
+                if final_context_docs:
+                    for i_fdoc, fdoc_retrieved in enumerate(final_context_docs[:3]): # 日志只打印前3条摘要
+                        rag_logger.debug(f"  Fused Doc {i_fdoc} (Summary): type={fdoc_retrieved.source_type}, score={fdoc_retrieved.score}, content='{str(fdoc_retrieved.content)[:50]}...'")
+                
+                if not final_context_docs: 
+                    fused_context_text_for_llm = "未在知识库中找到相关信息。"
+                    final_answer_from_llm = "根据现有知识，未能找到您查询的相关信息。"
+                    response_payload = {
+                        "status": "success",
+                        "final_answer": final_answer_from_llm,
+                        "original_query": original_query_for_response,
+                        "retrieved_context_docs": [], # <--- 确保空列表
+                        "debug_info": {"message": "No relevant context found after fusion."}
+                    }
+                else:
+                    context_strings_for_llm = [
+                        f"Source Type: {doc.source_type}, Score: {doc.score:.4f if doc.score is not None else 'N/A'}\nContent: {doc.content}" 
                         for doc in final_context_docs
-                    ],
-                    "retrieved_context_docs": [doc.model_dump() for doc in final_context_docs], # <<<--- 添加这一行，存储完整的上下文文档
-                    "final_context_docs_count": len(final_context_docs),
-                    "application_version": current_app_version
-                }
-                # await log_interaction_data(top_level_rag_log_data) # 如果已经改成通用日志函数
-                rag_logger.info(f"TOP_LEVEL_RAG_SUCCESS_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
-                await log_interaction_data(top_level_rag_log_data)
-            except Exception as e_log_rag:
-                rag_logger.error(f"Error during top-level RAG success logging: {e_log_rag}", exc_info=True)
-        elif response_payload.get("status") == "clarification_needed":
-            try:
-                current_app_version = "0.1.0"
-                top_level_rag_log_data = {
-                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                    "interaction_id": str(uuid.uuid4()),
-                    "task_type": "rag_clarification_needed",
-                    "user_query": original_query_for_response,
-                    "clarification_question": response_payload.get("clarification_question"),
-                    "uncertainty_reason": response_payload.get("debug_info", {}).get("uncertainty_reason"),
-                    "application_version": current_app_version
-                }
-                # rag_logger.info(f"TOP_LEVEL_RAG_CLARIFICATION_LOG: {json.dumps(top_level_rag_log_data, ensure_ascii=False)}")
-                await log_interaction_data(top_level_rag_log_data)
-            except Exception as e_log_clarify:
-                rag_logger.error(f"Error during top-level RAG clarification logging: {e_log_clarify}", exc_info=True)
-        # --- 结束顶层RAG交互日志记录 ---
+                    ]
+                    fused_context_text_for_llm = "\n\n---\n\n".join(context_strings_for_llm)
+                    log_fused_context_text_for_llm_snippet = fused_context_text_for_llm[:500] # <--- 记录日志
 
+                    rag_logger.info(f"\n--- FUSED CONTEXT for LLM (length: {len(fused_context_text_for_llm)} chars) ---")
+                    rag_logger.info(f"{fused_context_text_for_llm[:1000]}...") 
+                    rag_logger.info(f"--- END OF FUSED CONTEXT ---\n")
+
+                    rag_logger.info(f"--- [TIME] 开始最终答案生成 at {time.time() - start_time_total:.2f}s ---")
+                    start_time_answer_gen = time.time()
+                    final_answer_from_llm = await generate_answer_from_context(query, fused_context_text_for_llm)
+                    log_final_answer_from_llm = final_answer_from_llm or "N/A" # <--- 记录日志
+                    rag_logger.info(f"--- [TIME] 结束最终答案生成, 耗时: {time.time() - start_time_answer_gen:.2f}s ---")
+
+                    if not final_answer_from_llm or final_answer_from_llm.strip() == NO_ANSWER_PHRASE_ANSWER_CLEAN:
+                        final_answer_from_llm = "根据您提供的信息，我暂时无法给出明确的回答。"
+                    
+                    response_payload = {
+                        "status": "success",
+                        "final_answer": final_answer_from_llm,
+                        "original_query": original_query_for_response,
+                        "retrieved_context_docs": [doc.model_dump() for doc in final_context_docs], 
+                        "debug_info": {"total_raw_retrievals_count": len(all_raw_retrievals)}
+                    }
+
+        # 日志记录统一移到 finally 块之前
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
-        rag_logger.info(f"--- 'query_rag_v2' 成功执行完毕, 总耗时: {time.time() - start_time_total:.2f}s. 返回JSON响应 ---")
+        rag_logger.info(f"--- 'query_rag_v2' 逻辑执行完毕, 总耗时: {time.time() - start_time_total:.2f}s. ---")
         
-        sys.stdout.flush(); sys.stderr.flush() #确保在 try 块内，return 前
-        return final_json_output
-
     except Exception as e_main:
         rag_logger.error(f"RAG Service CRITICAL ERROR in 'query_rag_v2' (main try-except): {type(e_main).__name__} - {str(e_main)}", exc_info=True)
-        
-        # 确保 original_query_for_response 在此作用域内有效
-        # 如果 query_rag_v2 的参数就是 query，且 original_query_for_response 在 try 开始时被赋值为 query
         user_query_for_err_log = original_query_for_response if 'original_query_for_response' in locals() and original_query_for_response else query
-        
         response_payload = {
             "status": "error",
             "error_code": "RAG_SERVICE_INTERNAL_ERROR",
@@ -448,31 +394,57 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
             "original_query": user_query_for_err_log,
             "debug_info": {"exception_type": type(e_main).__name__}
         }
-
-        # --- 添加顶层RAG错误日志记录 ---
-        try:
-            current_app_version = "0.1.0"
-            top_level_rag_error_log_data = {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "interaction_id": str(uuid.uuid4()),
-                "task_type": "rag_query_processing_error",
-                "user_query": user_query_for_err_log,
-                "error_message": str(e_main),
-                "error_type": type(e_main).__name__,
-                "traceback": traceback.format_exc(),
-                "application_version": current_app_version
-            }
-            # rag_logger.info(f"TOP_LEVEL_RAG_ERROR_LOG: {json.dumps(top_level_rag_error_log_data, ensure_ascii=False)}")
-            await log_interaction_data(top_level_rag_error_log_data)
-        except Exception as e_log_err_inner:
-            rag_logger.error(f"CRITICAL: Error during top-level RAG error logging itself: {e_log_err_inner}", exc_info=True)
-        # --- 结束顶层RAG错误日志记录 ---
-
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
-    sys.stdout.flush(); sys.stderr.flush()
+    finally: # --- [新增 finally 块用于统一日志记录] ---
+        interaction_id_for_log = str(uuid.uuid4())
+        current_app_version = "zhz_rag_mcp_service_0.2.0" # 可以从配置读取
+        
+        # 收集所有日志信息
+        full_log_entry = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "interaction_id": interaction_id_for_log,
+            "task_type": "rag_query_processing_full_log", # 新的task_type
+            "app_version": current_app_version,
+            "original_user_query": original_query_for_response,
+            "query_params": {
+                "top_k_vector": top_k_vector, "top_k_kg": top_k_kg, 
+                "top_k_bm25": top_k_bm25, "top_k_final": top_k_final
+            },
+            "intent_classification_result": log_intent_classification_result,
+            "expanded_queries": log_expanded_queries,
+            "all_raw_retrievals_count": len(log_all_raw_retrievals_summary),
+            # "all_raw_retrievals_summary": log_all_raw_retrievals_summary, # 可能过长，先注释
+            "final_context_docs_count": len(log_final_context_docs_summary),
+            "final_context_docs_summary": [ # 只记录摘要
+                {"source": doc.get("source_type"), "score": doc.get("score"), "id": doc.get("metadata",{}).get("chunk_id") or doc.get("metadata",{}).get("id"), "content_preview": str(doc.get("content",""))[:50]+"..."} 
+                for doc in log_final_context_docs_summary[:5] # 最多记录5条摘要
+            ], 
+            # "final_context_docs_full": log_final_context_docs_summary, # 完整版，可能过长，先注释
+            "fused_context_text_for_llm_snippet": log_fused_context_text_for_llm_snippet,
+            "final_answer_from_llm": log_final_answer_from_llm,
+            "final_response_payload_status": response_payload.get("status"),
+            "total_processing_time_seconds": round(time.time() - start_time_total, 2),
+        }
+        if response_payload.get("status") == "error":
+            full_log_entry["error_details_in_response"] = {
+                "error_code": response_payload.get("error_code"),
+                "error_message": response_payload.get("error_message"),
+                "exception_type": response_payload.get("debug_info",{}).get("exception_type")
+            }
+            full_log_entry["raw_traceback_if_available_in_service"] = traceback.format_exc() if 'e_main' in locals() else "No exception caught in main block or e_main not available."
+
+
+        try:
+            await log_interaction_data(full_log_entry) # 使用通用的日志函数
+            rag_logger.info(f"Full RAG interaction log (ID: {interaction_id_for_log}) has been written.")
+        except Exception as e_log_final:
+            rag_logger.error(f"CRITICAL: Failed to write full RAG interaction log: {e_log_final}", exc_info=True)
+        
+        sys.stdout.flush(); sys.stderr.flush() # 确保所有打印输出
+        # --- [结束 finally 块] ---
+    
     return final_json_output
 
 if __name__ == "__main__":
-    # 只保留这一行，用于通过 mcpo 启动或直接运行此服务文件
     rag_logger.info("--- Starting RAG Service (FastMCP for mcpo via direct run) ---")
     rag_mcp_application.run()

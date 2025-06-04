@@ -12,24 +12,21 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime 
 
-# --- CrewAI ---
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
+service_logger = logging.getLogger(__name__)
+
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import BaseTool
 
-# --- 自定义模块导入 ---
 from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
-
-# --- 导入我们新创建的工具 ---
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
 from core.tools.search_tool import WebSearchTool
 
-# --- 配置 ---
 AGENT_SERVICE_PORT = int(os.getenv("AGENT_SERVICE_PORT", 8090))
 AGENT_SERVICE_HOST = "0.0.0.0"
 
-# --- Pydantic 模型定义 ---
-# 沿用之前的 AgentTaskRequest 和 AgentTaskResponse
 class AgentTaskRequest(BaseModel):
     user_query: str = Field(description="用户的原始文本查询。")
 
@@ -42,7 +39,6 @@ class AgentTaskResponse(BaseModel):
     debug_info: Optional[Dict[str, Any]] = Field(None, description="包含执行过程中的调试信息。")
     token_usage: Optional[Dict[str, Any]] = Field(None, description="LLM token 使用情况统计。")
 
-# 与 zhzai-agent/models.py 中 SubTaskDefinition 一致的结构，用于 Manager Agent 的输出
 class SubTaskDefinitionForManagerOutput(BaseModel):
     task_description: str = Field(description="用户的原始请求原文。")
     reasoning_for_plan: Optional[str] = Field(None, description="Manager Agent的决策思考过程。")
@@ -51,58 +47,28 @@ class SubTaskDefinitionForManagerOutput(BaseModel):
     tool_input_args: Optional[Dict[str, Any]] = Field(None, description="如果选择使用非Excel工具，这里是传递给该工具的参数。")
     excel_sqo_payload: Optional[List[Dict[str, Any]]] = Field(None, description="如果选择使用Excel工具，这里是SQO操作字典的列表。")
 
-
-# --- 全局变量 ---
 manager_llm: Optional[CustomLiteLLMWrapper] = None
 worker_llm: Optional[CustomLiteLLMWrapper] = None
 manager_agent_instance: Optional[Agent] = None
 worker_agent_instance: Optional[Agent] = None
+core_tools_instances: List[BaseTool] = []
 
-core_tools_instances: List[BaseTool] = [] # BaseTool 是 CrewAI 工具的基类
-
-# 我们新的核心工具名称 (与 zhzai-agent 不同)
 CORE_TOOLS_ZHZ_AGENT = {
     "enhanced_rag_tool": "【核心RAG工具】用于从本地知识库查找信息、回答复杂问题，整合了向量、关键词和图谱检索。",
     "excel_operation_tool": "【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。",
     "web_search_tool": "【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。"
 }
 CORE_TOOL_NAMES_LIST = list(CORE_TOOLS_ZHZ_AGENT.keys())
-
-# 将工具描述格式化为字符串，供Manager Prompt使用
 TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
     [f"- '{name}': {desc}" for name, desc in CORE_TOOLS_ZHZ_AGENT.items()]
 )
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager_llm, worker_llm, manager_agent_instance, worker_agent_instance, core_tools_instances
     print("--- Agent Orchestrator Service: Lifespan startup ---")
 
-    # --- 步骤 1: 初始化 LLM 实例 (保持不变) ---
-    print("Initializing LLM instances...")
-    try:
-        gemini_tool_config = {"function_calling_config": {"mode": "AUTO"}}
-        manager_llm = get_llm_instance(
-            llm_type="cloud_gemini", temperature=0.1, max_tokens=4096, tool_config=gemini_tool_config
-        )
-        if not manager_llm:
-            print("Failed to initialize Manager LLM (Cloud Gemini). Attempting fallback...")
-            manager_llm = get_llm_instance(
-                llm_type="local_qwen", temperature=0.1, max_tokens=3072, tool_config=gemini_tool_config
-            )
-        
-        worker_llm = get_llm_instance(llm_type="local_qwen", temperature=0.6, max_tokens=3072)
-
-        if manager_llm: print(f"Manager LLM initialized: {manager_llm.model_name}")
-        else: print("CRITICAL: Failed to initialize Manager LLM.")
-        if worker_llm: print(f"Worker LLM initialized: {worker_llm.model_name}")
-        else: print("CRITICAL: Failed to initialize Worker LLM.")
-    except Exception as e:
-        print(f"FATAL ERROR during LLM initialization: {e}", exc_info=True)
-        manager_llm = None; worker_llm = None
-
-    # --- 步骤 2: 初始化核心工具实例 ---
+    # --- [正确顺序] 步骤 1: 初始化核心工具实例 ---
     print("Initializing core tool instances...")
     try:
         enhanced_rag_tool_instance = EnhancedRAGTool()
@@ -115,44 +81,88 @@ async def lifespan(app: FastAPI):
             web_search_tool_instance,
         ]
         print(f"Core tools initialized: {[tool.name for tool in core_tools_instances]}")
+        # --- 我们的 DEBUG 日志 ---
+        print(f"DEBUG LIFESPAN: core_tools_instances type: {type(core_tools_instances)}")
+        if core_tools_instances:
+            print(f"DEBUG LIFESPAN: core_tools_instances length: {len(core_tools_instances)}")
+            for idx, tool_item in enumerate(core_tools_instances):
+                tool_name_attr = getattr(tool_item, 'name', 'Name_Attribute_Missing')
+                print(f"DEBUG LIFESPAN: Tool {idx} - Type: {type(tool_item)}, Name: {tool_name_attr}")
+        else:
+            print("DEBUG LIFESPAN: core_tools_instances is empty or None after initialization attempt.")
+        # --- 结束 DEBUG 日志 ---
     except Exception as e:
         print(f"ERROR during core tool initialization: {e}", exc_info=True)
-        core_tools_instances = []
+        core_tools_instances = [] # 如果工具初始化失败，确保它是空列表
 
-    # 初始化 Agent 实例
+    # --- [正确顺序] 步骤 2: 初始化 LLM 实例 (现在 core_tools_instances 已经有值了) ---
+    print("Initializing LLM instances...")
+    try:
+        gemini_tool_config = {"function_calling_config": {"mode": "AUTO"}}
+        manager_llm = get_llm_instance(
+            llm_type="cloud_gemini", 
+            temperature=0.1, 
+            max_tokens=4096, 
+            tool_config=gemini_tool_config,
+            agent_tools=core_tools_instances # <--- 现在 core_tools_instances 是有值的
+        )
+        if not manager_llm:
+            print("Failed to initialize Manager LLM (Cloud Gemini). Attempting fallback...")
+            manager_llm = get_llm_instance(
+                llm_type="local_qwen", 
+                temperature=0.1, 
+                max_tokens=3072, 
+                tool_config=gemini_tool_config,
+                agent_tools=core_tools_instances # <--- fallback 时也传递
+            )
+        
+        print("Initializing Worker LLM (attempting Cloud Gemini first)...")
+        worker_gemini_tool_config = {"function_calling_config": {"mode": "AUTO"}} 
+        worker_llm = get_llm_instance(
+            llm_type="cloud_gemini", 
+            temperature=0.5, 
+            max_tokens=3072,
+            tool_config=worker_gemini_tool_config,
+            agent_tools=core_tools_instances # <--- 现在 core_tools_instances 是有值的
+        )
+        if not worker_llm:
+            print("Failed to initialize Worker LLM (Cloud Gemini). Attempting fallback to local_qwen...")
+            worker_llm = get_llm_instance(
+                llm_type="local_qwen", 
+                temperature=0.6, 
+                max_tokens=3072,
+                agent_tools=core_tools_instances # <--- fallback 时也传递
+            )
+
+        if manager_llm: print(f"Manager LLM initialized: {manager_llm.model_name}")
+        else: print("CRITICAL: Failed to initialize Manager LLM.")
+        if worker_llm: print(f"Worker LLM initialized: {worker_llm.model_name}")
+        else: print("CRITICAL: Failed to initialize Worker LLM.")
+    except Exception as e:
+        print(f"FATAL ERROR during LLM initialization: {e}") 
+        traceback.print_exc() 
+        manager_llm = None; worker_llm = None
+
+    # --- [正确顺序] 步骤 3: 初始化 Agent 实例 ---
+    # (这部分代码不变，它依赖于 manager_llm, worker_llm, 和 core_tools_instances)
     if manager_llm:
         manager_agent_instance = Agent(
             role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
             goal=f"""【深入理解并分解】用户提出的复杂请求 (当前请求将通过任务描述提供) 成为一系列逻辑子任务。
-【核心决策1 - 优先自主回答】：在选择任何工具之前，请首先判断你是否能基于自身知识库和推理能力【直接回答】用户的全部或核心部分请求。如果可以，你的主要输出应是包含直接答案的JSON。
-【核心决策2 - Excel复杂查询处理】：如果用户的请求涉及到对Excel文件进行一个或多个复杂的数据查询、筛选、聚合或排序等操作，并且你无法直接回答，你【必须】选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}" 工具。并且，你【必须】为这些Excel操作【构建一个结构化查询对象 (SQO) 的JSON列表】，并将其作为输出JSON中 `excel_sqo_payload` 字段的值。列表中的【每一个SQO字典】都需要包含一个明确的 "operation_type" 和该操作对应的参数，但【不要包含 "file_path" 或 "sheet_name"】。
-【核心决策3 - 其他工具选择】：如果需要从本地知识库获取深度信息，选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('enhanced_rag_tool')]}"。如果需要网络实时信息，选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('web_search_tool')]}"。选择工具后，你需要准备好传递给该工具的参数，并将其放在输出JSON的 `tool_input_args` 字段中。
-【核心决策4 - 通用请求/无适用工具】：如果用户请求是生成通用文本、编写简单代码、回答一般性知识问题，并且你已判断可以【直接回答】，则无需选择任何特定功能性工具。此时输出JSON中 `selected_tool_names` 应为空列表，`excel_sqo_payload` 和 `tool_input_args` 为null，答案内容在 `direct_answer_content` 字段。
-
-最终，【严格按照指定的JSON格式】（即符合 `SubTaskDefinitionForManagerOutput` Pydantic模型）输出一个包含你的决策理由、用户原始请求、以及根据你的决策填充的 `direct_answer_content` 或 `selected_tool_names`、`tool_input_args`、`excel_sqo_payload` 的对象。
-
-【可供选择的本系统核心工具及其描述】:
+# ... (manager_agent_instance 的 goal 和 backstory 不变) ...
 {TOOL_OPTIONS_STR_FOR_MANAGER}
 """,
             backstory="""我是一位经验丰富的AI任务调度官和数据查询规划专家。我的核心工作流程如下：
-1.  **【深度理解与CoD规划 (内部进行)】**：我会对用户请求进行彻底分析，优先判断是否能直接利用我的知识库和推理能力给出完整答案。
-2.  **【工具选择与参数准备（如果无法直接回答）】**：
-    a.  **Excel复杂查询**: 当识别出需要对Excel执行复杂操作时，我选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}" 工具，并为其生成包含多个SQO操作定义的【JSON列表】作为 `excel_sqo_payload`。每个SQO包含 `operation_type` 和所需参数，但不含 `file_path` 或 `sheet_name`。
-    b.  **RAG查询**: 若需从知识库获取信息，选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('enhanced_rag_tool')]}"，并准备 `tool_input_args`（例如 `{{ "query": "用户原始问题", "top_k_vector": 5, ... }}`）。
-    c.  **网络搜索**: 若需实时网络信息，选择 "{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('web_search_tool')]}"，并准备 `tool_input_args`（例如 `{{ "query": "搜索关键词" }}`）。
-    d.  **最简必要原则**: 只选择绝对必要的工具。
-3.  **【严格的输出格式】**: 我的唯一输出是一个JSON对象，该对象必须符合本服务定义的 `SubTaskDefinitionForManagerOutput` Pydantic模型结构，包含 `task_description` (用户原始请求), `reasoning_for_plan`, 以及根据决策填充的 `selected_tool_names` (可为空), `direct_answer_content` (如果直接回答), `tool_input_args` (如果使用非Excel工具), 和 `excel_sqo_payload` (如果使用Excel工具)。
-
+# ... (manager_agent_instance 的 backstory 不变) ...
 我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。""",
             llm=manager_llm,
             verbose=True,
             allow_delegation=False,
-            tools=[]
+            tools=[] # Manager Agent 不直接使用工具执行
         )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
 
     if worker_llm:
-        # Worker Agent 现在拥有所有核心工具
         worker_agent_instance = Agent(
             role='任务执行专家 (Task Execution Expert)',
             goal="根据Manager分配的具体任务描述和指定的工具，高效地执行任务并提供结果。",
@@ -162,19 +172,20 @@ async def lifespan(app: FastAPI):
             llm=worker_llm,
             verbose=True,
             allow_delegation=False,
-            tools=core_tools_instances # <--- 将实例化的工具列表传递给 Worker Agent
+            tools=core_tools_instances # <--- Worker Agent 使用核心工具
         )
         print(f"Worker Agent initialized with LLM: {worker_llm.model_name} and tools: {[t.name for t in core_tools_instances]}")
 
     if not manager_agent_instance or not worker_agent_instance:
         print("CRITICAL: One or more core agents failed to initialize. Service functionality will be severely limited.")
-    elif not core_tools_instances and worker_agent_instance : # 如果 Worker Agent 初始化了但没有工具
+    elif not core_tools_instances and worker_agent_instance : 
         print("WARNING: Worker Agent initialized, but no core tools were successfully instantiated. Tool-based tasks will fail.")
+
 
     print("--- Agent Orchestrator Service: Lifespan startup complete ---")
     yield
     print("--- Agent Orchestrator Service: Lifespan shutdown ---")
-
+    
 app = FastAPI(
     title="Agent Orchestrator Service",
     description="接收用户请求，通过Manager/Worker Agent模型进行任务规划和执行。",

@@ -58,29 +58,45 @@ def get_cloud_gemini_llm(
     tool_config: Optional[dict] = None  # Gemini 风格的 tool_config
 ) -> Optional[CustomLiteLLMWrapper]:
     """
-    获取配置好的云端 Gemini LLM 实例 (CrewAI 兼容)，通过 LiteLLM 网关调用。
-    如果网关未配置，则返回 None。
+    获取配置好的云端 Gemini LLM 实例 (CrewAI 兼容)。
+    如果 CLOUD_LITELLM_GW_API_BASE 未配置，则尝试直接调用 Gemini (api_base=None)。
     """
     temp = temperature if temperature is not None else DEFAULT_TEMPERATURE_CLOUD
     mt = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS_CLOUD
 
-    print(f"LLM Manager: Creating Cloud Gemini LLM instance via Gateway.")
-    print(f"  Model: {GEMINI_MODEL_NAME_FOR_LITELLM}, Gateway API Base: {CLOUD_LITELLM_GW_API_BASE}")
+    actual_gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    gateway_specific_key = CLOUD_LITELLM_GATEWAY_API_KEY # 这个是网关本身的key
+
+    print(f"LLM Manager: Preparing Cloud Gemini LLM instance.")
+    print(f"  Model: {GEMINI_MODEL_NAME_FOR_LITELLM}")
+    print(f"  Gateway API Base from env: {CLOUD_LITELLM_GW_API_BASE}")
     print(f"  Temp: {temp}, Max Tokens: {mt}")
 
-    if CLOUD_LITELLM_GW_API_BASE == "YOUR_CLOUD_LITELLM_GATEWAY_URL_HERE/v1":
-        print("LLM Manager WARNING: CLOUD_LITELLM_GW_API_BASE is not configured. Cannot create cloud LLM instance.")
-        return None
-    
+    effective_api_base = CLOUD_LITELLM_GW_API_BASE
+    key_to_use = gateway_specific_key # 默认使用网关key
+
+    if CLOUD_LITELLM_GW_API_BASE == "YOUR_CLOUD_LITELLM_GATEWAY_URL_HERE/v1" or not CLOUD_LITELLM_GW_API_BASE:
+        print("LLM Manager INFO: CLOUD_LITELLM_GW_API_BASE is not configured or is a placeholder. Will attempt direct Gemini call with api_base=None.")
+        effective_api_base = None # 对于 LiteLLM 直接调用 Gemini，api_base 应为 None
+        key_to_use = actual_gemini_api_key # 直接调用 Gemini 时，使用 Gemini 的 API Key
+        if not key_to_use:
+            print("LLM Manager WARNING: GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. Direct Gemini calls will likely fail.")
+            # 即使 key 未设置，我们仍然返回实例，让 LiteLLM 尝试并可能在调用时失败
+    else:
+        # 如果配置了网关，则使用网关的key（如果网关需要key的话）
+        print(f"LLM Manager INFO: Using configured CLOUD_LITELLM_GW_API_BASE: {effective_api_base}")
+        key_to_use = gateway_specific_key
+
+
     return CustomLiteLLMWrapper(
         model=GEMINI_MODEL_NAME_FOR_LITELLM,
-        api_base=CLOUD_LITELLM_GW_API_BASE,
-        api_key=CLOUD_LITELLM_GATEWAY_API_KEY, # 网关本身可能需要的 key
-        # custom_llm_provider 在通过网关调用时通常不需要，除非网关本身是 OpenAI 兼容的代理
+        api_base=effective_api_base,
+        api_key=key_to_use, # 使用根据情况选择的 API Key
         temperature=temp,
         max_tokens=mt,
         agent_tools=agent_tools,
         tool_config=tool_config
+        # custom_llm_provider 对于直接调用 gemini/ 模型通常不需要显式设置，LiteLLM 会识别
     )
 
 # --- (可选) 一个选择 LLM 的辅助函数 ---
