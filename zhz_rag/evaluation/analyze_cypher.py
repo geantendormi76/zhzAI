@@ -4,6 +4,8 @@ import os
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from collections import Counter
+from datetime import datetime
+import glob 
 
 # --- 从项目中导入必要的模块 ---
 try:
@@ -196,52 +198,35 @@ def perform_cypher_evaluation_analysis(
         return False
 
 if __name__ == "__main__":
-    # --- Configuration for running the analysis ---
-    EVALUATION_NAME_FOR_CYPHER = "cypher_gemini_flash" # Must match the name used in batch_eval_cypher.py / evaluator.py
+    EVALUATION_NAME_FOR_CYPHER = "cypher_gemini_flash" 
 
-    # Try to find the latest log file for the given evaluation name
-    # This requires a naming convention for eval logs, e.g., eval_results_<name>_<date>.jsonl
-    # For simplicity, we'll construct a potential filename based on today's date,
-    # but in a real scenario, you might want a more robust way to find the latest.
+    eval_logs_pattern = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_*.jsonl")
+    all_eval_logs = sorted(glob.glob(eval_logs_pattern), key=os.path.getmtime, reverse=True)
     
-    # For demonstration, let's try to find a log from a recent specific date if today's doesn't exist.
-    # You might need to adjust this logic or manually specify the file.
-    
-    # We will try to use the file name you provided in the previous run's log:
-    # eval_results_cypher_gemini_flash_20250530.jsonl
-    # This assumes the "date" part of the filename is consistent.
-    
-    # Let's try to find the log file used in the last successful Cypher evaluation run (20250530)
-    # This is a placeholder, in a real system you might have a more robust way to get this.
-    target_date_str = "20250530" # From your previous successful run log
-    
-    log_file_name_cypher = f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_{target_date_str}.jsonl"
-    log_file_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, log_file_name_cypher)
+    log_file_path_cypher: Optional[str] = None
+    output_csv_path_cypher: Optional[str] = None
 
-    output_csv_name_cypher = f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{target_date_str}.csv"
-    output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_cypher)
+    if all_eval_logs:
+        log_file_path_cypher = all_eval_logs[0]
+        analyze_cypher_logger.info(f"Found latest Cypher evaluation log for analysis: {log_file_path_cypher}")
+        
+        base_log_name = os.path.basename(log_file_path_cypher)
+        if base_log_name.startswith(f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_") and base_log_name.endswith(".jsonl"):
+            date_part_from_filename = base_log_name[len(f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_"):-len(".jsonl")]
+            output_csv_name_cypher = f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{date_part_from_filename}.csv"
+            output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_cypher)
+        else:
+            today_str = datetime.now().strftime("%Y%m%d")
+            output_csv_name_cypher = f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{today_str}_fallback.csv"
+            output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_cypher)
+        analyze_cypher_logger.info(f"Analysis CSV report will be saved to: {output_csv_path_cypher}")
+    else:
+        analyze_cypher_logger.error(f"No Cypher evaluation log files found matching pattern: {eval_logs_pattern}")
 
-    if not os.path.exists(log_file_path_cypher):
-        analyze_cypher_logger.error(f"Cypher evaluation log file for analysis not found: {log_file_path_cypher}")
-        analyze_cypher_logger.info("Please ensure the filename and date match an existing evaluation log.")
-        # As a fallback, you could try finding the *absolute* latest eval log if the dated one isn't found,
-        # but that might not always be what you want.
-        # Example:
-        # eval_logs_pattern = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"eval_results_{EVALUATION_NAME_FOR_CYPHER}_*.jsonl")
-        # all_eval_logs = sorted(glob.glob(eval_logs_pattern), key=os.path.getmtime, reverse=True)
-        # if all_eval_logs:
-        #     log_file_path_cypher = all_eval_logs[0]
-        #     date_part_from_filename = os.path.basename(log_file_path_cypher).split('_')[-1].split('.')[0]
-        #     output_csv_path_cypher = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"analysis_{EVALUATION_NAME_FOR_CYPHER}_{date_part_from_filename}.csv")
-        #     analyze_cypher_logger.info(f"Falling back to latest available Cypher eval log: {log_file_path_cypher}")
-        # else:
-        #     analyze_cypher_logger.error(f"No Cypher evaluation logs found matching pattern: {eval_logs_pattern}")
-        #     log_file_path_cypher = None # Ensure it's None if no fallback
-    
-    if log_file_path_cypher and os.path.exists(log_file_path_cypher) : # Check again if fallback was attempted
+    if log_file_path_cypher and output_csv_path_cypher and os.path.exists(log_file_path_cypher):
         perform_cypher_evaluation_analysis(
             evaluation_log_filepath=log_file_path_cypher,
             output_csv_filepath=output_csv_path_cypher
         )
     else:
-        analyze_cypher_logger.info("Cypher evaluation analysis will not run as no suitable log file was identified.")
+        analyze_cypher_logger.info("Cypher evaluation analysis will not run as no suitable log file was identified or output path could not be determined.")
