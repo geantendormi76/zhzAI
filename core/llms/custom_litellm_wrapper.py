@@ -252,6 +252,18 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
             else:
                 logger.debug(f"  LiteLLM Raw Response (str): {str(response)[:500]}")
 
+            # --- 新增日志，检查原始的 usage ---
+            if hasattr(response, 'usage') and response.usage:
+                logger.info(f"  DEBUG USAGE (from LiteLLM response object): {response.usage}")
+                # 如果 response.usage 是 Pydantic 模型，可以尝试打印其字典形式
+                if hasattr(response.usage, 'model_dump'):
+                    logger.info(f"  DEBUG USAGE (dict): {response.usage.model_dump()}")
+                else:
+                    logger.info(f"  DEBUG USAGE (raw object): {response.usage}")
+            else:
+                logger.warning("  DEBUG USAGE: LiteLLM response object does not have .usage or it's empty.")
+            # --- 结束新增 ---
+
         except Exception as e:
             logger.error(f"LiteLLM completion call FAILED for model '{self.model_name}': {e}", exc_info=True) # <--- 修改日志
             return f"LLM_CALL_ERROR: 调用模型 '{self.model_name}' 失败: {str(e)}"

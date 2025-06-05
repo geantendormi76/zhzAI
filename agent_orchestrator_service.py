@@ -522,6 +522,7 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     
     worker_final_result: str = ""
     worker_crew_usage_metrics: Optional[Dict[str, Any]] = None # 用于存储 token usage
+    token_usage_for_response: Optional[Dict[str, Any]] = None # <--- 在这里初始化
     try:
         # --- [关键修改] 为 Worker Task 创建并运行一个 Crew ---
         worker_crew = Crew(
@@ -564,20 +565,40 @@ async def execute_task_endpoint(request: AgentTaskRequest):
         # 获取 Worker Crew 的 token usage
         if hasattr(worker_crew, 'usage_metrics'):
             worker_crew_usage_metrics = worker_crew.usage_metrics
-            print(f"Worker Crew token usage: {worker_crew_usage_metrics}")
-        # --- [结束关键修改] ---
+            print(f"DEBUG AGENT_ORCH: Raw worker_crew.usage_metrics object: {worker_crew_usage_metrics}")
+            print(f"DEBUG AGENT_ORCH: Type of worker_crew.usage_metrics: {type(worker_crew_usage_metrics)}")
+            if hasattr(worker_crew_usage_metrics, 'model_dump'):
+                print(f"DEBUG AGENT_ORCH: worker_crew.usage_metrics.model_dump(): {worker_crew_usage_metrics.model_dump()}")
+            elif isinstance(worker_crew_usage_metrics, dict):
+                    print(f"DEBUG AGENT_ORCH: worker_crew.usage_metrics (is dict): {worker_crew_usage_metrics}")
+            else:
+                print(f"DEBUG AGENT_ORCH: worker_crew.usage_metrics is not a dict and has no model_dump.")
+        else:
+            print("DEBUG AGENT_ORCH: worker_crew does not have usage_metrics attribute.")
+            worker_crew_usage_metrics = None # 确保它被定义
+            # --- [结束关键修改] ---
 
+            # 准备 token_usage_for_response
+            token_usage_for_response = None
+            if worker_crew_usage_metrics:
+                if hasattr(worker_crew_usage_metrics, 'model_dump'):
+                    token_usage_for_response = worker_crew_usage_metrics.model_dump()
+                elif isinstance(worker_crew_usage_metrics, dict):
+                    token_usage_for_response = worker_crew_usage_metrics
+                else:
+                    # 如果不是 Pydantic 模型或字典，尝试转换为字符串记录，但不作为结构化数据返回
+                    service_logger.warning(f"Unexpected type for worker_crew_usage_metrics: {type(worker_crew_usage_metrics)}. Will not be included in structured token_usage.")
 
         return AgentTaskResponse(
-        answer=worker_final_result,
-        status="success",
-        debug_info={
-            "manager_plan": manager_plan_object.model_dump(),
-            "worker_tool_used": selected_tool_name,
-            "worker_task_inputs": worker_task_inputs # 记录原始传递给 Worker Task 的输入
-        },
-        token_usage=worker_crew_usage_metrics.model_dump() if worker_crew_usage_metrics and hasattr(worker_crew_usage_metrics, 'model_dump') else worker_crew_usage_metrics if worker_crew_usage_metrics else None
-    )
+                answer=worker_final_result,
+                status="success",
+                debug_info={
+                    "manager_plan": manager_plan_object.model_dump(),
+                    "worker_tool_used": selected_tool_name,
+                    "worker_task_inputs": worker_task_inputs 
+                },
+                token_usage=token_usage_for_response # 使用处理后的 token_usage_for_response
+            )
 
     except Exception as e:
     # 使用 traceback 打印详细错误
