@@ -35,10 +35,14 @@ class EnhancedRAGTool(BaseTool):
         tool_path_on_mcp = f"{self.mcp_service_name}/{self.mcp_tool_path}"
         logger.critical(f"!!! EnhancedRAGTool._acall_mcp: ENTERING. Calling MCP endpoint '{tool_path_on_mcp}' with payload: {payload}")
         try:
-            # call_mcpo_tool 返回的是一个包装后的响应，格式为:
-            # {"success": True/False, "data": actual_tool_response_if_success, "error": error_msg_if_fail, ...}
             mcp_wrapper_response = await call_mcpo_tool(tool_path_on_mcp, payload)
-            logger.critical(f"!!! EnhancedRAGTool._acall_mcp: call_mcpo_tool RETURNED wrapper: {str(mcp_wrapper_response)[:500]}")
+
+             # --- 新增日志 ---
+            logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED from call_mcpo_tool - Type: {type(mcp_wrapper_response)}")
+            if isinstance(mcp_wrapper_response, dict):
+                logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED keys: {list(mcp_wrapper_response.keys())}")
+            logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED content preview: {str(mcp_wrapper_response)[:500]}")
+            # --- 结束新增日志 ---
             
             if isinstance(mcp_wrapper_response, dict) and mcp_wrapper_response.get("success") is True and "data" in mcp_wrapper_response:
                 # MCP 调用成功，现在获取 RAG 服务本身的响应数据

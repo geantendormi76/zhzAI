@@ -215,15 +215,26 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
             rag_logger.info(f"--- 需要澄清，返回: {response_payload}")
             # final_json_output will be set before finally block
 
-        else: # 如果不需要澄清，则继续RAG流程
-            # --- 暂时禁用查询扩展 ---
-            rag_logger.info(f"--- 查询清晰，无需澄清。RAG流程将仅针对原始查询 '{query}' 执行 (查询扩展已暂时禁用) ---")
-            log_expanded_queries = [] # 将其设置为空列表，以便 finally 块中的日志记录
+        else: 
+             # --- 启用查询扩展 ---
+            rag_logger.info(f"--- 查询清晰，无需澄清。将对原始查询 '{query}' 进行查询扩展 ---")
+            start_time_expansion = time.time()
+            expanded_queries = await generate_expanded_queries(query) # <--- 取消注释
+            log_expanded_queries = expanded_queries # <--- 记录实际的扩展查询
+            
+            if not expanded_queries or query not in expanded_queries: # 确保原始查询一定在里面
+                # 如果 generate_expanded_queries 返回空或不包含原始查询，至少处理原始查询
+                if query not in (expanded_queries or []): # 处理 expanded_queries 可能为 None 的情况
+                    expanded_queries = [query] + (expanded_queries or [])
+                elif not expanded_queries:
+                    expanded_queries = [query]
+
+            rag_logger.info(f"--- 扩展后的查询列表 (共 {len(expanded_queries)} 个): {expanded_queries}. 耗时: {time.time() - start_time_expansion:.2f}s ---")
             
             all_raw_retrievals: List[RetrievedDocument] = []
             
-            queries_to_process = [query] # <--- 修改：只处理原始查询
-            rag_logger.info(f"--- [TIME] 开始并行召回 for 1 query (original query only) at {time.time() - start_time_total:.2f}s ---")
+            queries_to_process = expanded_queries # <--- 修改：现在处理所有扩展后的查询
+            rag_logger.info(f"--- [TIME] 开始并行召回 for {len(queries_to_process)} queries at {time.time() - start_time_total:.2f}s ---")
             start_time_retrieval = time.time()
 
             for current_query_text in queries_to_process:

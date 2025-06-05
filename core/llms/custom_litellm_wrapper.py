@@ -314,11 +314,7 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
     # --- 添加这个方法 ---
     @property
     def supports_function_calling(self) -> bool:
-        # 如果我们的包装器通过 LiteLLM 能够处理工具/函数调用 (通常是的)
-        # 那么这里应该返回 True。
-        # 如果特定的 LLM (通过 model_name 区分) 不支持，可以在这里做更细致的判断。
-        # 例如，检查 self.custom_llm_provider 或 self.model_name
-        # 对于 OpenAI 兼容的本地服务和 Gemini，它们都支持工具调用。
+        logger.debug(f"CustomLiteLLMWrapper.supports_function_calling() called for model {self.model_name}, returning True.")
         return True
     # --- 添加结束 ---
 
