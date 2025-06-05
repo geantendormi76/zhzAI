@@ -352,10 +352,12 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                         "debug_info": {"message": "No relevant context found after fusion."}
                     }
                 else:
-                    context_strings_for_llm = [
-                        f"Source Type: {doc.source_type}, Score: {doc.score:.4f if doc.score is not None else 'N/A'}\nContent: {doc.content}" 
-                        for doc in final_context_docs
-                    ]
+                    context_strings_for_llm = []
+                    for doc in final_context_docs:
+                        score_str = f"{doc.score:.4f}" if isinstance(doc.score, float) else str(doc.score if doc.score is not None else 'N/A')
+                        context_strings_for_llm.append(
+                            f"Source Type: {doc.source_type}, Score: {score_str}\nContent: {doc.content}"
+                        )
                     fused_context_text_for_llm = "\n\n---\n\n".join(context_strings_for_llm)
                     log_fused_context_text_for_llm_snippet = fused_context_text_for_llm[:500] # <--- 记录日志
 

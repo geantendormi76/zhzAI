@@ -66,22 +66,50 @@ TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager_llm, worker_llm, manager_agent_instance, worker_agent_instance, core_tools_instances
+    # --- [修改] 为了让 Manager 的 prompt 也只看到 RAG 工具，我们需要在函数作用域内临时修改这些 ---
+    global CORE_TOOL_NAMES_LIST, TOOL_OPTIONS_STR_FOR_MANAGER 
+    
     print("--- Agent Orchestrator Service: Lifespan startup ---")
 
-    # --- [正确顺序] 步骤 1: 初始化核心工具实例 ---
+    # --- 步骤 1: 初始化核心工具实例 ---
     print("Initializing core tool instances...")
+    enhanced_rag_tool_instance = None # 先声明变量
     try:
-        enhanced_rag_tool_instance = EnhancedRAGTool()
+        enhanced_rag_tool_instance = EnhancedRAGTool() # 尝试创建
         excel_operation_tool_instance = ExcelOperationTool()
         web_search_tool_instance = WebSearchTool()
         
-        core_tools_instances = [
+        # 完整的工具列表，暂时不用，但保留定义
+        _all_core_tools_full_list = [
             enhanced_rag_tool_instance,
             excel_operation_tool_instance,
             web_search_tool_instance,
         ]
-        print(f"Core tools initialized: {[tool.name for tool in core_tools_instances]}")
-        # --- 我们的 DEBUG 日志 ---
+        print(f"Full list of core tools that COULD be initialized: {[tool.name for tool in _all_core_tools_full_list]}")
+
+        # --- 核心修改：当前测试只关注 RAG 工具 ---
+        if enhanced_rag_tool_instance: # 确保 RAG 工具已成功实例化
+            core_tools_instances = [enhanced_rag_tool_instance] # 全局的 core_tools_instances 现在只包含 RAG 工具
+            
+            # --- 动态修改 Manager Prompt 中可见的工具列表 ---
+            # 基于当前 core_tools_instances (只含RAG工具) 来生成
+            CORE_TOOL_NAMES_LIST = [tool.name for tool in core_tools_instances]
+            TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
+                [f"- '{name}': {CORE_TOOLS_ZHZ_AGENT.get(name, 'Unknown Tool Description')}" for name in CORE_TOOL_NAMES_LIST]
+            )
+            print(f"--- FOR CURRENT RAG TEST ---")
+            print(f"Effective CORE_TOOL_NAMES_LIST for Manager: {CORE_TOOL_NAMES_LIST}")
+            print(f"Effective TOOL_OPTIONS_STR_FOR_MANAGER for Manager:\n{TOOL_OPTIONS_STR_FOR_MANAGER}")
+            print(f"--- END OF RAG TEST CONFIG ---")
+
+        else: # 如果 RAG 工具实例化失败
+            print("CRITICAL ERROR: EnhancedRAGTool instance could not be created. Aborting LLM/Agent setup for RAG test.")
+            core_tools_instances = []
+            CORE_TOOL_NAMES_LIST = []
+            TOOL_OPTIONS_STR_FOR_MANAGER = "No tools available."
+
+
+        print(f"Core tools initialized for current test run: {[tool.name for tool in core_tools_instances]}")
         print(f"DEBUG LIFESPAN: core_tools_instances type: {type(core_tools_instances)}")
         if core_tools_instances:
             print(f"DEBUG LIFESPAN: core_tools_instances length: {len(core_tools_instances)}")
@@ -90,21 +118,26 @@ async def lifespan(app: FastAPI):
                 print(f"DEBUG LIFESPAN: Tool {idx} - Type: {type(tool_item)}, Name: {tool_name_attr}")
         else:
             print("DEBUG LIFESPAN: core_tools_instances is empty or None after initialization attempt.")
-        # --- 结束 DEBUG 日志 ---
+            
     except Exception as e:
         print(f"ERROR during core tool initialization: {e}", exc_info=True)
-        core_tools_instances = [] # 如果工具初始化失败，确保它是空列表
+        core_tools_instances = []
+        CORE_TOOL_NAMES_LIST = []
+        TOOL_OPTIONS_STR_FOR_MANAGER = "Tool initialization failed."
 
-    # --- [正确顺序] 步骤 2: 初始化 LLM 实例 (现在 core_tools_instances 已经有值了) ---
+
+    # --- 步骤 2: 初始化 LLM 实例 ---
+    # LLM 初始化时，agent_tools 参数将使用上面步骤中已更新（且只包含RAG工具）的 core_tools_instances
     print("Initializing LLM instances...")
     try:
         gemini_tool_config = {"function_calling_config": {"mode": "AUTO"}}
+        # Manager LLM 初始化
         manager_llm = get_llm_instance(
             llm_type="cloud_gemini", 
             temperature=0.1, 
             max_tokens=4096, 
             tool_config=gemini_tool_config,
-            agent_tools=core_tools_instances # <--- 现在 core_tools_instances 是有值的
+            agent_tools=core_tools_instances # 使用已更新的 core_tools_instances
         )
         if not manager_llm:
             print("Failed to initialize Manager LLM (Cloud Gemini). Attempting fallback...")
@@ -113,9 +146,10 @@ async def lifespan(app: FastAPI):
                 temperature=0.1, 
                 max_tokens=3072, 
                 tool_config=gemini_tool_config,
-                agent_tools=core_tools_instances # <--- fallback 时也传递
+                agent_tools=core_tools_instances 
             )
         
+        # Worker LLM 初始化
         print("Initializing Worker LLM (attempting Cloud Gemini first)...")
         worker_gemini_tool_config = {"function_calling_config": {"mode": "AUTO"}} 
         worker_llm = get_llm_instance(
@@ -123,7 +157,7 @@ async def lifespan(app: FastAPI):
             temperature=0.5, 
             max_tokens=3072,
             tool_config=worker_gemini_tool_config,
-            agent_tools=core_tools_instances # <--- 现在 core_tools_instances 是有值的
+            agent_tools=core_tools_instances # 使用已更新的 core_tools_instances
         )
         if not worker_llm:
             print("Failed to initialize Worker LLM (Cloud Gemini). Attempting fallback to local_qwen...")
@@ -131,7 +165,7 @@ async def lifespan(app: FastAPI):
                 llm_type="local_qwen", 
                 temperature=0.6, 
                 max_tokens=3072,
-                agent_tools=core_tools_instances # <--- fallback 时也传递
+                agent_tools=core_tools_instances
             )
 
         if manager_llm: print(f"Manager LLM initialized: {manager_llm.model_name}")
@@ -143,22 +177,35 @@ async def lifespan(app: FastAPI):
         traceback.print_exc() 
         manager_llm = None; worker_llm = None
 
-    # --- [正确顺序] 步骤 3: 初始化 Agent 实例 ---
-    # (这部分代码不变，它依赖于 manager_llm, worker_llm, 和 core_tools_instances)
+    # --- 步骤 3: 初始化 Agent 实例 ---
     if manager_llm:
         manager_agent_instance = Agent(
             role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
             goal=f"""【深入理解并分解】用户提出的复杂请求 (当前请求将通过任务描述提供) 成为一系列逻辑子任务。
-# ... (manager_agent_instance 的 goal 和 backstory 不变) ...
-{TOOL_OPTIONS_STR_FOR_MANAGER}
-""",
+【核心决策1 - 优先自主回答】：在选择任何工具之前，请首先判断你是否能基于自身知识库和推理能力【直接回答】用户的全部或核心部分请求。如果可以，你的主要输出应是包含直接答案的JSON。
+【核心决策2 - Excel复杂查询处理】：如果用户的请求涉及到对Excel文件进行一个或多个复杂的数据查询、筛选、聚合或排序等操作，并且你无法直接回答，你【必须】选择 "excel_operation_tool" 工具。并且，你【必须】为这些Excel操作【构建一个结构化查询对象 (SQO) 的JSON列表】，并将其作为输出JSON中 `excel_sqo_payload` 字段的值。列表中的【每一个SQO字典】都需要包含一个明确的 "operation_type" 和该操作对应的参数，但【不要包含 "file_path" 或 "sheet_name"】。
+【核心决策3 - 其他工具选择】：如果需要从本地知识库获取深度信息，选择 "enhanced_rag_tool"。如果需要网络实时信息，选择 "web_search_tool"。选择工具后，你需要准备好传递给该工具的参数，并将其放在输出JSON的 `tool_input_args` 字段中。
+【核心决策4 - 通用请求/无适用工具】：如果用户请求是生成通用文本、编写简单代码、回答一般性知识问题，并且你已判断可以【直接回答】，则无需选择任何特定功能性工具。此时输出JSON中 `selected_tool_names` 应为空列表，`excel_sqo_payload` 和 `tool_input_args` 为null，答案内容在 `direct_answer_content` 字段。
+
+最终，【严格按照指定的JSON格式】（即符合 `SubTaskDefinitionForManagerOutput` Pydantic模型）输出一个包含你的决策理由、用户原始请求、以及根据你的决策填充的 `direct_answer_content` 或 `selected_tool_names`、`tool_input_args`、`excel_sqo_payload` 的对象。
+
+【可供选择的本系统核心工具及其描述】:
+{TOOL_OPTIONS_STR_FOR_MANAGER} 
+""", # TOOL_OPTIONS_STR_FOR_MANAGER 会在这里被使用，它现在只包含 RAG 工具
             backstory="""我是一位经验丰富的AI任务调度官和数据查询规划专家。我的核心工作流程如下：
-# ... (manager_agent_instance 的 backstory 不变) ...
+1.  **【深度理解与CoD规划 (内部进行)】**：我会对用户请求进行彻底分析，优先判断是否能直接利用我的知识库和推理能力给出完整答案。
+2.  **【工具选择与参数准备（如果无法直接回答）】**：
+    a.  **Excel复杂查询**: 当识别出需要对Excel执行复杂操作时，我选择 "excel_operation_tool" 工具，并为其生成包含多个SQO操作定义的【JSON列表】作为 `excel_sqo_payload`。每个SQO包含 `operation_type` 和所需参数，但不含 `file_path` 或 `sheet_name`。
+    b.  **RAG查询**: 若需从知识库获取信息，选择 "enhanced_rag_tool"，并准备 `tool_input_args`（例如 `{{ "query": "用户原始问题", "top_k_vector": 5, ... }}`）。
+    c.  **网络搜索**: 若需实时网络信息，选择 "web_search_tool"，并准备 `tool_input_args`（例如 `{{ "query": "搜索关键词" }}`）。
+    d.  **最简必要原则**: 只选择绝对必要的工具。
+3.  **【严格的输出格式】**: 我的唯一输出是一个JSON对象，该对象必须符合本服务定义的 `SubTaskDefinitionForManagerOutput` Pydantic模型结构，包含 `task_description` (用户原始请求), `reasoning_for_plan`, 以及根据决策填充的 `selected_tool_names` (可为空), `direct_answer_content` (如果直接回答), `tool_input_args` (如果使用非Excel工具), 和 `excel_sqo_payload` (如果使用Excel工具)。
+
 我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。""",
             llm=manager_llm,
             verbose=True,
             allow_delegation=False,
-            tools=[] # Manager Agent 不直接使用工具执行
+            tools=[] 
         )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
 
@@ -172,20 +219,19 @@ async def lifespan(app: FastAPI):
             llm=worker_llm,
             verbose=True,
             allow_delegation=False,
-            tools=core_tools_instances # <--- Worker Agent 使用核心工具
+            tools=core_tools_instances # Worker Agent 使用已更新（只含RAG工具）的 core_tools_instances
         )
-        print(f"Worker Agent initialized with LLM: {worker_llm.model_name} and tools: {[t.name for t in core_tools_instances]}")
+        print(f"Worker Agent initialized with LLM: {worker_llm.model_name} and tools: {[t.name for t in worker_agent_instance.tools]}")
 
     if not manager_agent_instance or not worker_agent_instance:
         print("CRITICAL: One or more core agents failed to initialize. Service functionality will be severely limited.")
     elif not core_tools_instances and worker_agent_instance : 
         print("WARNING: Worker Agent initialized, but no core tools were successfully instantiated. Tool-based tasks will fail.")
 
-
     print("--- Agent Orchestrator Service: Lifespan startup complete ---")
     yield
     print("--- Agent Orchestrator Service: Lifespan shutdown ---")
-    
+
 app = FastAPI(
     title="Agent Orchestrator Service",
     description="接收用户请求，通过Manager/Worker Agent模型进行任务规划和执行。",
@@ -216,28 +262,25 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     1.  理解用户的核心意图。
     2.  **优先判断**：你能否基于你现有的知识直接、准确地回答这个问题？
         - 如果是，请在输出的JSON中填充 `direct_answer_content` 字段，并将 `selected_tool_names` 设为空列表。
-    3.  **如果不能直接回答**：判断解决这个问题最核心的工具是什么。从你已知的核心工具 ({', '.join(CORE_TOOL_NAMES_LIST)}) 中选择【一个或多个必要】工具。
-    4.  如果选择了 '{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}'，请为Excel操作构建一个或多个SQO的【列表】，并将其放入 `excel_sqo_payload` 字段。
-    5.  如果选择了其他工具（如 '{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('enhanced_rag_tool')]}' 或 '{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('web_search_tool')]}'），请准备好传递给该工具的参数，并将其放入 `tool_input_args` 字段。
-    6.  严格按照 `SubTaskDefinitionForManagerOutput` 的JSON格式输出你的规划。`task_description` 字段必须是用户的原始请求原文: '{request.user_query}'。同时提供你的 `reasoning_for_plan`。
+    3.  **如果不能直接回答**：你当前只有一个核心工具可用：'enhanced_rag_tool'。请判断是否需要使用它。
+    4.  如果选择了 'enhanced_rag_tool'，请准备好传递给该工具的参数，并将其放入 `tool_input_args` 字段。
+    5.  严格按照 `SubTaskDefinitionForManagerOutput` 的JSON格式输出你的规划。`task_description` 字段必须是用户的原始请求原文: '{request.user_query}'。同时提供你的 `reasoning_for_plan`。
     """
     
     # --- Manager Task 的期望输出格式说明 ---
-    # 这个 expected_output 对于指导LLM以正确的JSON格式返回至关重要
     manager_task_expected_output_description = f"""一个JSON对象，必须严格符合以下Pydantic模型的结构（你不需要输出 "SubTaskDefinitionForManagerOutput" 这个词本身）：
     {{
       "task_description": "string (固定为用户的原始请求: '{request.user_query}')",
       "reasoning_for_plan": "string (你的决策思考过程)",
-      "selected_tool_names": ["list of strings (选定的工具名称列表。如果直接回答，则为空列表)"],
+      "selected_tool_names": ["list of strings (选定的工具名称列表。如果直接回答，则为空列表。如果使用工具，则为 ['enhanced_rag_tool'])"],
       "direct_answer_content": "string (可选, 仅当 selected_tool_names 为空列表时，这里是你的答案内容)",
-      "tool_input_args": {{ "key": "value" }} (可选, 仅当 selected_tool_names 包含非Excel工具时，这里是给该工具的参数字典),
-      "excel_sqo_payload": "[{{...}}, {{...}}] (可选, 仅当 selected_tool_names 包含'{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}'时，这里是SQO操作字典的列表)"
+      "tool_input_args": {{ "key": "value" }} (可选, 仅当 selected_tool_names 包含'enhanced_rag_tool'时，这里是给该工具的参数字典),
+      "excel_sqo_payload": null # 当前Excel工具不可用，此字段应为null
     }}
 
     【重要输出规则】:
     - 如果你选择【直接回答】：`selected_tool_names` 必须是空列表 `[]`，`direct_answer_content` 必须包含你的答案，`tool_input_args` 和 `excel_sqo_payload` 应该为 `null` 或不存在。
-    - 如果你选择使用【非Excel工具】(例如 RAG 或 Web Search)：`selected_tool_names` 必须包含该工具的名称，`direct_answer_content` 应该为 `null` 或不存在，`tool_input_args` 必须包含调用该工具所需的参数 (例如 `{{ "query": "{request.user_query}" }}` )，`excel_sqo_payload` 应该为 `null` 或不存在。
-    - 如果你选择使用【Excel工具】 ('{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}')：`selected_tool_names` 必须包含 `"{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}"`，`direct_answer_content` 和 `tool_input_args` 应该为 `null` 或不存在，`excel_sqo_payload` 【必须】包含一个SQO操作定义的列表。
+    - 如果你选择使用【enhanced_rag_tool】：`selected_tool_names` 必须包含 `"enhanced_rag_tool"`，`direct_answer_content` 应该为 `null` 或不存在，`tool_input_args` 必须包含调用该工具所需的参数 (例如 `{{ "query": "{request.user_query}" }}` )，`excel_sqo_payload` 应该为 `null` 或不存在。
 
     示例输出 (直接回答):
     {{
@@ -253,29 +296,10 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     {{
       "task_description": "{request.user_query}",
       "reasoning_for_plan": "用户询问关于公司政策的问题，这需要从知识库中查找。",
-      "selected_tool_names": ["{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('enhanced_rag_tool')]}"],
+      "selected_tool_names": ["enhanced_rag_tool"],
       "direct_answer_content": null,
       "tool_input_args": {{"query": "{request.user_query}", "top_k_vector": 5, "top_k_kg": 3, "top_k_bm25": 3}},
       "excel_sqo_payload": null
-    }}
-    
-    示例输出 (使用Excel工具，假设用户问“test.xlsx中有哪些区域以及每个区域的平均销售额”):
-    {{
-      "task_description": "test.xlsx中有哪些区域以及每个区域的平均销售额",
-      "reasoning_for_plan": "用户需要从Excel文件中获取唯一区域列表，并对销售额按区域进行聚合计算平均值。这需要两个SQO操作。",
-      "selected_tool_names": ["{CORE_TOOL_NAMES_LIST[CORE_TOOL_NAMES_LIST.index('excel_operation_tool')]}"],
-      "direct_answer_content": null,
-      "tool_input_args": null, 
-      "excel_sqo_payload": [
-        {{
-          "operation_type": "get_unique_values",
-          "parameters": {{ "column_name": "区域" }}
-        }},
-        {{
-          "operation_type": "group_by_aggregate",
-          "parameters": {{ "group_by_columns": ["区域"], "aggregation_column": "销售额", "aggregation_function": "mean" }}
-        }}
-      ]
     }}
     请严格按照此JSON格式输出。
     """
