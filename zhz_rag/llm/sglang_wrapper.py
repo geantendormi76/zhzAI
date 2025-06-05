@@ -15,11 +15,13 @@ import logging
 import re
 import uuid  # 用于生成 interaction_id
 from datetime import datetime, timezone  # 用于生成时间戳
+import litellm # <--- 确保这个导入存在
 
 load_dotenv()  # 确保加载.env文件
 
 _LLM_DIR = os.path.dirname(os.path.abspath(__file__))
 RAG_INTERACTION_LOGS_DIR = os.path.join(_LLM_DIR, '..', '..', 'stored_data', 'rag_interaction_logs')
+
 
 if not os.path.exists(RAG_INTERACTION_LOGS_DIR):
     try:
@@ -114,80 +116,49 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 
 LLM_API_URL = os.getenv("SGLANG_API_URL", "http://localhost:8088/v1/chat/completions")
 
-async def call_llm_via_openai_api(
-    prompt: Union[str, List[Dict[str, str]]],
+# 添加回这个函数，但它现在只被 generate_answer_from_context, generate_cypher_query 等调用
+# 并且目标是本地的 OpenAI 兼容服务
+async def call_llm_via_openai_api_local_only( # 改个名字以示区分
+    prompt: Union[str, List[Dict[str, str]]], # prompt 可以是字符串或消息列表
     temperature: float = 0.2,
     max_new_tokens: Optional[int] = 1024,
     stop_sequences: Optional[List[str]] = None,
-    task_type: str = "unknown_llm_call",
+    task_type: str = "unknown_local_llm_call",
     user_query_for_log: Optional[str] = None,
-    model_name_for_log: str = "qwen3_gguf_via_openai_api", # Updated default model name
-    application_version_for_log: str = "0.1.0"
+    model_name_for_log: str = "local_qwen_via_openai_api_compat",
+    application_version_for_log: str = "0.1.0_local_compat"
 ) -> Optional[str]:
-
-    llm_py_logger.info(f"Attempting to call LLM. Task: {task_type}, Target API: {LLM_API_URL}")
+    llm_py_logger.info(f"Calling LOCAL LLM ({model_name_for_log}) for task: {task_type}, Target API: {LLM_API_URL}")
 
     current_messages: List[Dict[str, str]]
-    original_prompt_for_log: str # For logging the original SGLang-style prompt if applicable
+    original_prompt_for_log: str
 
-    if isinstance(prompt, str):
+    if isinstance(prompt, str): # 假设旧的SGLang风格的prompt字符串
         original_prompt_for_log = prompt
-        llm_py_logger.warning(f"call_llm_via_openai_api received a string prompt for task '{task_type}'. Attempting basic conversion to OpenAI messages. This is deprecated and may not be optimal.")
+        # 尝试从SGLang格式转换为OpenAI messages格式
+        # 这个转换逻辑需要根据您SGLang prompt的具体格式来定
+        # 一个简化的例子，可能需要调整：
         current_messages = []
-        if "<|im_start|>system" in original_prompt_for_log:
-            parts = original_prompt_for_log.split("<|im_start|>")
-            for part_content in parts:
-                if not part_content.strip():
-                    continue
-                # Strip <|im_end|> and then content
-                role_content_pair = part_content.split("<|im_end|>")[0].strip()
-                if "\n" in role_content_pair: # Expects "role\ncontent"
-                    role, message_content = role_content_pair.split("\n", 1)
-                    current_messages.append({"role": role.strip().lower(), "content": message_content.strip()})
-                else: # Fallback if no explicit role, assume user, or handle simple SGLang role prefix
-                    # This part needs careful mapping from SGLang role prefixes if used without newline
-                    # For now, a simple split for "system content" or "user content" without newline might be too naive.
-                    # The provided split logic was `role, message_content = role_content_pair.split("\n", 1)`
-                    # If it's just "system: message" or "system message" this is harder.
-                    # The logic from the txt:
-                    #   role_content_pair = part_content.split("<|im_end|>")[0].strip()
-                    #   if "\n" in role_content_pair:
-                    #       role, message_content = role_content_pair.split("\n", 1)
-                    #       current_messages.append({"role": role.strip().lower(), "content": message_content.strip()})
-                    #   else: # 可能是只有内容的user message
-                    #       current_messages.append({"role": "user", "content": role_content_pair.strip()})
-                    # This seems reasonable. Let's ensure role extraction.
-                    # A more robust way for SGLang prompts:
-                    # Check for "system\n", "user\n", "assistant\n" explicitly.
-                    temp_role_content = role_content_pair.strip()
-                    role_found = False
-                    for r in ["system", "user", "assistant"]:
-                        if temp_role_content.lower().startswith(r): # covers "system\ncontent" or "system content"
-                            # check if role is followed by newline or space
-                            if len(temp_role_content) > len(r) and (temp_role_content[len(r)] == '\n' or temp_role_content[len(r)] == ' ' or temp_role_content[len(r)] == ':'):
-                                message_content = temp_role_content[len(r):].lstrip(' \n:')
-                                current_messages.append({"role": r, "content": message_content.strip()})
-                                role_found = True
-                                break
-                    if not role_found: # Default to user if no role prefix detected or if it's just content
-                         current_messages.append({"role": "user", "content": temp_role_content})
-
-
-            if not current_messages or (current_messages and current_messages[-1]["role"] == "assistant"):
-                 current_messages.append({"role": "user", "content": "Continue."}) # Ensure last message is user if needed
-        else: # If not SGLang format with <|im_start|>system, treat the whole string as a user message
-            current_messages = [{"role": "user", "content": original_prompt_for_log}]
-        llm_py_logger.debug(f"  Converted string prompt to messages: {json.dumps(current_messages, ensure_ascii=False, indent=2)}")
+        # 简单的假设：如果prompt以<|im_start|>system开头，则提取system和user部分
+        if prompt.startswith("<|im_start|>system"):
+            parts = prompt.split("<|im_start|>")
+            for part in parts:
+                if not part.strip(): continue
+                role_content = part.split("<|im_end|>")[0].strip()
+                if "\n" in role_content:
+                    role, content = role_content.split("\n", 1)
+                    current_messages.append({"role": role.strip().lower(), "content": content.strip()})
+        if not current_messages: # 如果转换失败或不是SGLang格式，则认为是单个user消息
+            current_messages = [{"role": "user", "content": prompt}]
     elif isinstance(prompt, list):
         current_messages = prompt
         original_prompt_for_log = "Messages list provided directly."
-        llm_py_logger.debug(f"  Received messages list directly: {json.dumps(current_messages, ensure_ascii=False, indent=2)}")
     else:
-        llm_py_logger.error(f"Invalid 'prompt' argument type for call_llm_via_openai_api: {type(prompt)}")
+        llm_py_logger.error(f"Invalid 'prompt' argument type: {type(prompt)}")
         return None
 
     payload = {
-        "model": model_name_for_log,
+        "model": model_name_for_log, # 这个model名会被本地服务忽略，但符合OpenAI格式
         "messages": current_messages,
         "temperature": temperature,
         "max_tokens": max_new_tokens,
@@ -196,79 +167,48 @@ async def call_llm_via_openai_api(
         payload["stop"] = stop_sequences
 
     headers = {"Content-Type": "application/json"}
-    
-    llm_parameters_for_log = {
-        "model": model_name_for_log,
-        "temperature": temperature,
-        "max_tokens": max_new_tokens,
-        "stop_sequences": stop_sequences
-    }
+    llm_parameters_for_log = {k:v for k,v in payload.items() if k not in ['messages', 'model']} # model已在顶层记录
     raw_llm_output_text = None
+    error_info = None
 
     try:
-        llm_py_logger.info(f"Sending request to LLM API: {LLM_API_URL}")
-        llm_py_logger.debug(f"Payload: {json.dumps(payload, ensure_ascii=False, indent=2)}")
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(LLM_API_URL, json=payload, headers=headers)
+            response = await client.post(LLM_API_URL, json=payload, headers=headers) # LLM_API_URL 指向本地服务
             response.raise_for_status()
             response_json = response.json()
-            
-            if response_json.get("choices") and \
-               isinstance(response_json["choices"], list) and \
-               len(response_json["choices"]) > 0 and \
-               response_json["choices"][0].get("message"):
-                raw_llm_output_text = response_json["choices"][0]["message"].get("content")
-                if raw_llm_output_text is None: # content might be null
-                    raw_llm_output_text = "" 
+            if response_json.get("choices") and response_json["choices"][0].get("message"):
+                raw_llm_output_text = response_json["choices"][0]["message"].get("content", "")
             else:
-                raw_llm_output_text = "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE]]"
-            
-            llm_py_logger.info(f"LLM Raw Output (from API): {str(raw_llm_output_text)[:500]}...")
-
-            interaction_log_data = {
-                "interaction_id": str(uuid.uuid4()),
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "task_type": task_type,
-                "user_query_for_task": user_query_for_log,
-                "llm_input_messages": current_messages,
-                "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
-                "llm_parameters": llm_parameters_for_log,
-                "raw_llm_output": raw_llm_output_text,
-                "application_version": application_version_for_log
-            }
-            await log_interaction_data(interaction_log_data)
-            return raw_llm_output_text
-
-    except httpx.HTTPStatusError as e:
-        llm_py_logger.error(f"HTTPStatusError calling LLM API: {e}. Response: {e.response.text[:500]}", exc_info=True)
-        error_info = f"HTTPStatusError: {e.response.status_code} - {e.response.text[:200]}"
-    except httpx.RequestError as e:
-        llm_py_logger.error(f"RequestError calling LLM API: {e}", exc_info=True)
-        error_info = f"RequestError: {str(e)}"
-    except json.JSONDecodeError as e:
-        response_text_for_debug = "N/A"
-        if 'response' in locals() and hasattr(response, 'text'):
-            response_text_for_debug = response.text[:500]
-        llm_py_logger.error(f"JSONDecodeError from LLM API: {e}. Raw response: {response_text_for_debug}", exc_info=True)
-        error_info = f"JSONDecodeError: {str(e)}"
+                raw_llm_output_text = "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE_LOCAL]]"
+            llm_py_logger.info(f"Local LLM Raw Output: {str(raw_llm_output_text)[:200]}...")
+    # ... (省略错误处理和日志记录，与您之前的 call_llm_via_openai_api 类似) ...
     except Exception as e:
-        llm_py_logger.error(f"Unknown error in call_llm_via_openai_api: {type(e).__name__} - {e}", exc_info=True)
-        error_info = f"Unknown error: {type(e).__name__} - {str(e)}"
+        llm_py_logger.error(f"Error calling local LLM service: {e}", exc_info=True)
+        error_info = str(e)
+        # 确保记录错误
+        log_error_data = {
+            "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task_type": task_type + "_local_error", "user_query_for_task": user_query_for_log,
+            "llm_input_messages": current_messages,
+            "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
+            "llm_parameters": llm_parameters_for_log,
+            "raw_llm_output": f"Error: {error_info}. Partial raw output: {str(raw_llm_output_text)[:200] if raw_llm_output_text else 'N/A'}",
+            "error_details": traceback.format_exc(), "application_version": application_version_for_log
+        }
+        await log_interaction_data(log_error_data)
+        return None # 出错时返回None
 
-    error_log_data = {
-        "interaction_id": str(uuid.uuid4()),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "task_type": task_type + "_error",
-        "user_query_for_task": user_query_for_log,
-        "llm_input_messages": current_messages if 'current_messages' in locals() else [{"role":"system", "content": "Error: messages not formed"}],
-        "llm_input_original_prompt_if_string": original_prompt_for_log if 'original_prompt_for_log' in locals() and isinstance(prompt, str) else None,
+    # 记录成功的调用
+    log_success_data = {
+        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_type": task_type, "user_query_for_task": user_query_for_log,
+        "llm_input_messages": current_messages,
+        "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
         "llm_parameters": llm_parameters_for_log,
-        "raw_llm_output": f"Error: {error_info}. Partial raw output: {str(raw_llm_output_text)[:200] if raw_llm_output_text else 'N/A'}",
-        "error_details": traceback.format_exc(),
-        "application_version": application_version_for_log
+        "raw_llm_output": raw_llm_output_text, "application_version": application_version_for_log
     }
-    await log_interaction_data(error_log_data)
-    return None
+    await log_interaction_data(log_success_data)
+    return raw_llm_output_text
 
 async def generate_cypher_query(user_question: str, kg_schema_description: str = NEW_KG_SCHEMA_DESCRIPTION) -> Optional[str]:
     llm_py_logger.info(f"Attempting to generate Cypher query for: '{user_question}' via local service with GBNF + post-processing.")
@@ -280,7 +220,7 @@ async def generate_cypher_query(user_question: str, kg_schema_description: str =
     ]
     cypher_stop_sequences = ['<|im_end|>', '无法生成Cypher查询.', '```'] # 添加 '```' 以防模型生成 Markdown 后想继续
 
-    llm_response_json_str = await call_llm_via_openai_api( 
+    llm_response_json_str = await call_llm_via_openai_api_local_only( 
         prompt=messages_for_llm,
         temperature=0.0, 
         max_new_tokens=1024, 
@@ -333,17 +273,22 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
     llm_py_logger.info(f"Generating answer for query: '{user_query[:100]}...' using provided context.")
     
     system_prompt_for_answer = f"""
-你是一个AI问答助手。你的任务是根据【上下文信息】回答【用户问题】。
+你是一个非常严谨的AI问答助手。你的任务是根据【上下文信息】回答【用户问题】。
 
 **核心指令：**
 
-1.  **尝试直接回答：** 请首先仔细阅读【上下文信息】，如果其中包含能直接回答【用户问题】的内容，请用上下文中的信息直接、简洁地回答。
-2.  **忠实原文：** 你的回答必须严格基于【上下文信息】，禁止加入任何外部知识或个人观点。
-3.  **如果无法回答：** 如果你分析了【上下文信息】后，确认其中确实没有能回答【用户问题】的明确信息，那么请只回答以下这句话：
- "{NO_ANSWER_PHRASE_ANSWER_CLEAN}"
- 不要添加任何其他解释、建议或反问。
+1.  **严格基于上下文：** 你的回答【必须只能】使用【上下文信息】中明确提供的文字。禁止进行任何形式的推断、联想、猜测或引入外部知识。
+2.  **逐句核对：** 对于用户问题中的每一个信息点或子问题，你都必须在上下文中找到【直接对应的证据】才能回答。
+3.  **明确关联性：** 如果用户问题试图关联上下文中的不同信息片段（例如，A是否与B有关），你必须在上下文中找到【明确陈述这种关联性的直接证据】。如果上下文中分别提到了A和B，但没有明确说明它们之间的关系，则视为无法关联。
+4.  **处理无法回答的部分：**
+    *   如果【上下文信息】完全不包含回答【用户问题】的任何相关信息，或者无法找到任何直接证据，请【只回答】：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
+    *   如果【用户问题】包含多个子问题，而【上下文信息】只能回答其中的一部分：
+        *   请只回答你能找到直接证据的部分。
+        *   对于上下文中没有直接证据支持的其他子问题，请明确指出：“关于[某子问题]，上下文中未提供明确信息。”
+        *   不要对未提供信息的部分进行猜测或尝试回答。
+5.  **简洁明了：** 回答要直接、简洁。
 
-请直接给出答案，或者只给出上述那句固定的“无法找到信息”的回复。
+请严格遵守以上指令。
 """
     # 构造 messages 列表
     messages_for_llm = [
@@ -351,7 +296,7 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
         {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
     ]
 
-    raw_answer = await call_llm_via_openai_api(
+    raw_answer = await call_llm_via_openai_api_local_only(
         prompt=messages_for_llm, # <--- 传递 messages 列表
         temperature=0.05,
         max_new_tokens=1024, 
@@ -393,7 +338,7 @@ async def generate_simulated_kg_query_response(user_query: str, kg_schema_descri
 <|im_start|>assistant
 """
     stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN]
-    return await call_llm_via_openai_api(
+    return await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.5,
         max_new_tokens=256,
@@ -423,7 +368,7 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     stop_sequences = ["<|im_end|>"]
     
     llm_py_logger.info(f"调用LLM API进行查询扩展 (Prompt长度: {len(prompt_str)} 字符)...")
-    llm_output = await call_llm_via_openai_api(
+    llm_output = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.7,
         max_new_tokens=512,
@@ -474,7 +419,7 @@ async def generate_clarification_question(original_query: str, uncertainty_reaso
 """
     stop_sequences = ["<|im_end|>"]
     llm_py_logger.info(f"调用LLM API生成澄清问题 (Prompt长度: {len(prompt_str)} 字符)...")
-    clarification_question = await call_llm_via_openai_api(
+    clarification_question = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.5,
         max_new_tokens=128,
@@ -515,7 +460,7 @@ async def generate_clarification_options(original_query: str, uncertainty_reason
 """
     stop_sequences = ["<|im_end|>"]
     llm_py_logger.info(f"调用LLM API生成澄清选项 (Prompt长度: {len(prompt_str)} 字符)...")
-    llm_output = await call_llm_via_openai_api(
+    llm_output = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.7,
         max_new_tokens=256,
@@ -562,20 +507,23 @@ INTENT_CLASSIFICATION_JSON_SCHEMA = {
 }
 
 async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
-    llm_py_logger.info(f"Generating intent classification for query: '{user_query[:100]}...'")
-    prompt_str = f"""<|im_start|>system
-你是一个智能意图分类器。你的任务是分析用户查询，判断该查询是否清晰明确，或者是否存在歧义、信息不足导致需要进一步澄清。
+    llm_py_logger.info(f"Generating intent classification for query: '{user_query[:100]}...' using Gemini.")
+    
+    # 针对Gemini优化的Prompt，强调直接输出JSON
+    system_prompt_for_intent = f"""你是一个智能意图分类器。你的任务是分析用户查询，判断该查询是否清晰明确，或者是否存在歧义、信息不足导致需要进一步澄清。
 如果查询包含具体的命名实体（如人名“张三”、项目名“项目X”、产品名“新产品A”等），并且问题是关于这些实体的特定信息（例如“张三的职位是什么？”、“项目X的截止日期是哪天？”、“新产品A的功能有哪些？”），则通常认为查询是清晰的，不需要澄清。
 只有当查询缺少定位关键信息所必需的核心实体，或者询问的范围过于宽泛无法直接操作时，才需要澄清。
 
 如果查询需要澄清，请说明原因。
-你的回答必须是一个JSON对象，包含两个字段：
-1. "clarification_needed": 布尔值，如果需要澄清则为 true，否则为 false。
-2. "reason": 字符串，如果需要澄清，请简要说明原因；如果不需要，则为空字符串。
+你的【唯一输出】必须是一个严格符合以下结构的JSON对象，不要包含任何其他文本、解释或markdown标记:
+{{
+  "clarification_needed": true/false,
+  "reason": "如果需要澄清，请简要说明原因；如果不需要，则为空字符串。"
+}}
 
 示例1 (需要澄清 - 信息不足):
 用户查询: "帮我预定明天去上海的机票。"
-助手:
+助手 JSON 输出:
 {{
   "clarification_needed": true,
   "reason": "缺少出发城市、具体时间（上午/下午/晚上）、舱位等级等信息。"
@@ -583,79 +531,121 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
 
 示例2 (不需要澄清 - 清晰):
 用户查询: "公司最新的销售额报告在哪里可以找到？"
-助手:
+助手 JSON 输出:
 {{
   "clarification_needed": false,
   "reason": ""
 }}
-
-示例3 (需要澄清 - 实体不明确):
-用户查询: "关于项目进展的文档。"
-助手:
-{{
-  "clarification_needed": true,
-  "reason": "项目名称不明确，文档类型（报告、计划、会议纪要等）不明确。"
-}}
-
-示例4 (不需要澄清 - 包含具体实体和明确问题):
-用户查询: "张三参与了哪个项目？"
-助手:
-{{
-  "clarification_needed": false,
-  "reason": ""
-}}
-
-示例5 (不需要澄清 - 包含具体实体和明确问题):
-用户查询: "华东区域2024年第一季度的销售额是多少？"
-助手:
-{{
-  "clarification_needed": false,
-  "reason": ""
-}}
-
-示例6 (需要澄清 - “公司”指默认上下文，但其余部分仍模糊):
-用户查询: "公司的政策"
-助手:
-{{
-  "clarification_needed": true,
-  "reason": "未能明确指出是关于哪方面的公司政策（例如：人力资源、IT安全、财务等）。"
-}}<|im_end|>
-<|im_start|>user
-用户查询: {user_query}<|im_end|>
-<|im_start|>assistant
 """
-    stop_sequences = ["<|im_end|>"]
-    llm_py_logger.info(f"调用LLM API进行意图分类 (Prompt长度: {len(prompt_str)} 字符)...")
+    
+    messages_for_gemini = [
+        {"role": "system", "content": system_prompt_for_intent},
+        {"role": "user", "content": f"用户查询: {user_query}"}
+    ]
 
-    llm_output = await call_llm_via_openai_api(
-        prompt=prompt_str,
-        temperature=0.01,
-        max_new_tokens=256,
-        stop_sequences=stop_sequences,
-        task_type="intent_classification",
-        user_query_for_log=user_query
-    )
+    # 从环境变量获取Gemini配置
+    gemini_model_name = os.getenv("CLOUD_LLM_MODEL_NAME_FOR_LITELLM", "gemini/gemini-1.5-flash-latest")
+    gemini_api_key = os.getenv("GEMINI_API_KEY") # 或者 GOOGLE_API_KEY
+    proxy_url = os.getenv("LITELLM_PROXY_URL")
 
-    if llm_output:
-        try:
-            json_str = llm_output.strip()
-            if json_str.startswith("```json"):
-                json_str = json_str[len("```json"):].strip()
-            if json_str.endswith("```"):
-                json_str = json_str[:-len("```")].strip()
+    litellm_params: Dict[str, Any] = {
+        "model": gemini_model_name,
+        "messages": messages_for_gemini,
+        "api_key": gemini_api_key,
+        "temperature": 0.1, 
+        "max_tokens": 256,  # 意图分类的JSON输出通常较短
+        # "response_format": {"type": "json_object"} # LiteLLM的Gemini集成可能尚不支持此参数，暂时注释
+    }
+    if proxy_url:
+        # LiteLLM 的 proxy 参数期望一个字典，或者直接是一个字符串URL (取决于LiteLLM版本和具体实现)
+        # 为保险起见，我们按文档常见的字典格式提供
+        litellm_params["proxy"] = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+        # 或者，如果您的LiteLLM版本支持直接传递字符串URL作为代理：
+        # litellm_params["api_base"] = proxy_url # 这会将代理用于所有请求，如果Gemini也通过此代理
+        # litellm_params["base_url"] = proxy_url # 有些版本用 base_url
+        # 更通用的方式是设置环境变量 HTTP_PROXY 和 HTTPS_PROXY，LiteLLM通常会读取它们
+        # 但为了显式，我们这里尝试通过参数传递给litellm.acompletion
 
-            parsed_result = json.loads(json_str)
-            if isinstance(parsed_result, dict) and \
-               "clarification_needed" in parsed_result and \
-               "reason" in parsed_result:
-                llm_py_logger.info(f"LLM成功进行意图分类: {parsed_result}")
-                return parsed_result
-            else:
-                llm_py_logger.warning(f"LLM生成的意图分类JSON格式不符合预期: {llm_output[:200]}...")
-        except json.JSONDecodeError as e:
-            llm_py_logger.error(f"解析LLM意图分类JSON失败: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
-        except Exception as e:
-            llm_py_logger.error(f"处理LLM意图分类时发生未知错误: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
+    llm_py_logger.info(f"Calling Gemini (via LiteLLM) for intent classification. Model: {gemini_model_name}")
+    debug_params = {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key']}
+    llm_py_logger.debug(f"LiteLLM params for intent (excluding messages & api_key): {debug_params}")
+    
+    raw_gemini_output_text = None
+    error_info_intent = None
+    parsed_result_dict: Optional[Dict[str, Any]] = None # 用于存储最终解析结果
 
-    llm_py_logger.warning("LLM未能生成有效的意图分类结果，默认不需澄清。")
-    return {"clarification_needed": False, "reason": "LLM分类失败或无结果。"}
+    try:
+        response = await litellm.acompletion(**litellm_params)
+        if response and response.choices and response.choices[0].message and response.choices[0].message.content:
+            raw_gemini_output_text = response.choices[0].message.content.strip()
+            llm_py_logger.info(f"Gemini intent classification raw output: {raw_gemini_output_text[:300]}...")
+            
+            # 尝试解析JSON (与之前的提取逻辑类似)
+            json_str_candidate = raw_gemini_output_text
+            # 1. 尝试从 markdown block 中提取
+            markdown_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", json_str_candidate, re.DOTALL)
+            if markdown_match:
+                json_str_candidate = markdown_match.group(1)
+                llm_py_logger.debug(f"Extracted JSON candidate from markdown: {json_str_candidate[:200]}...")
+            
+            # 2. 如果没有markdown，或者提取后仍然不是纯JSON，尝试直接解析或查找第一个 '{' 和最后一个 '}'
+            try:
+                parsed_result_dict = json.loads(json_str_candidate)
+            except json.JSONDecodeError: # 如果直接解析失败
+                first_brace = json_str_candidate.find('{')
+                last_brace = json_str_candidate.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_str_candidate = json_str_candidate[first_brace : last_brace+1]
+                    llm_py_logger.debug(f"Extracted JSON candidate by braces: {json_str_candidate[:200]}...")
+                    try:
+                        parsed_result_dict = json.loads(json_str_candidate)
+                    except json.JSONDecodeError as e_json_brace:
+                        error_info_intent = f"Failed to decode JSON from Gemini intent (braces): {e_json_brace}"
+                        llm_py_logger.error(error_info_intent, exc_info=True)
+                else: # 没有找到有效的花括号对
+                    error_info_intent = "No valid JSON object found in Gemini intent output."
+                    llm_py_logger.error(error_info_intent + f" Raw: {raw_gemini_output_text[:200]}")
+            
+            # 验证解析后的JSON结构
+            if parsed_result_dict and isinstance(parsed_result_dict, dict) and \
+               "clarification_needed" in parsed_result_dict and \
+               "reason" in parsed_result_dict:
+                llm_py_logger.info(f"Gemini successfully classified intent: {parsed_result_dict}")
+                # 记录成功的调用
+                log_data_intent = {
+                    "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "task_type": "intent_classification_gemini", "user_query_for_task": user_query,
+                    "llm_input_messages": messages_for_gemini, "llm_parameters": {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key', 'proxy']},
+                    "raw_llm_output": raw_gemini_output_text, "application_version": "0.1.0_intent_gemini"
+                }
+                await log_interaction_data(log_data_intent)
+                return parsed_result_dict
+            else: # 解析成功但结构不对
+                if parsed_result_dict: # 避免对None调用get
+                    error_info_intent = f"Gemini intent output JSON structure mismatch. Parsed: {parsed_result_dict}"
+                else: # parsed_result_dict 为 None (例如，花括号提取失败后)
+                    error_info_intent = "Gemini intent output JSON structure mismatch (parsed_result_dict is None)."
+                llm_py_logger.warning(error_info_intent)
+        else: # response.choices[0].message.content 为空或不存在
+            error_info_intent = "Gemini intent call returned empty or malformed response content."
+            llm_py_logger.error(f"{error_info_intent} Full response object: {response}")
+
+    except Exception as e_gemini_call:
+        error_info_intent = f"Error calling Gemini for intent: {e_gemini_call}"
+        llm_py_logger.error(error_info_intent, exc_info=True)
+
+    # 如果执行到这里，说明出错了或者没有得到期望的JSON
+    log_error_data_intent = {
+        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_type": "intent_classification_gemini_error", "user_query_for_task": user_query,
+        "llm_input_messages": messages_for_gemini, "llm_parameters": {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key', 'proxy']},
+        "raw_llm_output": raw_gemini_output_text or "N/A", "error_details": error_info_intent,
+        "application_version": "0.1.0_intent_gemini"
+    }
+    await log_interaction_data(log_error_data_intent)
+    
+    llm_py_logger.warning(f"Gemini failed to generate valid intent classification, defaulting to no clarification needed. Error: {error_info_intent or 'Unknown reason'}")
+    return {"clarification_needed": False, "reason": f"Intent classification by Gemini failed: {error_info_intent or 'Unknown reason'}"}

@@ -190,10 +190,11 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
     log_all_raw_retrievals_summary: List[Dict[str, Any]] = []
     log_final_context_docs_summary: List[Dict[str, Any]] = [] # This will store the full doc model dumps
     log_fused_context_text_for_llm_snippet: str = "N/A"
+    # --- [确保所有日志变量都有初始值] ---
     log_final_answer_from_llm: str = "N/A"
     log_intent_classification_result: Optional[Dict[str, Any]] = None
     log_expanded_queries: Optional[List[str]] = None
-    # --- [结束新增日志变量] ---
+    # --- [结束确保所有日志变量都有初始值] ---
 
     try:
         # --- 1. LLM 驱动的意图分类和澄清触发 ---
