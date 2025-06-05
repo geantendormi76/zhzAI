@@ -110,21 +110,46 @@ async def log_interaction_data(
         # For eval results, ensure there's an ID, can be a new one for the eval log entry itself
          interaction_data["interaction_id"] = str(uuid.uuid4())
 
-
     try:
+        # --- 新增 DEBUG 日志 ---
+        print(f"COMMON_UTILS_LOG_DATA: Preparing to dump JSON. Keys in interaction_data: {list(interaction_data.keys())}")
+        if "final_context_docs_full" in interaction_data:
+            print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' IS PRESENT before dumps.")
+            if interaction_data["final_context_docs_full"]:
+                 print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' is NOT EMPTY before dumps. Length: {len(interaction_data['final_context_docs_full'])}")
+                 try:
+                    first_content = interaction_data["final_context_docs_full"][0].get("content", "CONTENT_KEY_MISSING")
+                    print(f"COMMON_UTILS_LOG_DATA: First content in final_context_docs_full: {str(first_content)[:50]}...")
+                 except:
+                    pass # 简单忽略打印错误
+            else:
+                print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' IS EMPTY LIST before dumps.")
+        else:
+            print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' KEY IS MISSING before dumps!")
+        # --- 结束新增 DEBUG 日志 ---
+
         def _write_sync():
-            # Ensure the directory for the specific log file exists
             log_file_dir = os.path.dirname(filepath)
             if not os.path.exists(log_file_dir):
                 try:
                     os.makedirs(log_file_dir, exist_ok=True)
-                    utils_logger.info(f"Created directory for log file: {log_file_dir}")
+                    # utils_logger.info(f"Created directory for log file: {log_file_dir}") # 使用print替代，避免日志级别问题
+                    print(f"COMMON_UTILS_LOG_DATA: Created directory for log file: {log_file_dir}")
                 except Exception as e_mkdir:
-                    utils_logger.error(f"Error creating directory {log_file_dir} for log file: {e_mkdir}")
-                    return # Prevent writing if directory creation fails
+                    # utils_logger.error(f"Error creating directory {log_file_dir} for log file: {e_mkdir}")
+                    print(f"COMMON_UTILS_LOG_DATA: Error creating directory {log_file_dir} for log file: {e_mkdir}")
+                    return 
 
             with open(filepath, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(interaction_data, ensure_ascii=False) + "\n")
+                json_string_to_write = json.dumps(interaction_data, ensure_ascii=False, default=str)
+
+                # --- 新增 DEBUG 日志 ---
+                print(f"COMMON_UTILS_LOG_DATA: JSON string to write (first 300 chars): {json_string_to_write[:300]}...")
+                if "\"final_context_docs_full\"" not in json_string_to_write: # 检查序列化后的字符串
+                    print(f"COMMON_UTILS_LOG_DATA: CRITICAL! 'final_context_docs_full' NOT IN JSON string after dumps!")
+                # --- 结束新增 DEBUG 日志 ---
+                
+                f.write(json_string_to_write + "\n")
         
         await asyncio.to_thread(_write_sync)
         # utils_logger.debug(f"Successfully logged data (type: {interaction_data.get('task_type', 'N/A')}) to {filepath}")

@@ -4,6 +4,8 @@ import os
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from collections import Counter
+from datetime import datetime
+import glob 
 
 # --- 从项目中导入必要的模块 ---
 try:
@@ -161,27 +163,38 @@ def perform_answer_evaluation_analysis(
         return False
 
 if __name__ == "__main__":
-    EVALUATION_NAME_FOR_ANSWER = "answer_gemini_flash" # Must match the name used in batch_eval_answer.py / evaluator.py
+    EVALUATION_NAME_FOR_ANSWER = "answer_gemini_flash" 
     
-    # Similar to analyze_cypher.py, we'll try to use the date from the previous successful run.
-    target_date_str = "20250530" # From your previous successful run log for Cypher, assuming Answer evals are on same day.
-                                 # Adjust if your answer eval logs have different dates.
-
-    log_file_name_answer = f"eval_results_{EVALUATION_NAME_FOR_ANSWER}_{target_date_str}.jsonl"
-    log_file_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, log_file_name_answer)
-
-    output_csv_name_answer = f"analysis_{EVALUATION_NAME_FOR_ANSWER}_{target_date_str}.csv"
-    output_csv_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_answer)
-
-    if not os.path.exists(log_file_path_answer):
-        analyze_answer_logger.error(f"Answer evaluation log file for analysis not found: {log_file_path_answer}")
-        analyze_answer_logger.info("Please ensure the filename and date match an existing evaluation log.")
-        # Fallback logic similar to analyze_cypher.py could be added here if needed.
+    # --- 动态查找最新的评估结果日志文件 ---
+    eval_logs_pattern = os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"eval_results_{EVALUATION_NAME_FOR_ANSWER}_*.jsonl")
+    all_eval_logs = sorted(glob.glob(eval_logs_pattern), key=os.path.getmtime, reverse=True)
     
-    if log_file_path_answer and os.path.exists(log_file_path_answer):
+    log_file_path_answer: Optional[str] = None
+    output_csv_path_answer: Optional[str] = None
+
+    if all_eval_logs:
+        log_file_path_answer = all_eval_logs[0] # 获取最新的一个
+        analyze_answer_logger.info(f"Found latest Answer evaluation log for analysis: {log_file_path_answer}")
+        
+        # 根据找到的日志文件名构造输出的 CSV 文件名
+        base_log_name = os.path.basename(log_file_path_answer)
+        # 从 "eval_results_answer_gemini_flash_YYYYMMDD.jsonl" 生成 "analysis_answer_gemini_flash_YYYYMMDD.csv"
+        if base_log_name.startswith(f"eval_results_{EVALUATION_NAME_FOR_ANSWER}_") and base_log_name.endswith(".jsonl"):
+            date_part_from_filename = base_log_name[len(f"eval_results_{EVALUATION_NAME_FOR_ANSWER}_"):-len(".jsonl")]
+            output_csv_name_answer = f"analysis_{EVALUATION_NAME_FOR_ANSWER}_{date_part_from_filename}.csv"
+            output_csv_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_answer)
+        else: # Fallback naming for CSV
+            today_str = datetime.now().strftime("%Y%m%d")
+            output_csv_name_answer = f"analysis_{EVALUATION_NAME_FOR_ANSWER}_{today_str}_fallback.csv"
+            output_csv_path_answer = os.path.join(EVALUATION_RESULTS_LOGS_DIR, output_csv_name_answer)
+        analyze_answer_logger.info(f"Analysis CSV report will be saved to: {output_csv_path_answer}")
+    else:
+        analyze_answer_logger.error(f"No Answer evaluation log files found matching pattern: {eval_logs_pattern}")
+
+    if log_file_path_answer and output_csv_path_answer and os.path.exists(log_file_path_answer):
         perform_answer_evaluation_analysis(
             evaluation_log_filepath=log_file_path_answer,
             output_csv_filepath=output_csv_path_answer
         )
     else:
-        analyze_answer_logger.info("Answer evaluation analysis will not run as no suitable log file was identified.")
+        analyze_answer_logger.info("Answer evaluation analysis will not run as no suitable log file was identified or output path could not be determined.")

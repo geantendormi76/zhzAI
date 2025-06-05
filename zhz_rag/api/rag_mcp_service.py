@@ -1,5 +1,3 @@
-# zhz_agent/rag_service.py
-
 import os
 import json
 import asyncio
@@ -103,7 +101,7 @@ async def app_lifespan_for_rag_service(server: FastMCP) -> AsyncIterator[AppCont
         embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH", "/home/zhz/models/bge-small-zh-v1.5")
 
         if not os.path.isdir(chroma_persist_dir):
-             rag_logger.warning(f"ChromaDB persist directory '{chroma_persist_dir}' not found. Retrieval may fail or use an in-memory DB if ChromaDBRetriever handles this.")
+                rag_logger.warning(f"ChromaDB persist directory '{chroma_persist_dir}' not found. Retrieval may fail or use an in-memory DB if ChromaDBRetriever handles this.")
         if not os.path.exists(embedding_model_path): # embedding_model_path 应该是目录
             rag_logger.warning(f"Embedding model path '{embedding_model_path}' not found. ChromaDBRetriever initialization might fail.")
 
@@ -181,7 +179,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
     top_k_final: int = 3 # 最终融合后返回的文档数
 ) -> str: 
     rag_logger.info(f"\n--- RAG Service (query_rag_v2): 接收到查询: '{query}' ---")
-    rag_logger.info(f"    Params: top_k_vector={top_k_vector}, top_k_kg={top_k_kg}, top_k_bm25={top_k_bm25}, top_k_final={top_k_final}")
+    rag_logger.info(f"      Params: top_k_vector={top_k_vector}, top_k_kg={top_k_kg}, top_k_bm25={top_k_bm25}, top_k_final={top_k_final}")
     start_time_total = time.time()
 
     app_ctx: AppContext = ctx.request_context.lifespan_context
@@ -190,7 +188,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
     final_json_output = ""
     # --- [新增日志变量] ---
     log_all_raw_retrievals_summary: List[Dict[str, Any]] = []
-    log_final_context_docs_summary: List[Dict[str, Any]] = []
+    log_final_context_docs_summary: List[Dict[str, Any]] = [] # This will store the full doc model dumps
     log_fused_context_text_for_llm_snippet: str = "N/A"
     log_final_answer_from_llm: str = "N/A"
     log_intent_classification_result: Optional[Dict[str, Any]] = None
@@ -215,18 +213,12 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                 "debug_info": {"uncertainty_reason": uncertainty_reason, "source": "intent_classification"}
             }
             rag_logger.info(f"--- 需要澄清，返回: {response_payload}")
-            final_json_output = json.dumps(response_payload, ensure_ascii=False)
-            # --- [修改日志记录点] 将日志记录移至 try-except-finally 外部的统一记录点 ---
-            # sys.stdout.flush(); sys.stderr.flush() # 这行可以移除，MCP会处理
-            # return final_json_output # 暂时不返回，确保日志被记录
+            # final_json_output will be set before finally block
 
         else: # 如果不需要澄清，则继续RAG流程
             # --- 暂时禁用查询扩展 ---
             rag_logger.info(f"--- 查询清晰，无需澄清。RAG流程将仅针对原始查询 '{query}' 执行 (查询扩展已暂时禁用) ---")
-            # start_time_expansion = time.time() # 注释掉
-            # expanded_queries = await generate_expanded_queries(query) # 注释掉
             log_expanded_queries = [] # 将其设置为空列表，以便 finally 块中的日志记录
-            # rag_logger.info(f"--- 扩展查询列表 (共 {len(expanded_queries)} 个): {expanded_queries}. 耗时: {time.time() - start_time_expansion:.2f}s ---") # 注释掉
             
             all_raw_retrievals: List[RetrievedDocument] = []
             
@@ -241,7 +233,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                 if app_ctx.chroma_retriever:
                     try:
                         chroma_docs_raw = app_ctx.chroma_retriever.retrieve(query_text=current_query_text, n_results=top_k_vector)
-                        rag_logger.debug(f"  ChromaDB for '{current_query_text}' raw output: {chroma_docs_raw}") # <--- 新增详细日志
+                        rag_logger.debug(f"   ChromaDB for '{current_query_text}' raw output: {chroma_docs_raw}") 
                         for doc_raw in chroma_docs_raw:
                             retrieved_doc = RetrievedDocument(
                                 source_type="vector_chroma",
@@ -250,16 +242,16 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                                 metadata={**doc_raw.get("metadata", {}), "original_query_part": current_query_text}
                             )
                             all_raw_retrievals.append(retrieved_doc)
-                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
-                        rag_logger.info(f"  ChromaDB for '{current_query_text}': found {len(chroma_docs_raw)} docs.")
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) 
+                        rag_logger.info(f"   ChromaDB for '{current_query_text}': found {len(chroma_docs_raw)} docs.")
                     except Exception as e_chroma:
-                        rag_logger.error(f"  Error during ChromaDB retrieval for '{current_query_text}': {e_chroma}", exc_info=True)
+                        rag_logger.error(f"   Error during ChromaDB retrieval for '{current_query_text}': {e_chroma}", exc_info=True)
                 
                 # 关键词检索 (BM25)
                 if app_ctx.file_bm25_retriever:
                     try:
                         bm25_docs_raw = app_ctx.file_bm25_retriever.retrieve(query_text=current_query_text, n_results=top_k_bm25)
-                        rag_logger.debug(f"  BM25 for '{current_query_text}' raw output (IDs and scores): {bm25_docs_raw}") # <--- 新增详细日志
+                        rag_logger.debug(f"   BM25 for '{current_query_text}' raw output (IDs and scores): {bm25_docs_raw}") 
                         for doc_raw_bm25 in bm25_docs_raw:
                             bm25_chunk_id = doc_raw_bm25.get("id")
                             text_content_for_bm25 = f"[BM25: Text for ID {bm25_chunk_id} pending]"
@@ -271,11 +263,15 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                                     break
                             if not found_in_chroma and app_ctx.chroma_retriever and bm25_chunk_id: 
                                 try:
-                                    specific_chroma_doc = app_ctx.chroma_retriever._collection.get(ids=[bm25_chunk_id], include=["metadatas"])
-                                    if specific_chroma_doc and specific_chroma_doc.get("metadatas") and specific_chroma_doc.get("metadatas")[0]:
-                                        text_content_for_bm25 = specific_chroma_doc["metadatas"][0].get("chunk_text", text_content_for_bm25)
+                                    specific_chroma_doc = app_ctx.chroma_retriever._collection.get(ids=[bm25_chunk_id], include=["metadatas", "documents"]) # Also fetch documents for content
+                                    if specific_chroma_doc:
+                                        if specific_chroma_doc.get("documents") and specific_chroma_doc.get("documents")[0]:
+                                            text_content_for_bm25 = specific_chroma_doc["documents"][0]
+                                        elif specific_chroma_doc.get("metadatas") and specific_chroma_doc.get("metadatas")[0]: # Fallback to chunk_text in metadata
+                                            text_content_for_bm25 = specific_chroma_doc["metadatas"][0].get("chunk_text", text_content_for_bm25)
+
                                 except Exception as e_chroma_get:
-                                    rag_logger.warning(f"  Failed to get text for BM25 ID {bm25_chunk_id} from Chroma: {e_chroma_get}")
+                                    rag_logger.warning(f"   Failed to get text for BM25 ID {bm25_chunk_id} from Chroma: {e_chroma_get}")
                             
                             retrieved_doc = RetrievedDocument(
                                 source_type="keyword_bm25s",
@@ -284,17 +280,17 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                                 metadata={"chunk_id": bm25_chunk_id, "original_query_part": current_query_text}
                             )
                             all_raw_retrievals.append(retrieved_doc)
-                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
-                        rag_logger.info(f"  BM25s for '{current_query_text}': found {len(bm25_docs_raw)} potential docs.")
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) 
+                        rag_logger.info(f"   BM25s for '{current_query_text}': found {len(bm25_docs_raw)} potential docs.")
                     except Exception as e_bm25:
-                        rag_logger.error(f"  Error during BM25 retrieval for '{current_query_text}': {e_bm25}", exc_info=True)
+                        rag_logger.error(f"   Error during BM25 retrieval for '{current_query_text}': {e_bm25}", exc_info=True)
 
                 # 知识图谱检索
                 if app_ctx.kg_retriever:
                     try:
-                        rag_logger.info(f"  Performing KG retrieval for query: '{current_query_text}'")
+                        rag_logger.info(f"   Performing KG retrieval for query: '{current_query_text}'")
                         kg_docs = await app_ctx.kg_retriever.retrieve_with_llm_cypher(query=current_query_text, top_k=top_k_kg)
-                        rag_logger.debug(f"  KG for '{current_query_text}' raw output: {kg_docs}") # <--- 新增详细日志
+                        rag_logger.debug(f"   KG for '{current_query_text}' raw output: {kg_docs}") 
                         for kg_doc_data in kg_docs: # kg_docs is List[Dict], needs conversion
                             retrieved_doc = RetrievedDocument(**kg_doc_data) # Convert dict to Pydantic model
                             if retrieved_doc.metadata:
@@ -302,30 +298,29 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                             else:
                                 retrieved_doc.metadata = {"original_query_part": current_query_text}
                             all_raw_retrievals.append(retrieved_doc)
-                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) # <--- 记录日志
-                        rag_logger.info(f"  KG Retrieval for '{current_query_text}': found {len(kg_docs)} results.")
+                            log_all_raw_retrievals_summary.append(retrieved_doc.model_dump()) 
+                        rag_logger.info(f"   KG Retrieval for '{current_query_text}': found {len(kg_docs)} results.")
                     except Exception as e_kg:
-                        rag_logger.error(f"  Error during KG retrieval for '{current_query_text}': {e_kg}", exc_info=True)
+                        rag_logger.error(f"   Error during KG retrieval for '{current_query_text}': {e_kg}", exc_info=True)
             
             rag_logger.info(f"--- [TIME] 结束所有召回, 耗时: {time.time() - start_time_retrieval:.2f}s ---")
             rag_logger.info(f"--- 总计从各路召回（所有查询处理后）的结果数: {len(all_raw_retrievals)} ---")
             if all_raw_retrievals:
                 for i_doc, doc_retrieved in enumerate(all_raw_retrievals[:3]): # 日志只打印前3条摘要
-                     rag_logger.debug(f"  Raw Doc {i_doc} (Summary): type={doc_retrieved.source_type}, score={doc_retrieved.score}, content='{str(doc_retrieved.content)[:50]}...'")
+                        rag_logger.debug(f"   Raw Doc {i_doc} (Summary): type={doc_retrieved.source_type}, score={doc_retrieved.score}, content='{str(doc_retrieved.content)[:50]}...'")
 
             if not all_raw_retrievals: 
                 response_payload = {
                     "status": "success", 
                     "final_answer": "抱歉，根据您提供的查询，未能从知识库中找到相关信息。",
                     "original_query": original_query_for_response,
-                    "retrieved_context_docs": [], # <--- 确保即使没有结果也返回空列表
+                    "retrieved_context_docs": [], 
                     "debug_info": {"message": "No documents retrieved from any source."}
                 }
-                # final_json_output = json.dumps(response_payload, ensure_ascii=False) # 移到 finally 外部
-                # return final_json_output # 移到 finally 外部
             else:
                 rag_logger.info(f"--- [TIME] 开始结果融合与重排序 at {time.time() - start_time_total:.2f}s ---")
                 start_time_fusion = time.time()
+                final_context_docs: List[RetrievedDocument]
                 if not app_ctx.fusion_engine:
                     rag_logger.error("FusionEngine not available! Skipping fusion and reranking.")
                     final_context_docs = sorted(all_raw_retrievals, key=lambda d: d.score if d.score is not None else -float('inf'), reverse=True)[:top_k_final]
@@ -335,11 +330,17 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                         original_query_for_response,
                         top_n_final=top_k_final
                     ) 
-                log_final_context_docs_summary = [doc.model_dump() for doc in final_context_docs] # <--- 记录日志
+                log_final_context_docs_summary = [doc.model_dump() for doc in final_context_docs] 
+
+                # --- 新增日志，检查 model_dump 的输出 ---
+                if log_final_context_docs_summary:
+                    rag_logger.info(f"DEBUG_MODEL_DUMP: First item of log_final_context_docs_summary (from model_dump()): {json.dumps(log_final_context_docs_summary[0], ensure_ascii=False, default=str)}")
+                # --- 结束新增日志 ---
+
                 rag_logger.info(f"--- [TIME] 结束结果融合与重排序, 耗时: {time.time() - start_time_fusion:.2f}s. Final context docs: {len(final_context_docs)} ---")
                 if final_context_docs:
                     for i_fdoc, fdoc_retrieved in enumerate(final_context_docs[:3]): # 日志只打印前3条摘要
-                        rag_logger.debug(f"  Fused Doc {i_fdoc} (Summary): type={fdoc_retrieved.source_type}, score={fdoc_retrieved.score}, content='{str(fdoc_retrieved.content)[:50]}...'")
+                        rag_logger.debug(f"   Fused Doc {i_fdoc} (Summary): type={fdoc_retrieved.source_type}, score={fdoc_retrieved.score}, content='{str(fdoc_retrieved.content)[:50]}...'")
                 
                 if not final_context_docs: 
                     fused_context_text_for_llm = "未在知识库中找到相关信息。"
@@ -348,7 +349,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                         "status": "success",
                         "final_answer": final_answer_from_llm,
                         "original_query": original_query_for_response,
-                        "retrieved_context_docs": [], # <--- 确保空列表
+                        "retrieved_context_docs": [], 
                         "debug_info": {"message": "No relevant context found after fusion."}
                     }
                 else:
@@ -359,7 +360,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                             f"Source Type: {doc.source_type}, Score: {score_str}\nContent: {doc.content}"
                         )
                     fused_context_text_for_llm = "\n\n---\n\n".join(context_strings_for_llm)
-                    log_fused_context_text_for_llm_snippet = fused_context_text_for_llm[:500] # <--- 记录日志
+                    log_fused_context_text_for_llm_snippet = fused_context_text_for_llm[:500] 
 
                     rag_logger.info(f"\n--- FUSED CONTEXT for LLM (length: {len(fused_context_text_for_llm)} chars) ---")
                     rag_logger.info(f"{fused_context_text_for_llm[:1000]}...") 
@@ -368,7 +369,7 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                     rag_logger.info(f"--- [TIME] 开始最终答案生成 at {time.time() - start_time_total:.2f}s ---")
                     start_time_answer_gen = time.time()
                     final_answer_from_llm = await generate_answer_from_context(query, fused_context_text_for_llm)
-                    log_final_answer_from_llm = final_answer_from_llm or "N/A" # <--- 记录日志
+                    log_final_answer_from_llm = final_answer_from_llm or "N/A" 
                     rag_logger.info(f"--- [TIME] 结束最终答案生成, 耗时: {time.time() - start_time_answer_gen:.2f}s ---")
 
                     if not final_answer_from_llm or final_answer_from_llm.strip() == NO_ANSWER_PHRASE_ANSWER_CLEAN:
@@ -382,7 +383,6 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
                         "debug_info": {"total_raw_retrievals_count": len(all_raw_retrievals)}
                     }
 
-        # 日志记录统一移到 finally 块之前
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
         rag_logger.info(f"--- 'query_rag_v2' 逻辑执行完毕, 总耗时: {time.time() - start_time_total:.2f}s. ---")
         
@@ -397,53 +397,62 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
             "debug_info": {"exception_type": type(e_main).__name__}
         }
         final_json_output = json.dumps(response_payload, ensure_ascii=False)
-    finally: # --- [新增 finally 块用于统一日志记录] ---
+    finally: 
         interaction_id_for_log = str(uuid.uuid4())
-        current_app_version = "zhz_rag_mcp_service_0.2.0" # 可以从配置读取
-        
-        # 收集所有日志信息
+        current_app_version = "zhz_rag_mcp_service_0.2.1" 
+
+        processed_final_context_docs_for_log = []
+        temp_log_final_context_docs = locals().get('log_final_context_docs_summary') # 安全获取
+
+        if temp_log_final_context_docs: # 如果 RAG 流程成功并且 final_context_docs 被处理了
+            for doc_dict in temp_log_final_context_docs: # temp_log_final_context_docs 是 model_dump() 后的列表
+                cleaned_doc = {}
+                for key, value in doc_dict.items():
+                    if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')): 
+                        cleaned_doc[key] = None 
+                    else:
+                        cleaned_doc[key] = value
+                processed_final_context_docs_for_log.append(cleaned_doc)
+        # 如果 temp_log_final_context_docs 为 None (例如澄清路径)，则 processed_final_context_docs_for_log 保持为 []
+
         full_log_entry = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "interaction_id": interaction_id_for_log,
-            "task_type": "rag_query_processing_full_log", # 新的task_type
+            "original_query_interaction_id_ref": locals().get('original_query_interaction_id'), 
+            "task_type": "rag_query_processing_full_log",
             "app_version": current_app_version,
-            "original_user_query": original_query_for_response,
+            "original_user_query": locals().get('original_query_for_response', query), # query 总是有定义的
             "query_params": {
                 "top_k_vector": top_k_vector, "top_k_kg": top_k_kg, 
                 "top_k_bm25": top_k_bm25, "top_k_final": top_k_final
             },
-            "intent_classification_result": log_intent_classification_result,
-            "expanded_queries": log_expanded_queries,
-            "all_raw_retrievals_count": len(log_all_raw_retrievals_summary),
-            # "all_raw_retrievals_summary": log_all_raw_retrievals_summary, # 可能过长，先注释
-            "final_context_docs_count": len(log_final_context_docs_summary),
-            "final_context_docs_summary": [ # 只记录摘要
-                {"source": doc.get("source_type"), "score": doc.get("score"), "id": doc.get("metadata",{}).get("chunk_id") or doc.get("metadata",{}).get("id"), "content_preview": str(doc.get("content",""))[:50]+"..."} 
-                for doc in log_final_context_docs_summary[:5] # 最多记录5条摘要
+            "intent_classification_result": locals().get('log_intent_classification_result'),
+            "expanded_queries": locals().get('log_expanded_queries', []), # 默认为空列表
+            "all_raw_retrievals_count": len(locals().get('log_all_raw_retrievals_summary', [])),
+            "final_context_docs_count": len(processed_final_context_docs_for_log), # 使用清理后列表的长度
+            "final_context_docs_summary": [ 
+                {
+                    "source_type": doc.get("source_type"), 
+                    "score": doc.get("score"), 
+                    "id": (doc.get("metadata",{}).get("chunk_id") or doc.get("metadata",{}).get("id")) if doc.get("metadata") else None, 
+                    "content_preview": str(doc.get("content","N/A"))[:50]+"..."
+                } 
+                for doc in processed_final_context_docs_for_log[:5] # 使用清理后列表的摘要
             ], 
-            # "final_context_docs_full": log_final_context_docs_summary, # 完整版，可能过长，先注释
-            "fused_context_text_for_llm_snippet": log_fused_context_text_for_llm_snippet,
-            "final_answer_from_llm": log_final_answer_from_llm,
-            "final_response_payload_status": response_payload.get("status"),
-            "total_processing_time_seconds": round(time.time() - start_time_total, 2),
+            "final_context_docs_full": processed_final_context_docs_for_log, # <--- 使用清理后的完整列表
+            "fused_context_text_for_llm_snippet": locals().get('log_fused_context_text_for_llm_snippet', "N/A"),
+            "final_answer_from_llm": locals().get('log_final_answer_from_llm', "N/A"),
+            "final_response_payload_status": locals().get('response_payload', {}).get("status", "Unknown"),
+            "total_processing_time_seconds": round(time.time() - start_time_total, 2) if 'start_time_total' in locals() else -1,
         }
-        if response_payload.get("status") == "error":
-            full_log_entry["error_details_in_response"] = {
-                "error_code": response_payload.get("error_code"),
-                "error_message": response_payload.get("error_message"),
-                "exception_type": response_payload.get("debug_info",{}).get("exception_type")
-            }
-            full_log_entry["raw_traceback_if_available_in_service"] = traceback.format_exc() if 'e_main' in locals() else "No exception caught in main block or e_main not available."
-
 
         try:
-            await log_interaction_data(full_log_entry) # 使用通用的日志函数
+            await log_interaction_data(full_log_entry) 
             rag_logger.info(f"Full RAG interaction log (ID: {interaction_id_for_log}) has been written.")
         except Exception as e_log_final:
             rag_logger.error(f"CRITICAL: Failed to write full RAG interaction log: {e_log_final}", exc_info=True)
         
-        sys.stdout.flush(); sys.stderr.flush() # 确保所有打印输出
-        # --- [结束 finally 块] ---
+        sys.stdout.flush(); sys.stderr.flush() 
     
     return final_json_output
 
