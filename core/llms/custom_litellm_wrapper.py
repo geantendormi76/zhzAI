@@ -242,6 +242,39 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
             
         logger.debug(f"  LiteLLM Call Args (cleaned, messages excluded, proxy shown if used): {debug_params_to_print}")
         
+        # --- 添加以下详细日志 ---
+        logger.info("--------------------------------------------------------------------")
+        logger.info(f"DEBUGGING TOOLS PASSED TO LITELLM for model {self.model_name} (Manager Agent call):") # 区分是Manager还是Worker的调用
+
+        effective_tools_to_log = litellm_call_args_cleaned.get("tools")
+
+        if effective_tools_to_log:
+            try:
+                tools_json_str = json.dumps(effective_tools_to_log, indent=2, ensure_ascii=False)
+                logger.info(f"  Tools (Content):\n{tools_json_str}")
+                # 专门检查 web_search_tool 是否存在
+                web_search_tool_found_in_definition = any(
+                    tool.get("function", {}).get("name") == "web_search_tool" 
+                    for tool in effective_tools_to_log if isinstance(tool, dict)
+                )
+                if web_search_tool_found_in_definition:
+                    logger.info("  >>>> web_search_tool IS PRESENT in the tools definition passed to LiteLLM. <<<<")
+                else:
+                    logger.warning("  >>>> web_search_tool IS MISSING from the tools definition passed to LiteLLM! <<<<")
+
+            except Exception as e_log_json:
+                logger.error(f"  Error serializing tools for logging: {e_log_json}")
+                logger.info(f"  Tools (Raw Object, could not serialize): {effective_tools_to_log}")
+        else:
+            logger.info("  Tools: Not present in litellm_call_args_cleaned (effective_tools_to_log is None or empty)")
+            
+        if "tool_choice" in litellm_call_args_cleaned:
+            logger.info(f"  Tool Choice: {litellm_call_args_cleaned['tool_choice']}")
+        else:
+            logger.info("  Tool Choice: Not present in litellm_call_args_cleaned")
+        logger.info("--------------------------------------------------------------------")
+        # --- 详细日志结束 ---
+
         response = None 
         try:
             response = litellm.completion(**litellm_call_args_cleaned) 

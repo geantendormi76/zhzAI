@@ -14,6 +14,23 @@
         "BM25_INDEX_DIRECTORY": "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index",
         "KUZU_DB_PATH": "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db"
       }
+    },    
+    "ddgsearch": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"], 
+      "disabled": false,
+      "autoApprove": ["search", "fetch_content"] 
+    },   
+    "amap-maps": {
+      "command": "node",
+      "args": [
+        "/home/zhz/mcp/amap-maps-mcp-server/build/index.js"
+      ],
+      "cwd": "/home/zhz/mcp/amap-maps-mcp-server",
+      "env": {
+        "AMAP_MAPS_API_KEY": "1ca72c66e1c964ce73eecd3822174442"
+      },
+      "disabled": false
     }
   }
 }

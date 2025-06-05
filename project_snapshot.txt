@@ -42,6 +42,9 @@ from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
 from core.tools.search_tool import WebSearchTool
+from core.tools.time_tool import GetCurrentTimeTool
+from core.tools.calculator_tool import CalculateTool
+
 
 AGENT_SERVICE_PORT = int(os.getenv("AGENT_SERVICE_PORT", 8090))
 AGENT_SERVICE_HOST = "0.0.0.0"
@@ -72,13 +75,17 @@ manager_agent_instance: Optional[Agent] = None
 worker_agent_instance: Optional[Agent] = None
 core_tools_instances: List[BaseTool] = []
 
+# --- 覆盖开始 ---
 CORE_TOOLS_ZHZ_AGENT = {
     "enhanced_rag_tool": "【核心RAG工具】用于从本地知识库查找信息、回答复杂问题，整合了向量、关键词和图谱检索。",
-    "excel_operation_tool": "【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。",
-    "web_search_tool": "【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。"
+    "excel_operation_tool": "【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。此工具通过本地代理在Windows上运行。",
+    "web_search_tool": "【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。此工具通过MCP调用。",
+    "get_current_time_tool": "【时间工具】获取当前的日期和时间，可指定时区。此工具在Agent的Python环境中直接执行。",
+    "calculate_tool": "【计算器工具】执行数学表达式的计算并返回数值结果。此工具在Agent的Python环境中直接执行。"
 }
-CORE_TOOL_NAMES_LIST = list(CORE_TOOLS_ZHZ_AGENT.keys())
-TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
+# --- 覆盖结束 ---
+CORE_TOOL_NAMES_LIST = list(CORE_TOOLS_ZHZ_AGENT.keys()) # 这行会自动更新
+TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join( # 这行会自动更新
     [f"- '{name}': {desc}" for name, desc in CORE_TOOLS_ZHZ_AGENT.items()]
 )
 
@@ -92,57 +99,50 @@ async def lifespan(app: FastAPI):
 
     # --- 步骤 1: 初始化核心工具实例 ---
     print("Initializing core tool instances...")
-    enhanced_rag_tool_instance = None # 先声明变量
+    enhanced_rag_tool_instance = None 
+    excel_operation_tool_instance = None
+    web_search_tool_instance = None
+    get_current_time_tool_instance = None
+    calculate_tool_instance = None
     try:
-        enhanced_rag_tool_instance = EnhancedRAGTool() # 尝试创建
-        excel_operation_tool_instance = ExcelOperationTool()
-        web_search_tool_instance = WebSearchTool()
-        
-        # 完整的工具列表，暂时不用，但保留定义
-        _all_core_tools_full_list = [
-            enhanced_rag_tool_instance,
-            excel_operation_tool_instance,
-            web_search_tool_instance,
-        ]
-        print(f"Full list of core tools that COULD be initialized: {[tool.name for tool in _all_core_tools_full_list]}")
+        enhanced_rag_tool_instance = EnhancedRAGTool()
+        excel_operation_tool_instance = ExcelOperationTool() # 尝试实例化
+        web_search_tool_instance = WebSearchTool()       # 尝试实例化
+        get_current_time_tool_instance = GetCurrentTimeTool()
+        calculate_tool_instance = CalculateTool()
 
-        # --- 核心修改：当前测试只关注 RAG 工具 ---
-        if enhanced_rag_tool_instance: # 确保 RAG 工具已成功实例化
-            core_tools_instances = [enhanced_rag_tool_instance] # 全局的 core_tools_instances 现在只包含 RAG 工具
-            
-            # --- 动态修改 Manager Prompt 中可见的工具列表 ---
-            # 基于当前 core_tools_instances (只含RAG工具) 来生成
-            CORE_TOOL_NAMES_LIST = [tool.name for tool in core_tools_instances]
-            TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
-                [f"- '{name}': {CORE_TOOLS_ZHZ_AGENT.get(name, 'Unknown Tool Description')}" for name in CORE_TOOL_NAMES_LIST]
-            )
-            print(f"--- FOR CURRENT RAG TEST ---")
-            print(f"Effective CORE_TOOL_NAMES_LIST for Manager: {CORE_TOOL_NAMES_LIST}")
-            print(f"Effective TOOL_OPTIONS_STR_FOR_MANAGER for Manager:\n{TOOL_OPTIONS_STR_FOR_MANAGER}")
-            print(f"--- END OF RAG TEST CONFIG ---")
+        core_tools_instances = []
+        if enhanced_rag_tool_instance:
+            core_tools_instances.append(enhanced_rag_tool_instance)
+        if get_current_time_tool_instance:
+            core_tools_instances.append(get_current_time_tool_instance)
+        if calculate_tool_instance:
+            core_tools_instances.append(calculate_tool_instance)
+        if excel_operation_tool_instance:
+            core_tools_instances.append(excel_operation_tool_instance)
+        if web_search_tool_instance:
+            core_tools_instances.append(web_search_tool_instance)
 
-        else: # 如果 RAG 工具实例化失败
-            print("CRITICAL ERROR: EnhancedRAGTool instance could not be created. Aborting LLM/Agent setup for RAG test.")
-            core_tools_instances = []
-            CORE_TOOL_NAMES_LIST = []
-            TOOL_OPTIONS_STR_FOR_MANAGER = "No tools available."
-
-
-        print(f"Core tools initialized for current test run: {[tool.name for tool in core_tools_instances]}")
-        print(f"DEBUG LIFESPAN: core_tools_instances type: {type(core_tools_instances)}")
-        if core_tools_instances:
-            print(f"DEBUG LIFESPAN: core_tools_instances length: {len(core_tools_instances)}")
-            for idx, tool_item in enumerate(core_tools_instances):
-                tool_name_attr = getattr(tool_item, 'name', 'Name_Attribute_Missing')
-                print(f"DEBUG LIFESPAN: Tool {idx} - Type: {type(tool_item)}, Name: {tool_name_attr}")
+        if not core_tools_instances:
+            print("CRITICAL ERROR: No core tools could be initialized. Aborting LLM/Agent setup.")
+            # 在这种情况下，后续的LLM和Agent初始化可能会失败或无意义
+            # 可以考虑在这里抛出异常或设置一个全局状态阻止服务启动
         else:
-            print("DEBUG LIFESPAN: core_tools_instances is empty or None after initialization attempt.")
-            
+            print(f"Successfully initialized tools: {[tool.name for tool in core_tools_instances]}")
+        print(f"--- FULL TOOL CONFIGURATION WILL BE USED BY MANAGER (if successfully initialized) ---")
+        print(f"Effective CORE_TOOL_NAMES_LIST for Manager (based on global def): {CORE_TOOL_NAMES_LIST}") # 这是全局的
+        print(f"Effective TOOL_OPTIONS_STR_FOR_MANAGER for Manager (based on global def):\n{TOOL_OPTIONS_STR_FOR_MANAGER}") # 这是全局的
+        print(f"Actually initialized tools for Worker: {[tool.name for tool in core_tools_instances]}")
+        print(f"--- END OF TOOL CONFIGURATION ---")
+        
     except Exception as e:
         print(f"ERROR during core tool initialization: {e}", exc_info=True)
-        core_tools_instances = []
-        CORE_TOOL_NAMES_LIST = []
-        TOOL_OPTIONS_STR_FOR_MANAGER = "Tool initialization failed."
+        core_tools_instances = [] # 确保出错时为空列表
+        # 后续LLM/Agent初始化时，如果 core_tools_instances 为空，它们可能需要特殊处理或报错
+
+    # ... 后续的LLM和Agent初始化代码 ...
+    # 确保 Manager Agent 的 tools=[] (它不直接调用工具)
+    # 确保 Worker Agent 的 tools=core_tools_instances (它需要所有可用的工具实例)
 
 
     # --- 步骤 2: 初始化 LLM 实例 ---
@@ -200,27 +200,164 @@ async def lifespan(app: FastAPI):
     if manager_llm:
         manager_agent_instance = Agent(
             role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
-            goal=f"""【深入理解并分解】用户提出的复杂请求 (当前请求将通过任务描述提供) 成为一系列逻辑子任务。
-【核心决策1 - 优先自主回答】：在选择任何工具之前，请首先判断你是否能基于自身知识库和推理能力【直接回答】用户的全部或核心部分请求。如果可以，你的主要输出应是包含直接答案的JSON。
-【核心决策2 - Excel复杂查询处理】：如果用户的请求涉及到对Excel文件进行一个或多个复杂的数据查询、筛选、聚合或排序等操作，并且你无法直接回答，你【必须】选择 "excel_operation_tool" 工具。并且，你【必须】为这些Excel操作【构建一个结构化查询对象 (SQO) 的JSON列表】，并将其作为输出JSON中 `excel_sqo_payload` 字段的值。列表中的【每一个SQO字典】都需要包含一个明确的 "operation_type" 和该操作对应的参数，但【不要包含 "file_path" 或 "sheet_name"】。
-【核心决策3 - 其他工具选择】：如果需要从本地知识库获取深度信息，选择 "enhanced_rag_tool"。如果需要网络实时信息，选择 "web_search_tool"。选择工具后，你需要准备好传递给该工具的参数，并将其放在输出JSON的 `tool_input_args` 字段中。
-【核心决策4 - 通用请求/无适用工具】：如果用户请求是生成通用文本、编写简单代码、回答一般性知识问题，并且你已判断可以【直接回答】，则无需选择任何特定功能性工具。此时输出JSON中 `selected_tool_names` 应为空列表，`excel_sqo_payload` 和 `tool_input_args` 为null，答案内容在 `direct_answer_content` 字段。
+            goal=f"""你的核心任务是分析用户的请求（该请求将在后续的任务描述中提供），并决定最佳的处理路径。你必须严格按照以下【工具选择规则和优先级】以及【示例】进行决策。
 
-最终，【严格按照指定的JSON格式】（即符合 `SubTaskDefinitionForManagerOutput` Pydantic模型）输出一个包含你的决策理由、用户原始请求、以及根据你的决策填充的 `direct_answer_content` 或 `selected_tool_names`、`tool_input_args`、`excel_sqo_payload` 的对象。
+**【决策规则与优先级】**
 
-【可供选择的本系统核心工具及其描述】:
-{TOOL_OPTIONS_STR_FOR_MANAGER} 
-""", # TOOL_OPTIONS_STR_FOR_MANAGER 会在这里被使用，它现在只包含 RAG 工具
-            backstory="""我是一位经验丰富的AI任务调度官和数据查询规划专家。我的核心工作流程如下：
-1.  **【深度理解与CoD规划 (内部进行)】**：我会对用户请求进行彻底分析，优先判断是否能直接利用我的知识库和推理能力给出完整答案。
-2.  **【工具选择与参数准备（如果无法直接回答）】**：
-    a.  **Excel复杂查询**: 当识别出需要对Excel执行复杂操作时，我选择 "excel_operation_tool" 工具，并为其生成包含多个SQO操作定义的【JSON列表】作为 `excel_sqo_payload`。每个SQO包含 `operation_type` 和所需参数，但不含 `file_path` 或 `sheet_name`。
-    b.  **RAG查询**: 若需从知识库获取信息，选择 "enhanced_rag_tool"，并准备 `tool_input_args`（例如 `{{ "query": "用户原始问题", "top_k_vector": 5, ... }}`）。
-    c.  **网络搜索**: 若需实时网络信息，选择 "web_search_tool"，并准备 `tool_input_args`（例如 `{{ "query": "搜索关键词" }}`）。
-    d.  **最简必要原则**: 只选择绝对必要的工具。
-3.  **【严格的输出格式】**: 我的唯一输出是一个JSON对象，该对象必须符合本服务定义的 `SubTaskDefinitionForManagerOutput` Pydantic模型结构，包含 `task_description` (用户原始请求), `reasoning_for_plan`, 以及根据决策填充的 `selected_tool_names` (可为空), `direct_answer_content` (如果直接回答), `tool_input_args` (如果使用非Excel工具), 和 `excel_sqo_payload` (如果使用Excel工具)。
+1.  **【规则1：时间查询 - 强制使用工具】**
+    *   如果用户查询明确是关于【获取当前日期或时间】。
+    *   **行动**：【必须选择】`"get_current_time_tool"`。不要尝试自己回答“我没有实时时钟”。
+    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
 
-我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。""",
+2.  **【规则2：数学计算 - 强制使用工具】**
+    *   如果用户查询明确是要求【执行一个数学表达式的计算】。
+    *   **行动**：【必须选择】`"calculate_tool"`。不要尝试自己计算，即使很简单。
+    *   **参数**：为 `tool_input_args` 准备 `expression`。
+
+3.  **【规则3：实时/最新信息查询 - 网络搜索强制】**
+    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价等）。
+    *   **行动**：【必须且只能】选择 `"web_search_tool"`。
+    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
+    *   **禁止**：不要使用 "enhanced_rag_tool" 查找此类信息。
+
+4.  **【规则4：内部知识/文档深度查询 - RAG】**
+    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】。
+    *   **行动**：选择 `"enhanced_rag_tool"`。
+    *   **参数**：为 `tool_input_args` 准备 `query` 等。
+
+5.  **【规则5：Excel文件操作 - 强制使用工具】**
+    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行复杂操作】。
+    *   **行动**：【必须选择】`"excel_operation_tool"`。
+    *   **任务**：为其构建【结构化查询对象 (SQO) 的JSON列表】到 `excel_sqo_payload`。SQO不含 "file_path" 或 "sheet_name"。
+
+6.  **【规则6：LLM直接回答（在工具不适用后）】**
+    *   **仅当**以上所有规则都不适用，并且你判断可以基于你【已有的知识和常识】直接、准确、完整地回答用户的全部请求时。
+    *   **行动**：`selected_tool_names` 设为 `[]`，在 `direct_answer_content` 提供答案。
+
+7.  **【规则7：无法处理/需要澄清（最终回退）】**
+    *   如果所有规则都不适用，且你也无法直接回答。
+    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释，如果合适，在 `direct_answer_content` 中礼貌回复。
+
+**【可用工具的参考描述】：**
+{TOOL_OPTIONS_STR_FOR_MANAGER}
+
+**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
+
+<example>
+  <user_query>现在几点了？</user_query>
+  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
+  <output_json>{{
+    "task_description": "现在几点了？",
+    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
+    "selected_tool_names": ["get_current_time_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>计算 5 * (10 + 3)</user_query>
+  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
+  <output_json>{{
+    "task_description": "计算 5 * (10 + 3)",
+    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
+    "selected_tool_names": ["calculate_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>今天上海的天气怎么样？</user_query>
+  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
+  <output_json>{{
+    "task_description": "今天上海的天气怎么样？",
+    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
+    "selected_tool_names": ["web_search_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "今天上海天气"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>我们公司的报销政策是什么？</user_query>
+  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
+  <output_json>{{
+    "task_description": "我们公司的报销政策是什么？",
+    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
+    "selected_tool_names": ["enhanced_rag_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "公司报销政策"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>中国的首都是哪里？</user_query>
+  <thought>这是一个常见的常识性问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
+  <output_json>{{
+    "task_description": "中国的首都是哪里？",
+    "reasoning_for_plan": "常识性问题，可直接回答。",
+    "selected_tool_names": [],
+    "direct_answer_content": "中国的首都是北京。",
+    "tool_input_args": null,
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
+  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
+    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["区域", "产品类别"],
+        "aggregation_column": "销售额",
+        "aggregation_function": "sum"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+**【输出格式要求 - 必须严格遵守！】**
+你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
+*   `task_description`: (字符串) 用户的原始请求。
+*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
+*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
+*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
+*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
+*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
+
+我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
+""",
+            # --- 添加/恢复 backstory 参数 ---
+            backstory="""我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我的工作流程严谨细致：
+
+1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
+
+2.  **【决策优先级：优先自主解决】**：在考虑动用任何外部工具之前，我会首先评估我的内部知识库和推理能力是否足以直接、完整且准确地回答用户的问题。只有当我确认无法自主解决时，我才会启动工具选择流程。
+
+3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
+    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
+    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)，因为它能从我们精心构建的本地知识库中提取精确信息。
+    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作——无论是读取、计算、筛选、聚合还是修改——我都会委派给【Excel操作工具】(`excel_operation_tool`)。此时，我的核心任务是为该工具生成一个或多个清晰、准确的【结构化查询对象 (SQO) 的JSON列表】，放入 `excel_sqo_payload` 字段。我深知SQO的质量直接影响执行结果，因此我会仔细构造每一个SQO的操作类型 (`operation_type`) 和所需参数，并且我【绝不会】在SQO中包含文件路径 (`file_path`) 或工作表名 (`sheet_name`)，这些将由后续流程处理。
+    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
+    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，我不会强行匹配工具或给出猜测性答复。我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
+
+4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。这个JSON对象不仅包含了用户的原始请求 (`task_description`) 和我的决策理由 (`reasoning_for_plan`)，更重要的是，它清晰地指明了选定的工具 (`selected_tool_names`) 以及调用这些工具所需的一切参数（在 `tool_input_args` 或 `excel_sqo_payload` 中）。
+
+我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
+""",
+            # --- backstory 参数结束 ---
             llm=manager_llm,
             verbose=True,
             allow_delegation=False,
@@ -234,7 +371,8 @@ async def lifespan(app: FastAPI):
             goal="根据Manager分配的具体任务描述和指定的工具，高效地执行任务并提供结果。",
             backstory="""我是一个AI执行者，专注于使用【Manager明确授权给我的工具】来解决问题。
                         我会严格遵循任务指令。如果任务是调用Excel工具并提供了SQO列表，我会按顺序迭代处理这些SQO，并整合结果。
-                        我会使用工具的名称（例如 'enhanced_rag_tool', 'excel_operation_tool', 'web_search_tool'）来调用它们。""",
+                        对于像 'get_current_time_tool' 和 'calculate_tool' 这样的本地Python工具，我会直接在我的环境中执行它们。
+                        对于其他工具，我会使用工具的名称（例如 'enhanced_rag_tool', 'excel_operation_tool', 'web_search_tool'）来调用它们。""",
             llm=worker_llm,
             verbose=True,
             allow_delegation=False,
@@ -488,12 +626,32 @@ async def execute_task_endpoint(request: AgentTaskRequest):
                 error_message="excel_sqo_payload is missing for excel_operation_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
-        
+        # --- 添加 elif 分支来处理 web_search_tool ---
+    elif selected_tool_name == "web_search_tool": 
+        search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
+        max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
+        worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
+        worker_task_inputs = {"query": search_query, "max_results": max_results}
+    # --- 添加结束 ---
+    # --- 添加开始 ---
+    elif selected_tool_name == "get_current_time_tool":
+        timezone_str = manager_plan_object.tool_input_args.get("timezone", "Asia/Shanghai") if manager_plan_object.tool_input_args else "Asia/Shanghai"
+        worker_task_description = f"请使用时间工具获取当前时间。时区参数为: '{timezone_str}'。"
+        worker_task_inputs = {"timezone_str": timezone_str} # 注意参数名与工具类 _run 方法的参数名一致
+
+    elif selected_tool_name == "calculate_tool":
+        expression_str = manager_plan_object.tool_input_args.get("expression", "") if manager_plan_object.tool_input_args else ""
+        if not expression_str:
+            return AgentTaskResponse(
+                answer="Manager选择计算器工具但未提供表达式。", status="error",
+                error_message="expression is missing for calculate_tool.",
+                debug_info={"manager_plan": manager_plan_object.model_dump()}
+            )
+        worker_task_description = f"请使用计算器工具计算以下表达式: '{expression_str}'。"
+        worker_task_inputs = {"expression": expression_str} # 注意参数名与工具类 _run 方法的参数名一致
+        # --- 添加结束 ---
         # TODO: 从用户原始请求 manager_plan_object.task_description 中提取 file_path 和 sheet_name
-        # 这里我们先用一个占位符/默认值，您需要实现提取逻辑
-        # 例如，使用正则表达式从 manager_plan_object.task_description 查找文件路径
-        # file_path_match = re.search(r"文件\s*['\"]?([^'\"]+\.(?:xlsx|xls|csv))['\"]?", manager_plan_object.task_description)
-        # excel_file_path = file_path_match.group(1) if file_path_match else "YOUR_DEFAULT_TEST_EXCEL_PATH.xlsx"
+
         excel_file_path = "/home/zhz/zhz_agent/data/test.xlsx" # 临时硬编码，后续需要动态获取
         excel_sheet_name: Union[str, int] = 0 # 临时硬编码
 
@@ -1374,6 +1532,46 @@ if __name__ == "__main__":
     uvicorn.run("local_llm_service:app", host=SERVICE_HOST, port=SERVICE_PORT, reload=False)
     --- END OF FILE CONTENT ---
 
+  File: mcp_servers.json
+    --- START OF FILE CONTENT ---
+{
+  "mcpServers": {
+    "zhz_rag_mcp_service": { 
+      "command": "/home/zhz/zhz_agent/.venv/bin/python", 
+      "args": [
+        "-m", 
+        "zhz_rag.api.rag_mcp_service" 
+      ],
+      "cwd": "/home/zhz/zhz_agent", 
+      "env": {
+        "PYTHONPATH": "/home/zhz/zhz_agent:/home/zhz/zhz_agent/zhz_rag",
+        "SGLANG_API_URL": "http://localhost:8088/v1/chat/completions",
+        "CHROMA_PERSIST_DIRECTORY": "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index",
+        "BM25_INDEX_DIRECTORY": "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index",
+        "KUZU_DB_PATH": "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db"
+      }
+    },    
+    "ddgsearch": {
+      "command": "uvx",
+      "args": ["duckduckgo-mcp-server"], 
+      "disabled": false,
+      "autoApprove": ["search", "fetch_content"] 
+    },   
+    "amap-maps": {
+      "command": "node",
+      "args": [
+        "/home/zhz/mcp/amap-maps-mcp-server/build/index.js"
+      ],
+      "cwd": "/home/zhz/mcp/amap-maps-mcp-server",
+      "env": {
+        "AMAP_MAPS_API_KEY": "1ca72c66e1c964ce73eecd3822174442"
+      },
+      "disabled": false
+    }
+  }
+}
+    --- END OF FILE CONTENT ---
+
   File: project_snapshot.txt
     --- START OF FILE CONTENT ---
 Project Root: /home/zhz/zhz_agent
@@ -1420,6 +1618,9 @@ from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
 from core.tools.search_tool import WebSearchTool
+from core.tools.time_tool import GetCurrentTimeTool
+from core.tools.calculator_tool import CalculateTool
+
 
 AGENT_SERVICE_PORT = int(os.getenv("AGENT_SERVICE_PORT", 8090))
 AGENT_SERVICE_HOST = "0.0.0.0"
@@ -1450,13 +1651,17 @@ manager_agent_instance: Optional[Agent] = None
 worker_agent_instance: Optional[Agent] = None
 core_tools_instances: List[BaseTool] = []
 
+# --- 覆盖开始 ---
 CORE_TOOLS_ZHZ_AGENT = {
     "enhanced_rag_tool": "【核心RAG工具】用于从本地知识库查找信息、回答复杂问题，整合了向量、关键词和图谱检索。",
-    "excel_operation_tool": "【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。",
-    "web_search_tool": "【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。"
+    "excel_operation_tool": "【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。此工具通过本地代理在Windows上运行。",
+    "web_search_tool": "【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。此工具通过MCP调用。",
+    "get_current_time_tool": "【时间工具】获取当前的日期和时间，可指定时区。此工具在Agent的Python环境中直接执行。",
+    "calculate_tool": "【计算器工具】执行数学表达式的计算并返回数值结果。此工具在Agent的Python环境中直接执行。"
 }
-CORE_TOOL_NAMES_LIST = list(CORE_TOOLS_ZHZ_AGENT.keys())
-TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
+# --- 覆盖结束 ---
+CORE_TOOL_NAMES_LIST = list(CORE_TOOLS_ZHZ_AGENT.keys()) # 这行会自动更新
+TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join( # 这行会自动更新
     [f"- '{name}': {desc}" for name, desc in CORE_TOOLS_ZHZ_AGENT.items()]
 )
 
@@ -1470,57 +1675,50 @@ async def lifespan(app: FastAPI):
 
     # --- 步骤 1: 初始化核心工具实例 ---
     print("Initializing core tool instances...")
-    enhanced_rag_tool_instance = None # 先声明变量
+    enhanced_rag_tool_instance = None 
+    excel_operation_tool_instance = None
+    web_search_tool_instance = None
+    get_current_time_tool_instance = None
+    calculate_tool_instance = None
     try:
-        enhanced_rag_tool_instance = EnhancedRAGTool() # 尝试创建
-        excel_operation_tool_instance = ExcelOperationTool()
-        web_search_tool_instance = WebSearchTool()
-        
-        # 完整的工具列表，暂时不用，但保留定义
-        _all_core_tools_full_list = [
-            enhanced_rag_tool_instance,
-            excel_operation_tool_instance,
-            web_search_tool_instance,
-        ]
-        print(f"Full list of core tools that COULD be initialized: {[tool.name for tool in _all_core_tools_full_list]}")
+        enhanced_rag_tool_instance = EnhancedRAGTool()
+        excel_operation_tool_instance = ExcelOperationTool() # 尝试实例化
+        web_search_tool_instance = WebSearchTool()       # 尝试实例化
+        get_current_time_tool_instance = GetCurrentTimeTool()
+        calculate_tool_instance = CalculateTool()
 
-        # --- 核心修改：当前测试只关注 RAG 工具 ---
-        if enhanced_rag_tool_instance: # 确保 RAG 工具已成功实例化
-            core_tools_instances = [enhanced_rag_tool_instance] # 全局的 core_tools_instances 现在只包含 RAG 工具
-            
-            # --- 动态修改 Manager Prompt 中可见的工具列表 ---
-            # 基于当前 core_tools_instances (只含RAG工具) 来生成
-            CORE_TOOL_NAMES_LIST = [tool.name for tool in core_tools_instances]
-            TOOL_OPTIONS_STR_FOR_MANAGER = "\n".join(
-                [f"- '{name}': {CORE_TOOLS_ZHZ_AGENT.get(name, 'Unknown Tool Description')}" for name in CORE_TOOL_NAMES_LIST]
-            )
-            print(f"--- FOR CURRENT RAG TEST ---")
-            print(f"Effective CORE_TOOL_NAMES_LIST for Manager: {CORE_TOOL_NAMES_LIST}")
-            print(f"Effective TOOL_OPTIONS_STR_FOR_MANAGER for Manager:\n{TOOL_OPTIONS_STR_FOR_MANAGER}")
-            print(f"--- END OF RAG TEST CONFIG ---")
+        core_tools_instances = []
+        if enhanced_rag_tool_instance:
+            core_tools_instances.append(enhanced_rag_tool_instance)
+        if get_current_time_tool_instance:
+            core_tools_instances.append(get_current_time_tool_instance)
+        if calculate_tool_instance:
+            core_tools_instances.append(calculate_tool_instance)
+        if excel_operation_tool_instance:
+            core_tools_instances.append(excel_operation_tool_instance)
+        if web_search_tool_instance:
+            core_tools_instances.append(web_search_tool_instance)
 
-        else: # 如果 RAG 工具实例化失败
-            print("CRITICAL ERROR: EnhancedRAGTool instance could not be created. Aborting LLM/Agent setup for RAG test.")
-            core_tools_instances = []
-            CORE_TOOL_NAMES_LIST = []
-            TOOL_OPTIONS_STR_FOR_MANAGER = "No tools available."
-
-
-        print(f"Core tools initialized for current test run: {[tool.name for tool in core_tools_instances]}")
-        print(f"DEBUG LIFESPAN: core_tools_instances type: {type(core_tools_instances)}")
-        if core_tools_instances:
-            print(f"DEBUG LIFESPAN: core_tools_instances length: {len(core_tools_instances)}")
-            for idx, tool_item in enumerate(core_tools_instances):
-                tool_name_attr = getattr(tool_item, 'name', 'Name_Attribute_Missing')
-                print(f"DEBUG LIFESPAN: Tool {idx} - Type: {type(tool_item)}, Name: {tool_name_attr}")
+        if not core_tools_instances:
+            print("CRITICAL ERROR: No core tools could be initialized. Aborting LLM/Agent setup.")
+            # 在这种情况下，后续的LLM和Agent初始化可能会失败或无意义
+            # 可以考虑在这里抛出异常或设置一个全局状态阻止服务启动
         else:
-            print("DEBUG LIFESPAN: core_tools_instances is empty or None after initialization attempt.")
-            
+            print(f"Successfully initialized tools: {[tool.name for tool in core_tools_instances]}")
+        print(f"--- FULL TOOL CONFIGURATION WILL BE USED BY MANAGER (if successfully initialized) ---")
+        print(f"Effective CORE_TOOL_NAMES_LIST for Manager (based on global def): {CORE_TOOL_NAMES_LIST}") # 这是全局的
+        print(f"Effective TOOL_OPTIONS_STR_FOR_MANAGER for Manager (based on global def):\n{TOOL_OPTIONS_STR_FOR_MANAGER}") # 这是全局的
+        print(f"Actually initialized tools for Worker: {[tool.name for tool in core_tools_instances]}")
+        print(f"--- END OF TOOL CONFIGURATION ---")
+        
     except Exception as e:
         print(f"ERROR during core tool initialization: {e}", exc_info=True)
-        core_tools_instances = []
-        CORE_TOOL_NAMES_LIST = []
-        TOOL_OPTIONS_STR_FOR_MANAGER = "Tool initialization failed."
+        core_tools_instances = [] # 确保出错时为空列表
+        # 后续LLM/Agent初始化时，如果 core_tools_instances 为空，它们可能需要特殊处理或报错
+
+    # ... 后续的LLM和Agent初始化代码 ...
+    # 确保 Manager Agent 的 tools=[] (它不直接调用工具)
+    # 确保 Worker Agent 的 tools=core_tools_instances (它需要所有可用的工具实例)
 
 
     # --- 步骤 2: 初始化 LLM 实例 ---
@@ -1578,27 +1776,164 @@ async def lifespan(app: FastAPI):
     if manager_llm:
         manager_agent_instance = Agent(
             role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
-            goal=f"""【深入理解并分解】用户提出的复杂请求 (当前请求将通过任务描述提供) 成为一系列逻辑子任务。
-【核心决策1 - 优先自主回答】：在选择任何工具之前，请首先判断你是否能基于自身知识库和推理能力【直接回答】用户的全部或核心部分请求。如果可以，你的主要输出应是包含直接答案的JSON。
-【核心决策2 - Excel复杂查询处理】：如果用户的请求涉及到对Excel文件进行一个或多个复杂的数据查询、筛选、聚合或排序等操作，并且你无法直接回答，你【必须】选择 "excel_operation_tool" 工具。并且，你【必须】为这些Excel操作【构建一个结构化查询对象 (SQO) 的JSON列表】，并将其作为输出JSON中 `excel_sqo_payload` 字段的值。列表中的【每一个SQO字典】都需要包含一个明确的 "operation_type" 和该操作对应的参数，但【不要包含 "file_path" 或 "sheet_name"】。
-【核心决策3 - 其他工具选择】：如果需要从本地知识库获取深度信息，选择 "enhanced_rag_tool"。如果需要网络实时信息，选择 "web_search_tool"。选择工具后，你需要准备好传递给该工具的参数，并将其放在输出JSON的 `tool_input_args` 字段中。
-【核心决策4 - 通用请求/无适用工具】：如果用户请求是生成通用文本、编写简单代码、回答一般性知识问题，并且你已判断可以【直接回答】，则无需选择任何特定功能性工具。此时输出JSON中 `selected_tool_names` 应为空列表，`excel_sqo_payload` 和 `tool_input_args` 为null，答案内容在 `direct_answer_content` 字段。
+            goal=f"""你的核心任务是分析用户的请求（该请求将在后续的任务描述中提供），并决定最佳的处理路径。你必须严格按照以下【工具选择规则和优先级】以及【示例】进行决策。
 
-最终，【严格按照指定的JSON格式】（即符合 `SubTaskDefinitionForManagerOutput` Pydantic模型）输出一个包含你的决策理由、用户原始请求、以及根据你的决策填充的 `direct_answer_content` 或 `selected_tool_names`、`tool_input_args`、`excel_sqo_payload` 的对象。
+**【决策规则与优先级】**
 
-【可供选择的本系统核心工具及其描述】:
-{TOOL_OPTIONS_STR_FOR_MANAGER} 
-""", # TOOL_OPTIONS_STR_FOR_MANAGER 会在这里被使用，它现在只包含 RAG 工具
-            backstory="""我是一位经验丰富的AI任务调度官和数据查询规划专家。我的核心工作流程如下：
-1.  **【深度理解与CoD规划 (内部进行)】**：我会对用户请求进行彻底分析，优先判断是否能直接利用我的知识库和推理能力给出完整答案。
-2.  **【工具选择与参数准备（如果无法直接回答）】**：
-    a.  **Excel复杂查询**: 当识别出需要对Excel执行复杂操作时，我选择 "excel_operation_tool" 工具，并为其生成包含多个SQO操作定义的【JSON列表】作为 `excel_sqo_payload`。每个SQO包含 `operation_type` 和所需参数，但不含 `file_path` 或 `sheet_name`。
-    b.  **RAG查询**: 若需从知识库获取信息，选择 "enhanced_rag_tool"，并准备 `tool_input_args`（例如 `{{ "query": "用户原始问题", "top_k_vector": 5, ... }}`）。
-    c.  **网络搜索**: 若需实时网络信息，选择 "web_search_tool"，并准备 `tool_input_args`（例如 `{{ "query": "搜索关键词" }}`）。
-    d.  **最简必要原则**: 只选择绝对必要的工具。
-3.  **【严格的输出格式】**: 我的唯一输出是一个JSON对象，该对象必须符合本服务定义的 `SubTaskDefinitionForManagerOutput` Pydantic模型结构，包含 `task_description` (用户原始请求), `reasoning_for_plan`, 以及根据决策填充的 `selected_tool_names` (可为空), `direct_answer_content` (如果直接回答), `tool_input_args` (如果使用非Excel工具), 和 `excel_sqo_payload` (如果使用Excel工具)。
+1.  **【规则1：时间查询 - 强制使用工具】**
+    *   如果用户查询明确是关于【获取当前日期或时间】。
+    *   **行动**：【必须选择】`"get_current_time_tool"`。不要尝试自己回答“我没有实时时钟”。
+    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
 
-我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。""",
+2.  **【规则2：数学计算 - 强制使用工具】**
+    *   如果用户查询明确是要求【执行一个数学表达式的计算】。
+    *   **行动**：【必须选择】`"calculate_tool"`。不要尝试自己计算，即使很简单。
+    *   **参数**：为 `tool_input_args` 准备 `expression`。
+
+3.  **【规则3：实时/最新信息查询 - 网络搜索强制】**
+    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价等）。
+    *   **行动**：【必须且只能】选择 `"web_search_tool"`。
+    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
+    *   **禁止**：不要使用 "enhanced_rag_tool" 查找此类信息。
+
+4.  **【规则4：内部知识/文档深度查询 - RAG】**
+    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】。
+    *   **行动**：选择 `"enhanced_rag_tool"`。
+    *   **参数**：为 `tool_input_args` 准备 `query` 等。
+
+5.  **【规则5：Excel文件操作 - 强制使用工具】**
+    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行复杂操作】。
+    *   **行动**：【必须选择】`"excel_operation_tool"`。
+    *   **任务**：为其构建【结构化查询对象 (SQO) 的JSON列表】到 `excel_sqo_payload`。SQO不含 "file_path" 或 "sheet_name"。
+
+6.  **【规则6：LLM直接回答（在工具不适用后）】**
+    *   **仅当**以上所有规则都不适用，并且你判断可以基于你【已有的知识和常识】直接、准确、完整地回答用户的全部请求时。
+    *   **行动**：`selected_tool_names` 设为 `[]`，在 `direct_answer_content` 提供答案。
+
+7.  **【规则7：无法处理/需要澄清（最终回退）】**
+    *   如果所有规则都不适用，且你也无法直接回答。
+    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释，如果合适，在 `direct_answer_content` 中礼貌回复。
+
+**【可用工具的参考描述】：**
+{TOOL_OPTIONS_STR_FOR_MANAGER}
+
+**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
+
+<example>
+  <user_query>现在几点了？</user_query>
+  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
+  <output_json>{{
+    "task_description": "现在几点了？",
+    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
+    "selected_tool_names": ["get_current_time_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>计算 5 * (10 + 3)</user_query>
+  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
+  <output_json>{{
+    "task_description": "计算 5 * (10 + 3)",
+    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
+    "selected_tool_names": ["calculate_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>今天上海的天气怎么样？</user_query>
+  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
+  <output_json>{{
+    "task_description": "今天上海的天气怎么样？",
+    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
+    "selected_tool_names": ["web_search_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "今天上海天气"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>我们公司的报销政策是什么？</user_query>
+  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
+  <output_json>{{
+    "task_description": "我们公司的报销政策是什么？",
+    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
+    "selected_tool_names": ["enhanced_rag_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "公司报销政策"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>中国的首都是哪里？</user_query>
+  <thought>这是一个常见的常识性问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
+  <output_json>{{
+    "task_description": "中国的首都是哪里？",
+    "reasoning_for_plan": "常识性问题，可直接回答。",
+    "selected_tool_names": [],
+    "direct_answer_content": "中国的首都是北京。",
+    "tool_input_args": null,
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
+  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
+    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["区域", "产品类别"],
+        "aggregation_column": "销售额",
+        "aggregation_function": "sum"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+**【输出格式要求 - 必须严格遵守！】**
+你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
+*   `task_description`: (字符串) 用户的原始请求。
+*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
+*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
+*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
+*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
+*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
+
+我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
+""",
+            # --- 添加/恢复 backstory 参数 ---
+            backstory="""我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我的工作流程严谨细致：
+
+1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
+
+2.  **【决策优先级：优先自主解决】**：在考虑动用任何外部工具之前，我会首先评估我的内部知识库和推理能力是否足以直接、完整且准确地回答用户的问题。只有当我确认无法自主解决时，我才会启动工具选择流程。
+
+3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
+    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
+    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)，因为它能从我们精心构建的本地知识库中提取精确信息。
+    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作——无论是读取、计算、筛选、聚合还是修改——我都会委派给【Excel操作工具】(`excel_operation_tool`)。此时，我的核心任务是为该工具生成一个或多个清晰、准确的【结构化查询对象 (SQO) 的JSON列表】，放入 `excel_sqo_payload` 字段。我深知SQO的质量直接影响执行结果，因此我会仔细构造每一个SQO的操作类型 (`operation_type`) 和所需参数，并且我【绝不会】在SQO中包含文件路径 (`file_path`) 或工作表名 (`sheet_name`)，这些将由后续流程处理。
+    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
+    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，我不会强行匹配工具或给出猜测性答复。我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
+
+4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。这个JSON对象不仅包含了用户的原始请求 (`task_description`) 和我的决策理由 (`reasoning_for_plan`)，更重要的是，它清晰地指明了选定的工具 (`selected_tool_names`) 以及调用这些工具所需的一切参数（在 `tool_input_args` 或 `excel_sqo_payload` 中）。
+
+我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
+""",
+            # --- backstory 参数结束 ---
             llm=manager_llm,
             verbose=True,
             allow_delegation=False,
@@ -1612,7 +1947,8 @@ async def lifespan(app: FastAPI):
             goal="根据Manager分配的具体任务描述和指定的工具，高效地执行任务并提供结果。",
             backstory="""我是一个AI执行者，专注于使用【Manager明确授权给我的工具】来解决问题。
                         我会严格遵循任务指令。如果任务是调用Excel工具并提供了SQO列表，我会按顺序迭代处理这些SQO，并整合结果。
-                        我会使用工具的名称（例如 'enhanced_rag_tool', 'excel_operation_tool', 'web_search_tool'）来调用它们。""",
+                        对于像 'get_current_time_tool' 和 'calculate_tool' 这样的本地Python工具，我会直接在我的环境中执行它们。
+                        对于其他工具，我会使用工具的名称（例如 'enhanced_rag_tool', 'excel_operation_tool', 'web_search_tool'）来调用它们。""",
             llm=worker_llm,
             verbose=True,
             allow_delegation=False,
@@ -1866,12 +2202,32 @@ async def execute_task_endpoint(request: AgentTaskRequest):
                 error_message="excel_sqo_payload is missing for excel_operation_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
-        
+        # --- 添加 elif 分支来处理 web_search_tool ---
+    elif selected_tool_name == "web_search_tool": 
+        search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
+        max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
+        worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
+        worker_task_inputs = {"query": search_query, "max_results": max_results}
+    # --- 添加结束 ---
+    # --- 添加开始 ---
+    elif selected_tool_name == "get_current_time_tool":
+        timezone_str = manager_plan_object.tool_input_args.get("timezone", "Asia/Shanghai") if manager_plan_object.tool_input_args else "Asia/Shanghai"
+        worker_task_description = f"请使用时间工具获取当前时间。时区参数为: '{timezone_str}'。"
+        worker_task_inputs = {"timezone_str": timezone_str} # 注意参数名与工具类 _run 方法的参数名一致
+
+    elif selected_tool_name == "calculate_tool":
+        expression_str = manager_plan_object.tool_input_args.get("expression", "") if manager_plan_object.tool_input_args else ""
+        if not expression_str:
+            return AgentTaskResponse(
+                answer="Manager选择计算器工具但未提供表达式。", status="error",
+                error_message="expression is missing for calculate_tool.",
+                debug_info={"manager_plan": manager_plan_object.model_dump()}
+            )
+        worker_task_description = f"请使用计算器工具计算以下表达式: '{expression_str}'。"
+        worker_task_inputs = {"expression": expression_str} # 注意参数名与工具类 _run 方法的参数名一致
+        # --- 添加结束 ---
         # TODO: 从用户原始请求 manager_plan_object.task_description 中提取 file_path 和 sheet_name
-        # 这里我们先用一个占位符/默认值，您需要实现提取逻辑
-        # 例如，使用正则表达式从 manager_plan_object.task_description 查找文件路径
-        # file_path_match = re.search(r"文件\s*['\"]?([^'\"]+\.(?:xlsx|xls|csv))['\"]?", manager_plan_object.task_description)
-        # excel_file_path = file_path_match.group(1) if file_path_match else "YOUR_DEFAULT_TEST_EXCEL_PATH.xlsx"
+
         excel_file_path = "/home/zhz/zhz_agent/data/test.xlsx" # 临时硬编码，后续需要动态获取
         excel_sheet_name: Union[str, int] = 0 # 临时硬编码
 
@@ -5449,29 +5805,6 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 """
     --- END OF FILE CONTENT ---
 
-  File: mcp_servers.json
-    --- START OF FILE CONTENT ---
-{
-  "mcpServers": {
-    "zhz_rag_mcp_service": { 
-      "command": "/home/zhz/zhz_agent/.venv/bin/python", 
-      "args": [
-        "-m", 
-        "zhz_rag.api.rag_mcp_service" 
-      ],
-      "cwd": "/home/zhz/zhz_agent", 
-      "env": {
-        "PYTHONPATH": "/home/zhz/zhz_agent:/home/zhz/zhz_agent/zhz_rag",
-        "SGLANG_API_URL": "http://localhost:8088/v1/chat/completions",
-        "CHROMA_PERSIST_DIRECTORY": "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index",
-        "BM25_INDEX_DIRECTORY": "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index",
-        "KUZU_DB_PATH": "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db"
-      }
-    }
-  }
-}
-    --- END OF FILE CONTENT ---
-
   File: pydantic_models.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/zhz_rag/config/pydantic_models.py
@@ -7130,37 +7463,20 @@ Directory: zhz_rag/llm/
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/zhz_rag/llm/__init__.py
 
-# 从 sglang_wrapper.py 导入新的函数名
-from .sglang_wrapper import call_llm_via_openai_api
+from .sglang_wrapper import call_llm_via_openai_api_local_only # 导入新函数
 
-# 为了兼容可能仍然在其他地方使用旧名称 'call_sglang_llm' 的导入
-# 我们可以创建一个别名，让 call_sglang_llm 指向新的函数
-call_sglang_llm = call_llm_via_openai_api
+call_sglang_llm = call_llm_via_openai_api_local_only # 别名指向新函数
 
-# 导出其他 sglang_wrapper.py 中定义的、且希望从 zhz_rag.llm 直接导入的函数
 from .sglang_wrapper import (
     generate_answer_from_context,
-    generate_cypher_query, # 这个函数内部应该使用 call_llm_via_openai_api
+    generate_cypher_query,
     generate_expanded_queries,
-    generate_intent_classification,
+    generate_intent_classification, # 这个现在直接用 litellm 调用 Gemini
     generate_clarification_question,
     generate_clarification_options,
     NO_ANSWER_PHRASE_ANSWER_CLEAN,
     NO_ANSWER_PHRASE_KG_CLEAN
 )
-
-# 也可以选择性地从 custom_crewai_llms.py 导出
-# from .custom_crewai_llms import CustomGeminiLLM, CustomSGLangLLM # 如果需要的话
-
-# 你可以通过 __all__ 变量来明确指定当执行 from zhz_rag.llm import * 时会导入哪些名称
-# 但通常显式导入更好
-# __all__ = [
-#     "call_llm_via_openai_api",
-#     "call_sglang_llm", # 别名
-#     "generate_answer_from_context",
-#     "generate_cypher_query",
-#     # ... 其他导出的名称
-# ]
     --- END OF FILE CONTENT ---
 
   File: custom_crewai_llms.py
@@ -7502,11 +7818,13 @@ import logging
 import re
 import uuid  # 用于生成 interaction_id
 from datetime import datetime, timezone  # 用于生成时间戳
+import litellm # <--- 确保这个导入存在
 
 load_dotenv()  # 确保加载.env文件
 
 _LLM_DIR = os.path.dirname(os.path.abspath(__file__))
 RAG_INTERACTION_LOGS_DIR = os.path.join(_LLM_DIR, '..', '..', 'stored_data', 'rag_interaction_logs')
+
 
 if not os.path.exists(RAG_INTERACTION_LOGS_DIR):
     try:
@@ -7601,80 +7919,49 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 
 LLM_API_URL = os.getenv("SGLANG_API_URL", "http://localhost:8088/v1/chat/completions")
 
-async def call_llm_via_openai_api(
-    prompt: Union[str, List[Dict[str, str]]],
+# 添加回这个函数，但它现在只被 generate_answer_from_context, generate_cypher_query 等调用
+# 并且目标是本地的 OpenAI 兼容服务
+async def call_llm_via_openai_api_local_only( # 改个名字以示区分
+    prompt: Union[str, List[Dict[str, str]]], # prompt 可以是字符串或消息列表
     temperature: float = 0.2,
     max_new_tokens: Optional[int] = 1024,
     stop_sequences: Optional[List[str]] = None,
-    task_type: str = "unknown_llm_call",
+    task_type: str = "unknown_local_llm_call",
     user_query_for_log: Optional[str] = None,
-    model_name_for_log: str = "qwen3_gguf_via_openai_api", # Updated default model name
-    application_version_for_log: str = "0.1.0"
+    model_name_for_log: str = "local_qwen_via_openai_api_compat",
+    application_version_for_log: str = "0.1.0_local_compat"
 ) -> Optional[str]:
-
-    llm_py_logger.info(f"Attempting to call LLM. Task: {task_type}, Target API: {LLM_API_URL}")
+    llm_py_logger.info(f"Calling LOCAL LLM ({model_name_for_log}) for task: {task_type}, Target API: {LLM_API_URL}")
 
     current_messages: List[Dict[str, str]]
-    original_prompt_for_log: str # For logging the original SGLang-style prompt if applicable
+    original_prompt_for_log: str
 
-    if isinstance(prompt, str):
+    if isinstance(prompt, str): # 假设旧的SGLang风格的prompt字符串
         original_prompt_for_log = prompt
-        llm_py_logger.warning(f"call_llm_via_openai_api received a string prompt for task '{task_type}'. Attempting basic conversion to OpenAI messages. This is deprecated and may not be optimal.")
+        # 尝试从SGLang格式转换为OpenAI messages格式
+        # 这个转换逻辑需要根据您SGLang prompt的具体格式来定
+        # 一个简化的例子，可能需要调整：
         current_messages = []
-        if "<|im_start|>system" in original_prompt_for_log:
-            parts = original_prompt_for_log.split("<|im_start|>")
-            for part_content in parts:
-                if not part_content.strip():
-                    continue
-                # Strip <|im_end|> and then content
-                role_content_pair = part_content.split("<|im_end|>")[0].strip()
-                if "\n" in role_content_pair: # Expects "role\ncontent"
-                    role, message_content = role_content_pair.split("\n", 1)
-                    current_messages.append({"role": role.strip().lower(), "content": message_content.strip()})
-                else: # Fallback if no explicit role, assume user, or handle simple SGLang role prefix
-                    # This part needs careful mapping from SGLang role prefixes if used without newline
-                    # For now, a simple split for "system content" or "user content" without newline might be too naive.
-                    # The provided split logic was `role, message_content = role_content_pair.split("\n", 1)`
-                    # If it's just "system: message" or "system message" this is harder.
-                    # The logic from the txt:
-                    #   role_content_pair = part_content.split("<|im_end|>")[0].strip()
-                    #   if "\n" in role_content_pair:
-                    #       role, message_content = role_content_pair.split("\n", 1)
-                    #       current_messages.append({"role": role.strip().lower(), "content": message_content.strip()})
-                    #   else: # 可能是只有内容的user message
-                    #       current_messages.append({"role": "user", "content": role_content_pair.strip()})
-                    # This seems reasonable. Let's ensure role extraction.
-                    # A more robust way for SGLang prompts:
-                    # Check for "system\n", "user\n", "assistant\n" explicitly.
-                    temp_role_content = role_content_pair.strip()
-                    role_found = False
-                    for r in ["system", "user", "assistant"]:
-                        if temp_role_content.lower().startswith(r): # covers "system\ncontent" or "system content"
-                            # check if role is followed by newline or space
-                            if len(temp_role_content) > len(r) and (temp_role_content[len(r)] == '\n' or temp_role_content[len(r)] == ' ' or temp_role_content[len(r)] == ':'):
-                                message_content = temp_role_content[len(r):].lstrip(' \n:')
-                                current_messages.append({"role": r, "content": message_content.strip()})
-                                role_found = True
-                                break
-                    if not role_found: # Default to user if no role prefix detected or if it's just content
-                         current_messages.append({"role": "user", "content": temp_role_content})
-
-
-            if not current_messages or (current_messages and current_messages[-1]["role"] == "assistant"):
-                 current_messages.append({"role": "user", "content": "Continue."}) # Ensure last message is user if needed
-        else: # If not SGLang format with <|im_start|>system, treat the whole string as a user message
-            current_messages = [{"role": "user", "content": original_prompt_for_log}]
-        llm_py_logger.debug(f"  Converted string prompt to messages: {json.dumps(current_messages, ensure_ascii=False, indent=2)}")
+        # 简单的假设：如果prompt以<|im_start|>system开头，则提取system和user部分
+        if prompt.startswith("<|im_start|>system"):
+            parts = prompt.split("<|im_start|>")
+            for part in parts:
+                if not part.strip(): continue
+                role_content = part.split("<|im_end|>")[0].strip()
+                if "\n" in role_content:
+                    role, content = role_content.split("\n", 1)
+                    current_messages.append({"role": role.strip().lower(), "content": content.strip()})
+        if not current_messages: # 如果转换失败或不是SGLang格式，则认为是单个user消息
+            current_messages = [{"role": "user", "content": prompt}]
     elif isinstance(prompt, list):
         current_messages = prompt
         original_prompt_for_log = "Messages list provided directly."
-        llm_py_logger.debug(f"  Received messages list directly: {json.dumps(current_messages, ensure_ascii=False, indent=2)}")
     else:
-        llm_py_logger.error(f"Invalid 'prompt' argument type for call_llm_via_openai_api: {type(prompt)}")
+        llm_py_logger.error(f"Invalid 'prompt' argument type: {type(prompt)}")
         return None
 
     payload = {
-        "model": model_name_for_log,
+        "model": model_name_for_log, # 这个model名会被本地服务忽略，但符合OpenAI格式
         "messages": current_messages,
         "temperature": temperature,
         "max_tokens": max_new_tokens,
@@ -7683,79 +7970,48 @@ async def call_llm_via_openai_api(
         payload["stop"] = stop_sequences
 
     headers = {"Content-Type": "application/json"}
-    
-    llm_parameters_for_log = {
-        "model": model_name_for_log,
-        "temperature": temperature,
-        "max_tokens": max_new_tokens,
-        "stop_sequences": stop_sequences
-    }
+    llm_parameters_for_log = {k:v for k,v in payload.items() if k not in ['messages', 'model']} # model已在顶层记录
     raw_llm_output_text = None
+    error_info = None
 
     try:
-        llm_py_logger.info(f"Sending request to LLM API: {LLM_API_URL}")
-        llm_py_logger.debug(f"Payload: {json.dumps(payload, ensure_ascii=False, indent=2)}")
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(LLM_API_URL, json=payload, headers=headers)
+            response = await client.post(LLM_API_URL, json=payload, headers=headers) # LLM_API_URL 指向本地服务
             response.raise_for_status()
             response_json = response.json()
-            
-            if response_json.get("choices") and \
-               isinstance(response_json["choices"], list) and \
-               len(response_json["choices"]) > 0 and \
-               response_json["choices"][0].get("message"):
-                raw_llm_output_text = response_json["choices"][0]["message"].get("content")
-                if raw_llm_output_text is None: # content might be null
-                    raw_llm_output_text = "" 
+            if response_json.get("choices") and response_json["choices"][0].get("message"):
+                raw_llm_output_text = response_json["choices"][0]["message"].get("content", "")
             else:
-                raw_llm_output_text = "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE]]"
-            
-            llm_py_logger.info(f"LLM Raw Output (from API): {str(raw_llm_output_text)[:500]}...")
-
-            interaction_log_data = {
-                "interaction_id": str(uuid.uuid4()),
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "task_type": task_type,
-                "user_query_for_task": user_query_for_log,
-                "llm_input_messages": current_messages,
-                "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
-                "llm_parameters": llm_parameters_for_log,
-                "raw_llm_output": raw_llm_output_text,
-                "application_version": application_version_for_log
-            }
-            await log_interaction_data(interaction_log_data)
-            return raw_llm_output_text
-
-    except httpx.HTTPStatusError as e:
-        llm_py_logger.error(f"HTTPStatusError calling LLM API: {e}. Response: {e.response.text[:500]}", exc_info=True)
-        error_info = f"HTTPStatusError: {e.response.status_code} - {e.response.text[:200]}"
-    except httpx.RequestError as e:
-        llm_py_logger.error(f"RequestError calling LLM API: {e}", exc_info=True)
-        error_info = f"RequestError: {str(e)}"
-    except json.JSONDecodeError as e:
-        response_text_for_debug = "N/A"
-        if 'response' in locals() and hasattr(response, 'text'):
-            response_text_for_debug = response.text[:500]
-        llm_py_logger.error(f"JSONDecodeError from LLM API: {e}. Raw response: {response_text_for_debug}", exc_info=True)
-        error_info = f"JSONDecodeError: {str(e)}"
+                raw_llm_output_text = "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE_LOCAL]]"
+            llm_py_logger.info(f"Local LLM Raw Output: {str(raw_llm_output_text)[:200]}...")
+    # ... (省略错误处理和日志记录，与您之前的 call_llm_via_openai_api 类似) ...
     except Exception as e:
-        llm_py_logger.error(f"Unknown error in call_llm_via_openai_api: {type(e).__name__} - {e}", exc_info=True)
-        error_info = f"Unknown error: {type(e).__name__} - {str(e)}"
+        llm_py_logger.error(f"Error calling local LLM service: {e}", exc_info=True)
+        error_info = str(e)
+        # 确保记录错误
+        log_error_data = {
+            "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task_type": task_type + "_local_error", "user_query_for_task": user_query_for_log,
+            "llm_input_messages": current_messages,
+            "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
+            "llm_parameters": llm_parameters_for_log,
+            "raw_llm_output": f"Error: {error_info}. Partial raw output: {str(raw_llm_output_text)[:200] if raw_llm_output_text else 'N/A'}",
+            "error_details": traceback.format_exc(), "application_version": application_version_for_log
+        }
+        await log_interaction_data(log_error_data)
+        return None # 出错时返回None
 
-    error_log_data = {
-        "interaction_id": str(uuid.uuid4()),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "task_type": task_type + "_error",
-        "user_query_for_task": user_query_for_log,
-        "llm_input_messages": current_messages if 'current_messages' in locals() else [{"role":"system", "content": "Error: messages not formed"}],
-        "llm_input_original_prompt_if_string": original_prompt_for_log if 'original_prompt_for_log' in locals() and isinstance(prompt, str) else None,
+    # 记录成功的调用
+    log_success_data = {
+        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_type": task_type, "user_query_for_task": user_query_for_log,
+        "llm_input_messages": current_messages,
+        "llm_input_original_prompt_if_string": original_prompt_for_log if isinstance(prompt, str) else None,
         "llm_parameters": llm_parameters_for_log,
-        "raw_llm_output": f"Error: {error_info}. Partial raw output: {str(raw_llm_output_text)[:200] if raw_llm_output_text else 'N/A'}",
-        "error_details": traceback.format_exc(),
-        "application_version": application_version_for_log
+        "raw_llm_output": raw_llm_output_text, "application_version": application_version_for_log
     }
-    await log_interaction_data(error_log_data)
-    return None
+    await log_interaction_data(log_success_data)
+    return raw_llm_output_text
 
 async def generate_cypher_query(user_question: str, kg_schema_description: str = NEW_KG_SCHEMA_DESCRIPTION) -> Optional[str]:
     llm_py_logger.info(f"Attempting to generate Cypher query for: '{user_question}' via local service with GBNF + post-processing.")
@@ -7767,7 +8023,7 @@ async def generate_cypher_query(user_question: str, kg_schema_description: str =
     ]
     cypher_stop_sequences = ['<|im_end|>', '无法生成Cypher查询.', '```'] # 添加 '```' 以防模型生成 Markdown 后想继续
 
-    llm_response_json_str = await call_llm_via_openai_api( 
+    llm_response_json_str = await call_llm_via_openai_api_local_only( 
         prompt=messages_for_llm,
         temperature=0.0, 
         max_new_tokens=1024, 
@@ -7820,17 +8076,22 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
     llm_py_logger.info(f"Generating answer for query: '{user_query[:100]}...' using provided context.")
     
     system_prompt_for_answer = f"""
-你是一个AI问答助手。你的任务是根据【上下文信息】回答【用户问题】。
+你是一个非常严谨的AI问答助手。你的任务是根据【上下文信息】回答【用户问题】。
 
 **核心指令：**
 
-1.  **尝试直接回答：** 请首先仔细阅读【上下文信息】，如果其中包含能直接回答【用户问题】的内容，请用上下文中的信息直接、简洁地回答。
-2.  **忠实原文：** 你的回答必须严格基于【上下文信息】，禁止加入任何外部知识或个人观点。
-3.  **如果无法回答：** 如果你分析了【上下文信息】后，确认其中确实没有能回答【用户问题】的明确信息，那么请只回答以下这句话：
- "{NO_ANSWER_PHRASE_ANSWER_CLEAN}"
- 不要添加任何其他解释、建议或反问。
+1.  **严格基于上下文：** 你的回答【必须只能】使用【上下文信息】中明确提供的文字。禁止进行任何形式的推断、联想、猜测或引入外部知识。
+2.  **逐句核对：** 对于用户问题中的每一个信息点或子问题，你都必须在上下文中找到【直接对应的证据】才能回答。
+3.  **明确关联性：** 如果用户问题试图关联上下文中的不同信息片段（例如，A是否与B有关），你必须在上下文中找到【明确陈述这种关联性的直接证据】。如果上下文中分别提到了A和B，但没有明确说明它们之间的关系，则视为无法关联。
+4.  **处理无法回答的部分：**
+    *   如果【上下文信息】完全不包含回答【用户问题】的任何相关信息，或者无法找到任何直接证据，请【只回答】：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
+    *   如果【用户问题】包含多个子问题，而【上下文信息】只能回答其中的一部分：
+        *   请只回答你能找到直接证据的部分。
+        *   对于上下文中没有直接证据支持的其他子问题，请明确指出：“关于[某子问题]，上下文中未提供明确信息。”
+        *   不要对未提供信息的部分进行猜测或尝试回答。
+5.  **简洁明了：** 回答要直接、简洁。
 
-请直接给出答案，或者只给出上述那句固定的“无法找到信息”的回复。
+请严格遵守以上指令。
 """
     # 构造 messages 列表
     messages_for_llm = [
@@ -7838,7 +8099,7 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
         {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
     ]
 
-    raw_answer = await call_llm_via_openai_api(
+    raw_answer = await call_llm_via_openai_api_local_only(
         prompt=messages_for_llm, # <--- 传递 messages 列表
         temperature=0.05,
         max_new_tokens=1024, 
@@ -7880,7 +8141,7 @@ async def generate_simulated_kg_query_response(user_query: str, kg_schema_descri
 <|im_start|>assistant
 """
     stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN]
-    return await call_llm_via_openai_api(
+    return await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.5,
         max_new_tokens=256,
@@ -7910,7 +8171,7 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     stop_sequences = ["<|im_end|>"]
     
     llm_py_logger.info(f"调用LLM API进行查询扩展 (Prompt长度: {len(prompt_str)} 字符)...")
-    llm_output = await call_llm_via_openai_api(
+    llm_output = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.7,
         max_new_tokens=512,
@@ -7961,7 +8222,7 @@ async def generate_clarification_question(original_query: str, uncertainty_reaso
 """
     stop_sequences = ["<|im_end|>"]
     llm_py_logger.info(f"调用LLM API生成澄清问题 (Prompt长度: {len(prompt_str)} 字符)...")
-    clarification_question = await call_llm_via_openai_api(
+    clarification_question = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.5,
         max_new_tokens=128,
@@ -8002,7 +8263,7 @@ async def generate_clarification_options(original_query: str, uncertainty_reason
 """
     stop_sequences = ["<|im_end|>"]
     llm_py_logger.info(f"调用LLM API生成澄清选项 (Prompt长度: {len(prompt_str)} 字符)...")
-    llm_output = await call_llm_via_openai_api(
+    llm_output = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
         temperature=0.7,
         max_new_tokens=256,
@@ -8049,20 +8310,23 @@ INTENT_CLASSIFICATION_JSON_SCHEMA = {
 }
 
 async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
-    llm_py_logger.info(f"Generating intent classification for query: '{user_query[:100]}...'")
-    prompt_str = f"""<|im_start|>system
-你是一个智能意图分类器。你的任务是分析用户查询，判断该查询是否清晰明确，或者是否存在歧义、信息不足导致需要进一步澄清。
+    llm_py_logger.info(f"Generating intent classification for query: '{user_query[:100]}...' using Gemini.")
+    
+    # 针对Gemini优化的Prompt，强调直接输出JSON
+    system_prompt_for_intent = f"""你是一个智能意图分类器。你的任务是分析用户查询，判断该查询是否清晰明确，或者是否存在歧义、信息不足导致需要进一步澄清。
 如果查询包含具体的命名实体（如人名“张三”、项目名“项目X”、产品名“新产品A”等），并且问题是关于这些实体的特定信息（例如“张三的职位是什么？”、“项目X的截止日期是哪天？”、“新产品A的功能有哪些？”），则通常认为查询是清晰的，不需要澄清。
 只有当查询缺少定位关键信息所必需的核心实体，或者询问的范围过于宽泛无法直接操作时，才需要澄清。
 
 如果查询需要澄清，请说明原因。
-你的回答必须是一个JSON对象，包含两个字段：
-1. "clarification_needed": 布尔值，如果需要澄清则为 true，否则为 false。
-2. "reason": 字符串，如果需要澄清，请简要说明原因；如果不需要，则为空字符串。
+你的【唯一输出】必须是一个严格符合以下结构的JSON对象，不要包含任何其他文本、解释或markdown标记:
+{{
+  "clarification_needed": true/false,
+  "reason": "如果需要澄清，请简要说明原因；如果不需要，则为空字符串。"
+}}
 
 示例1 (需要澄清 - 信息不足):
 用户查询: "帮我预定明天去上海的机票。"
-助手:
+助手 JSON 输出:
 {{
   "clarification_needed": true,
   "reason": "缺少出发城市、具体时间（上午/下午/晚上）、舱位等级等信息。"
@@ -8070,82 +8334,124 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
 
 示例2 (不需要澄清 - 清晰):
 用户查询: "公司最新的销售额报告在哪里可以找到？"
-助手:
+助手 JSON 输出:
 {{
   "clarification_needed": false,
   "reason": ""
 }}
-
-示例3 (需要澄清 - 实体不明确):
-用户查询: "关于项目进展的文档。"
-助手:
-{{
-  "clarification_needed": true,
-  "reason": "项目名称不明确，文档类型（报告、计划、会议纪要等）不明确。"
-}}
-
-示例4 (不需要澄清 - 包含具体实体和明确问题):
-用户查询: "张三参与了哪个项目？"
-助手:
-{{
-  "clarification_needed": false,
-  "reason": ""
-}}
-
-示例5 (不需要澄清 - 包含具体实体和明确问题):
-用户查询: "华东区域2024年第一季度的销售额是多少？"
-助手:
-{{
-  "clarification_needed": false,
-  "reason": ""
-}}
-
-示例6 (需要澄清 - “公司”指默认上下文，但其余部分仍模糊):
-用户查询: "公司的政策"
-助手:
-{{
-  "clarification_needed": true,
-  "reason": "未能明确指出是关于哪方面的公司政策（例如：人力资源、IT安全、财务等）。"
-}}<|im_end|>
-<|im_start|>user
-用户查询: {user_query}<|im_end|>
-<|im_start|>assistant
 """
-    stop_sequences = ["<|im_end|>"]
-    llm_py_logger.info(f"调用LLM API进行意图分类 (Prompt长度: {len(prompt_str)} 字符)...")
+    
+    messages_for_gemini = [
+        {"role": "system", "content": system_prompt_for_intent},
+        {"role": "user", "content": f"用户查询: {user_query}"}
+    ]
 
-    llm_output = await call_llm_via_openai_api(
-        prompt=prompt_str,
-        temperature=0.01,
-        max_new_tokens=256,
-        stop_sequences=stop_sequences,
-        task_type="intent_classification",
-        user_query_for_log=user_query
-    )
+    # 从环境变量获取Gemini配置
+    gemini_model_name = os.getenv("CLOUD_LLM_MODEL_NAME_FOR_LITELLM", "gemini/gemini-1.5-flash-latest")
+    gemini_api_key = os.getenv("GEMINI_API_KEY") # 或者 GOOGLE_API_KEY
+    proxy_url = os.getenv("LITELLM_PROXY_URL")
 
-    if llm_output:
-        try:
-            json_str = llm_output.strip()
-            if json_str.startswith("```json"):
-                json_str = json_str[len("```json"):].strip()
-            if json_str.endswith("```"):
-                json_str = json_str[:-len("```")].strip()
+    litellm_params: Dict[str, Any] = {
+        "model": gemini_model_name,
+        "messages": messages_for_gemini,
+        "api_key": gemini_api_key,
+        "temperature": 0.1, 
+        "max_tokens": 256,  # 意图分类的JSON输出通常较短
+        # "response_format": {"type": "json_object"} # LiteLLM的Gemini集成可能尚不支持此参数，暂时注释
+    }
+    if proxy_url:
+        # LiteLLM 的 proxy 参数期望一个字典，或者直接是一个字符串URL (取决于LiteLLM版本和具体实现)
+        # 为保险起见，我们按文档常见的字典格式提供
+        litellm_params["proxy"] = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
+        # 或者，如果您的LiteLLM版本支持直接传递字符串URL作为代理：
+        # litellm_params["api_base"] = proxy_url # 这会将代理用于所有请求，如果Gemini也通过此代理
+        # litellm_params["base_url"] = proxy_url # 有些版本用 base_url
+        # 更通用的方式是设置环境变量 HTTP_PROXY 和 HTTPS_PROXY，LiteLLM通常会读取它们
+        # 但为了显式，我们这里尝试通过参数传递给litellm.acompletion
 
-            parsed_result = json.loads(json_str)
-            if isinstance(parsed_result, dict) and \
-               "clarification_needed" in parsed_result and \
-               "reason" in parsed_result:
-                llm_py_logger.info(f"LLM成功进行意图分类: {parsed_result}")
-                return parsed_result
-            else:
-                llm_py_logger.warning(f"LLM生成的意图分类JSON格式不符合预期: {llm_output[:200]}...")
-        except json.JSONDecodeError as e:
-            llm_py_logger.error(f"解析LLM意图分类JSON失败: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
-        except Exception as e:
-            llm_py_logger.error(f"处理LLM意图分类时发生未知错误: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
+    llm_py_logger.info(f"Calling Gemini (via LiteLLM) for intent classification. Model: {gemini_model_name}")
+    debug_params = {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key']}
+    llm_py_logger.debug(f"LiteLLM params for intent (excluding messages & api_key): {debug_params}")
+    
+    raw_gemini_output_text = None
+    error_info_intent = None
+    parsed_result_dict: Optional[Dict[str, Any]] = None # 用于存储最终解析结果
 
-    llm_py_logger.warning("LLM未能生成有效的意图分类结果，默认不需澄清。")
-    return {"clarification_needed": False, "reason": "LLM分类失败或无结果。"}
+    try:
+        response = await litellm.acompletion(**litellm_params)
+        if response and response.choices and response.choices[0].message and response.choices[0].message.content:
+            raw_gemini_output_text = response.choices[0].message.content.strip()
+            llm_py_logger.info(f"Gemini intent classification raw output: {raw_gemini_output_text[:300]}...")
+            
+            # 尝试解析JSON (与之前的提取逻辑类似)
+            json_str_candidate = raw_gemini_output_text
+            # 1. 尝试从 markdown block 中提取
+            markdown_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", json_str_candidate, re.DOTALL)
+            if markdown_match:
+                json_str_candidate = markdown_match.group(1)
+                llm_py_logger.debug(f"Extracted JSON candidate from markdown: {json_str_candidate[:200]}...")
+            
+            # 2. 如果没有markdown，或者提取后仍然不是纯JSON，尝试直接解析或查找第一个 '{' 和最后一个 '}'
+            try:
+                parsed_result_dict = json.loads(json_str_candidate)
+            except json.JSONDecodeError: # 如果直接解析失败
+                first_brace = json_str_candidate.find('{')
+                last_brace = json_str_candidate.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_str_candidate = json_str_candidate[first_brace : last_brace+1]
+                    llm_py_logger.debug(f"Extracted JSON candidate by braces: {json_str_candidate[:200]}...")
+                    try:
+                        parsed_result_dict = json.loads(json_str_candidate)
+                    except json.JSONDecodeError as e_json_brace:
+                        error_info_intent = f"Failed to decode JSON from Gemini intent (braces): {e_json_brace}"
+                        llm_py_logger.error(error_info_intent, exc_info=True)
+                else: # 没有找到有效的花括号对
+                    error_info_intent = "No valid JSON object found in Gemini intent output."
+                    llm_py_logger.error(error_info_intent + f" Raw: {raw_gemini_output_text[:200]}")
+            
+            # 验证解析后的JSON结构
+            if parsed_result_dict and isinstance(parsed_result_dict, dict) and \
+               "clarification_needed" in parsed_result_dict and \
+               "reason" in parsed_result_dict:
+                llm_py_logger.info(f"Gemini successfully classified intent: {parsed_result_dict}")
+                # 记录成功的调用
+                log_data_intent = {
+                    "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "task_type": "intent_classification_gemini", "user_query_for_task": user_query,
+                    "llm_input_messages": messages_for_gemini, "llm_parameters": {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key', 'proxy']},
+                    "raw_llm_output": raw_gemini_output_text, "application_version": "0.1.0_intent_gemini"
+                }
+                await log_interaction_data(log_data_intent)
+                return parsed_result_dict
+            else: # 解析成功但结构不对
+                if parsed_result_dict: # 避免对None调用get
+                    error_info_intent = f"Gemini intent output JSON structure mismatch. Parsed: {parsed_result_dict}"
+                else: # parsed_result_dict 为 None (例如，花括号提取失败后)
+                    error_info_intent = "Gemini intent output JSON structure mismatch (parsed_result_dict is None)."
+                llm_py_logger.warning(error_info_intent)
+        else: # response.choices[0].message.content 为空或不存在
+            error_info_intent = "Gemini intent call returned empty or malformed response content."
+            llm_py_logger.error(f"{error_info_intent} Full response object: {response}")
+
+    except Exception as e_gemini_call:
+        error_info_intent = f"Error calling Gemini for intent: {e_gemini_call}"
+        llm_py_logger.error(error_info_intent, exc_info=True)
+
+    # 如果执行到这里，说明出错了或者没有得到期望的JSON
+    log_error_data_intent = {
+        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_type": "intent_classification_gemini_error", "user_query_for_task": user_query,
+        "llm_input_messages": messages_for_gemini, "llm_parameters": {k:v for k,v in litellm_params.items() if k not in ['messages', 'api_key', 'proxy']},
+        "raw_llm_output": raw_gemini_output_text or "N/A", "error_details": error_info_intent,
+        "application_version": "0.1.0_intent_gemini"
+    }
+    await log_interaction_data(log_error_data_intent)
+    
+    llm_py_logger.warning(f"Gemini failed to generate valid intent classification, defaulting to no clarification needed. Error: {error_info_intent or 'Unknown reason'}")
+    return {"clarification_needed": False, "reason": f"Intent classification by Gemini failed: {error_info_intent or 'Unknown reason'}"}
     --- END OF FILE CONTENT ---
 
 
@@ -9182,18 +9488,6 @@ Directory: zhz_rag/stored_data/rag_interaction_logs/
   File (skipped, extension not included): rag_interactions_20250605.jsonl
 
 Directory: zhz_rag/stored_data/evaluation_results_logs/
-  File: analysis_answer_gemini_flash_20250605.csv
-    --- START OF FILE CONTENT ---
-﻿interaction_id_ref,user_question,generated_answer,overall_answer_quality_score,main_strengths_answer,main_weaknesses_answer,faithfulness_score,faithfulness_reasoning,faithfulness_problematic_segments,relevance_score,relevance_reasoning,completeness_context_sufficiency,completeness_context_reasoning,completeness_score,completeness_reasoning,coherence_score,coherence_reasoning,actionability_score,actionability_reasoning,gemini_suggestion_answer
-5dd63533-17d8-47bc-b670-f9cdd675913c,张三在哪里工作？,张三在谷歌工作。,5,"The answer is concise, accurate, and directly addresses the user's question.","No significant weaknesses.  The answer could be slightly improved by adding a qualifier, but this is minor.",5,The answer '张三在谷歌工作' is directly and accurately supported by the provided context: '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。',,5,"The answer perfectly and completely addresses the user's question, '张三在哪里工作？'",Sufficient,The context explicitly states Zhang San's workplace.,5,The answer fully utilizes the relevant information in the context to provide a complete and accurate response to the user's query.,5,"The answer is grammatically correct, concise, and easily understandable.",5,"The answer provides a clear and immediately actionable piece of information for an office worker, for example, if they needed to contact Zhang San.","While the answer is excellent, adding a qualifier like  '根据提供的资料，张三在谷歌工作。' could slightly improve it by explicitly acknowledging the source of the information. This is a minor suggestion, however, as the current answer is already very good."
-79bdcabd-bcc2-4709-9d4c-2ca12a5afd9f,项目Alpha的文档编写任务分配给了谁？,项目Alpha的文档编写任务分配给了张三。,4,"The answer is concise, accurate, and directly addresses the user's question.  It is completely faithful to the provided context.","The answer is slightly incomplete as it omits the additional information from Context Snippet 1 that Zhang San works at Google. While not strictly necessary to answer the core question, this information could be valuable context for the user.",5,All information presented in the answer is directly supported by Context Snippet 1. There are no hallucinations or contradictions.,,5,The answer perfectly and completely addresses the user's core question by directly stating who was assigned the documentation task for Project Alpha.,Sufficient,Context Snippet 1 contains all the information necessary to answer the user's question. Context Snippet 2 is irrelevant.,4,"While the answer correctly identifies the individual assigned to the task, it omits the additional detail from the context that Zhang San works at Google.  This omission doesn't make the answer incorrect, but it could be considered less complete.",5,"The answer is grammatically correct, concise, and easy to understand.  It flows naturally and is well-written.",5,"The answer provides a clear and concise answer to the user's question, directly addressing their need for information.  This is highly actionable and usable for an office worker.","To make the answer even more complete, consider adding the detail from Context Snippet 1:  '项目Alpha的文档编写任务分配给了张三，他在谷歌工作。'"
-da7c60ea-ad9c-4f57-b13d-cb8cbf870462,总结一下doc1.txt的主要内容。,"根据上下文信息，doc1.txt的主要内容包括：  
-1. 项目Alpha的文档编写任务分配给张三，张三在谷歌工作。  
-2. 第二个文档讨论了自然语言处理技术。",3,The answer correctly extracts information from the provided context snippets.,"The answer incorrectly includes information from 'Snippet 2', which refers to a *second* document, not doc1.txt.  This is a hallucination/misinterpretation.",2,"The first point is faithful to Context Snippet 1. However, the second point, stating that 'the second document discussed natural language processing techniques,' is not faithful.  The question specifically asks for a summary of doc1.txt, and Snippet 2 refers to a different document entirely. This is a hallucination/misinterpretation.",2. 第二个文档讨论了自然语言处理技术。,4,"The answer attempts to address the user's question by summarizing the content.  While partially successful, the inclusion of information from the wrong document reduces its relevance.",Partially Sufficient,"The context provides information relevant to doc1.txt, but it lacks information about the full content of doc1.txt.  We only have one snippet related to it.",3,"Given the limited context, the answer is partially complete. It correctly summarizes the information available about doc1.txt in Snippet 1, but it hallucinates by including information from a different document (Snippet 2).",4,"The answer is well-structured, grammatically correct, and easy to understand. The presentation is clear and concise.",3,"The answer provides a summary, but due to the hallucination, its usability is reduced. An office worker would need to verify the information, as it contains a factual error.","The AI should be improved to more accurately distinguish between different documents mentioned in the context.  If the context is insufficient to fully answer the question, the response should explicitly state this limitation.  For example, the answer could be: 'Based on the provided context, doc1.txt is about the assignment of the Alpha project's documentation writing task to Zhang San, who works at Google.  The provided context does not offer further details about doc1.txt.'"
-
-    --- END OF FILE CONTENT ---
-
-  File (skipped, extension not included): eval_results_answer_gemini_flash_20250605.jsonl
 
 Directory: zhz_rag/stored_data/kuzu_default_db/
   File (skipped, extension not included): .lock
@@ -11261,10 +11555,11 @@ async def query_rag_v2( # 重命名工具函数以避免与旧的混淆 (如果�
     log_all_raw_retrievals_summary: List[Dict[str, Any]] = []
     log_final_context_docs_summary: List[Dict[str, Any]] = [] # This will store the full doc model dumps
     log_fused_context_text_for_llm_snippet: str = "N/A"
+    # --- [确保所有日志变量都有初始值] ---
     log_final_answer_from_llm: str = "N/A"
     log_intent_classification_result: Optional[Dict[str, Any]] = None
     log_expanded_queries: Optional[List[str]] = None
-    # --- [结束新增日志变量] ---
+    # --- [结束确保所有日志变量都有初始值] ---
 
     try:
         # --- 1. LLM 驱动的意图分类和澄清触发 ---
@@ -11544,431 +11839,6 @@ if __name__ == "__main__":
     --- END OF FILE CONTENT ---
 
   File (skipped, extension not included): rag_service_debug.log
-  File: rag_service_debug.log.txt
-    --- START OF FILE CONTENT ---
-2025-06-05 12:28:45,313 - INFO - RagServiceLogger - rag_mcp_service.py:36 - --- RagServiceLogger configured to write to rag_service_debug.log ---
-2025-06-05 12:28:47,389 - WARNING - RagServiceLogger - rag_mcp_service.py:70 - .env file not found at /home/zhz/zhz_agent/zhz_rag/api/.env, will rely on environment variables or defaults.
-2025-06-05 12:28:47,398 - INFO - RagServiceLogger - rag_mcp_service.py:471 - --- Starting RAG Service (FastMCP for mcpo via direct run) ---
-2025-06-05 12:28:47,401 - INFO - RagServiceLogger - rag_mcp_service.py:88 - --- RAG Service (FastMCP): 正在初始化 RAG 组件 (新版) ---
-2025-06-05 12:28:47,958 - INFO - RagServiceLogger - rag_mcp_service.py:113 - RAG Service: ChromaDBRetriever 初始化成功。
-2025-06-05 12:28:47,959 - INFO - RagServiceLogger - rag_mcp_service.py:127 - RAG Service: FileBM25Retriever 初始化成功。
-2025-06-05 12:28:47,965 - INFO - RagServiceLogger - rag_mcp_service.py:136 - RAG Service: KGRetriever 初始化成功。
-2025-06-05 12:28:47,965 - INFO - RagServiceLogger - fusion_engine.py:41 - FusionEngine: Loading reranker model from: /home/zhz/models/bge-reranker-base to cuda...
-2025-06-05 12:28:48,998 - INFO - RagServiceLogger - fusion_engine.py:59 - FusionEngine: Reranker model loaded to GPU and using FP16.
-2025-06-05 12:28:48,999 - INFO - RagServiceLogger - fusion_engine.py:64 - FusionEngine: Reranker model loading successful!
-2025-06-05 12:28:48,999 - INFO - RagServiceLogger - rag_mcp_service.py:145 - RAG Service: FusionEngine 初始化成功。
-2025-06-05 12:28:48,999 - INFO - RagServiceLogger - rag_mcp_service.py:149 - --- RAG Service (FastMCP): RAG 组件初始化尝试完成。---
-2025-06-05 12:31:07,864 - INFO - RagServiceLogger - rag_mcp_service.py:181 - 
---- RAG Service (query_rag_v2): 接收到查询: '张三在哪里工作？' ---
-2025-06-05 12:31:07,864 - INFO - RagServiceLogger - rag_mcp_service.py:182 -       Params: top_k_vector=5, top_k_kg=3, top_k_bm25=3, top_k_final=3
-2025-06-05 12:31:07,864 - INFO - RagServiceLogger - rag_mcp_service.py:200 - --- [TIME] 开始意图分类 at 0.00s ---
-2025-06-05 12:31:23,809 - INFO - RagServiceLogger - rag_mcp_service.py:204 - --- [TIME] 结束意图分类, 耗时: 15.94s. Result: {'clarification_needed': False, 'reason': ''}
-2025-06-05 12:31:23,809 - INFO - RagServiceLogger - rag_mcp_service.py:220 - --- 查询清晰，无需澄清。将对原始查询 '张三在哪里工作？' 进行查询扩展 ---
-2025-06-05 12:31:38,096 - INFO - RagServiceLogger - rag_mcp_service.py:232 - --- 扩展后的查询列表 (共 4 个): ['张三目前的具体工作地点是哪里？', '张三的工作地点属于哪个城市或区域？', '张三是否在全职或兼职状态下工作？', '张三在哪里工作？']. 耗时: 14.29s ---
-2025-06-05 12:31:38,096 - INFO - RagServiceLogger - rag_mcp_service.py:237 - --- [TIME] 开始并行召回 for 4 queries at 30.23s ---
-2025-06-05 12:31:38,096 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '张三目前的具体工作地点是哪里？'
-2025-06-05 12:31:38,821 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '张三目前的具体工作地点是哪里？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7867591364914212, 'distance': 0.4264817270171577, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6887914454651377, 'distance': 0.6224171090697246, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:31:38,822 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '张三目前的具体工作地点是哪里？': found 2 docs.
-2025-06-05 12:31:39,271 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '张三目前的具体工作地点是哪里？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.5145924687385559}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}]
-2025-06-05 12:31:39,274 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '张三目前的具体工作地点是哪里？': found 2 potential docs.
-2025-06-05 12:31:39,274 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '张三目前的具体工作地点是哪里？'
-2025-06-05 12:31:45,069 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '张三目前的具体工作地点是哪里？' raw output: []
-2025-06-05 12:31:45,069 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '张三目前的具体工作地点是哪里？': found 0 results.
-2025-06-05 12:31:45,069 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '张三的工作地点属于哪个城市或区域？'
-2025-06-05 12:31:45,085 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '张三的工作地点属于哪个城市或区域？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7641450687097534, 'distance': 0.4717098625804932, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6620796215993948, 'distance': 0.6758407568012104, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:31:45,085 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '张三的工作地点属于哪个城市或区域？': found 2 docs.
-2025-06-05 12:31:45,085 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '张三的工作地点属于哪个城市或区域？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.5145924687385559}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}]
-2025-06-05 12:31:45,085 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '张三的工作地点属于哪个城市或区域？': found 2 potential docs.
-2025-06-05 12:31:45,085 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '张三的工作地点属于哪个城市或区域？'
-2025-06-05 12:31:45,601 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '张三的工作地点属于哪个城市或区域？' raw output: []
-2025-06-05 12:31:45,601 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '张三的工作地点属于哪个城市或区域？': found 0 results.
-2025-06-05 12:31:45,601 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '张三是否在全职或兼职状态下工作？'
-2025-06-05 12:31:45,609 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '张三是否在全职或兼职状态下工作？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7721326082874234, 'distance': 0.4557347834251533, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6798799292126996, 'distance': 0.6402401415746009, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:31:45,609 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '张三是否在全职或兼职状态下工作？': found 2 docs.
-2025-06-05 12:31:45,609 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '张三是否在全职或兼职状态下工作？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.25729623436927795}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}]
-2025-06-05 12:31:45,609 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '张三是否在全职或兼职状态下工作？': found 2 potential docs.
-2025-06-05 12:31:45,609 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '张三是否在全职或兼职状态下工作？'
-2025-06-05 12:31:46,104 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '张三是否在全职或兼职状态下工作？' raw output: []
-2025-06-05 12:31:46,104 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '张三是否在全职或兼职状态下工作？': found 0 results.
-2025-06-05 12:31:46,104 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '张三在哪里工作？'
-2025-06-05 12:31:46,114 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '张三在哪里工作？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7751814238132197, 'distance': 0.4496371523735605, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6303522783352865, 'distance': 0.739295443329427, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:31:46,114 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '张三在哪里工作？': found 2 docs.
-2025-06-05 12:31:46,115 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '张三在哪里工作？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.5145924687385559}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}]
-2025-06-05 12:31:46,115 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '张三在哪里工作？': found 2 potential docs.
-2025-06-05 12:31:46,115 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '张三在哪里工作？'
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '张三在哪里工作？' raw output: []
-2025-06-05 12:31:46,661 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '张三在哪里工作？': found 0 results.
-2025-06-05 12:31:46,661 - INFO - RagServiceLogger - rag_mcp_service.py:317 - --- [TIME] 结束所有召回, 耗时: 8.57s ---
-2025-06-05 12:31:46,661 - INFO - RagServiceLogger - rag_mcp_service.py:318 - --- 总计从各路召回（所有查询处理后）的结果数: 16 ---
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 0 (Summary): type=vector_chroma, score=0.7867591364914212, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 1 (Summary): type=vector_chroma, score=0.6887914454651377, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 2 (Summary): type=keyword_bm25s, score=0.5145924687385559, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:31:46,661 - INFO - RagServiceLogger - rag_mcp_service.py:332 - --- [TIME] 开始结果融合与重排序 at 38.80s ---
-2025-06-05 12:31:46,661 - INFO - RagServiceLogger - fusion_engine.py:144 - FusionEngine: Fusing 16 raw retrieved documents for query: '张三在哪里工作？'. Target top_n_final: 3
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.5145924687385559 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7641450687097534 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6620796215993948 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.5145924687385559 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7721326082874234 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6798799292126996 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,661 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.25729623436927795 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7751814238132197 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6303522783352865 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.5145924687385559 vs existing 0.7867591364914212. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6887914454651377. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:31:46,662 - INFO - RagServiceLogger - fusion_engine.py:170 - FusionEngine: After deduplication (content hash): 2 documents.
-2025-06-05 12:31:46,662 - INFO - RagServiceLogger - fusion_engine.py:189 - FusionEngine: Starting light screening for 2 unique documents.
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:216 -   Screening: Doc 0 (ID: N/A) passed light screening.
-2025-06-05 12:31:46,662 - DEBUG - RagServiceLogger - fusion_engine.py:209 -   Screening: Doc 1 (ID: N/A) failed Jaccard check. Similarity: 0.0000 < 0.05. Content: '第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:31:46,662 - INFO - RagServiceLogger - fusion_engine.py:218 - FusionEngine: After light screening: 1 documents remain.
-2025-06-05 12:31:46,690 - INFO - RagServiceLogger - fusion_engine.py:95 - FusionEngine: Reranking 1 documents with CrossEncoder...
-2025-06-05 12:31:46,820 - INFO - RagServiceLogger - fusion_engine.py:116 - FusionEngine: Reranking complete. 1 documents sorted.
-2025-06-05 12:31:46,820 - INFO - RagServiceLogger - fusion_engine.py:238 - FusionEngine: After reranking: 1 documents.
-2025-06-05 12:31:46,820 - DEBUG - RagServiceLogger - fusion_engine.py:240 -   Reranked Doc 0: type=vector_chroma, new_score=6.7031, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:31:46,820 - INFO - RagServiceLogger - fusion_engine.py:245 - FusionEngine: Returning final top 1 documents.
-2025-06-05 12:31:46,820 - INFO - RagServiceLogger - rag_mcp_service.py:348 - DEBUG_MODEL_DUMP: First item of log_final_context_docs_summary (from model_dump()): {"source_type": "vector_chroma", "content": "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。", "score": 6.703125, "metadata": {"chunk_char_length": 29, "chunk_number": 1, "chunk_text": "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。", "filename": "doc1.txt", "size_bytes": 77, "source_directory": "/home/zhz/zhz_agent/data/raw_documents/", "total_chunks_for_doc": 1, "original_query_part": "张三目前的具体工作地点是哪里？"}}
-2025-06-05 12:31:46,821 - INFO - RagServiceLogger - rag_mcp_service.py:351 - --- [TIME] 结束结果融合与重排序, 耗时: 0.16s. Final context docs: 1 ---
-2025-06-05 12:31:46,821 - DEBUG - RagServiceLogger - rag_mcp_service.py:354 -    Fused Doc 0 (Summary): type=vector_chroma, score=6.703125, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:31:46,821 - INFO - RagServiceLogger - rag_mcp_service.py:376 - 
---- FUSED CONTEXT for LLM (length: 80 chars) ---
-2025-06-05 12:31:46,821 - INFO - RagServiceLogger - rag_mcp_service.py:377 - Source Type: vector_chroma, Score: 6.7031
-Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:31:46,821 - INFO - RagServiceLogger - rag_mcp_service.py:378 - --- END OF FUSED CONTEXT ---
-
-2025-06-05 12:31:46,821 - INFO - RagServiceLogger - rag_mcp_service.py:380 - --- [TIME] 开始最终答案生成 at 38.96s ---
-2025-06-05 12:31:55,178 - INFO - RagServiceLogger - rag_mcp_service.py:384 - --- [TIME] 结束最终答案生成, 耗时: 8.36s ---
-2025-06-05 12:31:55,179 - INFO - RagServiceLogger - rag_mcp_service.py:398 - --- 'query_rag_v2' 逻辑执行完毕, 总耗时: 47.31s. ---
-2025-06-05 12:31:55,180 - INFO - RagServiceLogger - rag_mcp_service.py:462 - Full RAG interaction log (ID: 5dd63533-17d8-47bc-b670-f9cdd675913c) has been written.
-2025-06-05 12:32:05,564 - INFO - RagServiceLogger - rag_mcp_service.py:181 - 
---- RAG Service (query_rag_v2): 接收到查询: '项目Alpha的文档编写任务分配给了谁？' ---
-2025-06-05 12:32:05,564 - INFO - RagServiceLogger - rag_mcp_service.py:182 -       Params: top_k_vector=5, top_k_kg=3, top_k_bm25=3, top_k_final=3
-2025-06-05 12:32:05,564 - INFO - RagServiceLogger - rag_mcp_service.py:200 - --- [TIME] 开始意图分类 at 0.00s ---
-2025-06-05 12:32:24,677 - INFO - RagServiceLogger - rag_mcp_service.py:204 - --- [TIME] 结束意图分类, 耗时: 19.11s. Result: {'clarification_needed': False, 'reason': 'LLM分类失败或无结果。'}
-2025-06-05 12:32:24,677 - INFO - RagServiceLogger - rag_mcp_service.py:220 - --- 查询清晰，无需澄清。将对原始查询 '项目Alpha的文档编写任务分配给了谁？' 进行查询扩展 ---
-2025-06-05 12:32:37,480 - INFO - RagServiceLogger - rag_mcp_service.py:232 - --- 扩展后的查询列表 (共 4 个): ['项目Alpha的文档编写任务由谁负责执行？', '文档编写任务的具体内容和分工如何分配？', '项目Alpha的文档编写任务是否涉及跨部门协作？', '项目Alpha的文档编写任务分配给了谁？']. 耗时: 12.80s ---
-2025-06-05 12:32:37,480 - INFO - RagServiceLogger - rag_mcp_service.py:237 - --- [TIME] 开始并行召回 for 4 queries at 31.92s ---
-2025-06-05 12:32:37,480 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '项目Alpha的文档编写任务由谁负责执行？'
-2025-06-05 12:32:37,511 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '项目Alpha的文档编写任务由谁负责执行？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.8663428193762523, 'distance': 0.2673143612474952, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7532964203210739, 'distance': 0.4934071593578523, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:32:37,511 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '项目Alpha的文档编写任务由谁负责执行？': found 2 docs.
-2025-06-05 12:32:37,512 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '项目Alpha的文档编写任务由谁负责执行？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 1.354158878326416}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}]
-2025-06-05 12:32:37,514 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '项目Alpha的文档编写任务由谁负责执行？': found 2 potential docs.
-2025-06-05 12:32:37,514 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '项目Alpha的文档编写任务由谁负责执行？'
-2025-06-05 12:32:43,939 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '项目Alpha的文档编写任务由谁负责执行？' raw output: []
-2025-06-05 12:32:43,939 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '项目Alpha的文档编写任务由谁负责执行？': found 0 results.
-2025-06-05 12:32:43,939 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '文档编写任务的具体内容和分工如何分配？'
-2025-06-05 12:32:43,947 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '文档编写任务的具体内容和分工如何分配？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.8551838638290905, 'distance': 0.2896322723418189, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7364195468021517, 'distance': 0.5271609063956967, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:32:43,947 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '文档编写任务的具体内容和分工如何分配？': found 2 docs.
-2025-06-05 12:32:43,947 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '文档编写任务的具体内容和分工如何分配？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 1.0968626737594604}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}]
-2025-06-05 12:32:43,947 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '文档编写任务的具体内容和分工如何分配？': found 2 potential docs.
-2025-06-05 12:32:43,947 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '文档编写任务的具体内容和分工如何分配？'
-2025-06-05 12:32:44,492 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '文档编写任务的具体内容和分工如何分配？' raw output: []
-2025-06-05 12:32:44,492 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '文档编写任务的具体内容和分工如何分配？': found 0 results.
-2025-06-05 12:32:44,492 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '项目Alpha的文档编写任务是否涉及跨部门协作？'
-2025-06-05 12:32:44,501 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '项目Alpha的文档编写任务是否涉及跨部门协作？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.842448957206889, 'distance': 0.3151020855862222, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7467386515095181, 'distance': 0.5065226969809637, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:32:44,501 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '项目Alpha的文档编写任务是否涉及跨部门协作？': found 2 docs.
-2025-06-05 12:32:44,501 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '项目Alpha的文档编写任务是否涉及跨部门协作？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 1.354158878326416}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}]
-2025-06-05 12:32:44,501 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '项目Alpha的文档编写任务是否涉及跨部门协作？': found 2 potential docs.
-2025-06-05 12:32:44,501 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '项目Alpha的文档编写任务是否涉及跨部门协作？'
-2025-06-05 12:32:45,090 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '项目Alpha的文档编写任务是否涉及跨部门协作？' raw output: []
-2025-06-05 12:32:45,090 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '项目Alpha的文档编写任务是否涉及跨部门协作？': found 0 results.
-2025-06-05 12:32:45,090 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '项目Alpha的文档编写任务分配给了谁？'
-2025-06-05 12:32:45,102 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '项目Alpha的文档编写任务分配给了谁？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.903962508043018, 'distance': 0.19207498391396383, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7558951487889674, 'distance': 0.4882097024220653, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:32:45,102 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '项目Alpha的文档编写任务分配给了谁？': found 2 docs.
-2025-06-05 12:32:45,103 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '项目Alpha的文档编写任务分配给了谁？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 2.193725347518921}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.1581256240606308}]
-2025-06-05 12:32:45,103 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '项目Alpha的文档编写任务分配给了谁？': found 2 potential docs.
-2025-06-05 12:32:45,103 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '项目Alpha的文档编写任务分配给了谁？'
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '项目Alpha的文档编写任务分配给了谁？' raw output: []
-2025-06-05 12:32:45,594 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '项目Alpha的文档编写任务分配给了谁？': found 0 results.
-2025-06-05 12:32:45,594 - INFO - RagServiceLogger - rag_mcp_service.py:317 - --- [TIME] 结束所有召回, 耗时: 8.11s ---
-2025-06-05 12:32:45,594 - INFO - RagServiceLogger - rag_mcp_service.py:318 - --- 总计从各路召回（所有查询处理后）的结果数: 16 ---
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 0 (Summary): type=vector_chroma, score=0.8663428193762523, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 1 (Summary): type=vector_chroma, score=0.7532964203210739, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 2 (Summary): type=keyword_bm25s, score=1.354158878326416, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:32:45,594 - INFO - RagServiceLogger - rag_mcp_service.py:332 - --- [TIME] 开始结果融合与重排序 at 40.03s ---
-2025-06-05 12:32:45,594 - INFO - RagServiceLogger - fusion_engine.py:144 - FusionEngine: Fusing 16 raw retrieved documents for query: '项目Alpha的文档编写任务分配给了谁？'. Target top_n_final: 3
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 1.354158878326416 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7532964203210739. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.8551838638290905 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7364195468021517 vs existing 0.7532964203210739. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 1.0968626737594604 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7532964203210739. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,594 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.842448957206889 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7467386515095181 vs existing 0.7532964203210739. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 1.354158878326416 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7532964203210739. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.903962508043018 vs existing 1.354158878326416. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7558951487889674 vs existing 0.7558951487889674. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 2.193725347518921 vs existing 2.193725347518921. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.1581256240606308 vs existing 0.7558951487889674. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,595 - INFO - RagServiceLogger - fusion_engine.py:170 - FusionEngine: After deduplication (content hash): 2 documents.
-2025-06-05 12:32:45,595 - INFO - RagServiceLogger - fusion_engine.py:189 - FusionEngine: Starting light screening for 2 unique documents.
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:216 -   Screening: Doc 0 (ID: 425087b5-58ed-47f3-ade3-69ebca135812) passed light screening.
-2025-06-05 12:32:45,595 - DEBUG - RagServiceLogger - fusion_engine.py:216 -   Screening: Doc 1 (ID: N/A) passed light screening.
-2025-06-05 12:32:45,595 - INFO - RagServiceLogger - fusion_engine.py:218 - FusionEngine: After light screening: 2 documents remain.
-2025-06-05 12:32:45,624 - INFO - RagServiceLogger - fusion_engine.py:95 - FusionEngine: Reranking 2 documents with CrossEncoder...
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - fusion_engine.py:116 - FusionEngine: Reranking complete. 2 documents sorted.
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - fusion_engine.py:238 - FusionEngine: After reranking: 2 documents.
-2025-06-05 12:32:45,662 - DEBUG - RagServiceLogger - fusion_engine.py:240 -   Reranked Doc 0: type=keyword_bm25s, new_score=9.2578, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:32:45,662 - DEBUG - RagServiceLogger - fusion_engine.py:240 -   Reranked Doc 1: type=vector_chroma, new_score=-10.1953, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - fusion_engine.py:245 - FusionEngine: Returning final top 2 documents.
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:348 - DEBUG_MODEL_DUMP: First item of log_final_context_docs_summary (from model_dump()): {"source_type": "keyword_bm25s", "content": "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。", "score": 9.2578125, "metadata": {"chunk_id": "425087b5-58ed-47f3-ade3-69ebca135812", "original_query_part": "项目Alpha的文档编写任务分配给了谁？"}}
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:351 - --- [TIME] 结束结果融合与重排序, 耗时: 0.07s. Final context docs: 2 ---
-2025-06-05 12:32:45,662 - DEBUG - RagServiceLogger - rag_mcp_service.py:354 -    Fused Doc 0 (Summary): type=keyword_bm25s, score=9.2578125, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:32:45,662 - DEBUG - RagServiceLogger - rag_mcp_service.py:354 -    Fused Doc 1 (Summary): type=vector_chroma, score=-10.1953125, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:376 - 
---- FUSED CONTEXT for LLM (length: 157 chars) ---
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:377 - Source Type: keyword_bm25s, Score: 9.2578
-Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。
-
----
-
-Source Type: vector_chroma, Score: -10.1953
-Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:378 - --- END OF FUSED CONTEXT ---
-
-2025-06-05 12:32:45,662 - INFO - RagServiceLogger - rag_mcp_service.py:380 - --- [TIME] 开始最终答案生成 at 40.10s ---
-2025-06-05 12:32:54,586 - INFO - RagServiceLogger - rag_mcp_service.py:384 - --- [TIME] 结束最终答案生成, 耗时: 8.92s ---
-2025-06-05 12:32:54,586 - INFO - RagServiceLogger - rag_mcp_service.py:398 - --- 'query_rag_v2' 逻辑执行完毕, 总耗时: 49.02s. ---
-2025-06-05 12:32:54,587 - INFO - RagServiceLogger - rag_mcp_service.py:462 - Full RAG interaction log (ID: 79bdcabd-bcc2-4709-9d4c-2ca12a5afd9f) has been written.
-2025-06-05 12:33:06,278 - INFO - RagServiceLogger - rag_mcp_service.py:181 - 
---- RAG Service (query_rag_v2): 接收到查询: '总结一下doc1.txt的主要内容。' ---
-2025-06-05 12:33:06,278 - INFO - RagServiceLogger - rag_mcp_service.py:182 -       Params: top_k_vector=5, top_k_kg=3, top_k_bm25=3, top_k_final=3
-2025-06-05 12:33:06,278 - INFO - RagServiceLogger - rag_mcp_service.py:200 - --- [TIME] 开始意图分类 at 0.00s ---
-2025-06-05 12:33:25,733 - INFO - RagServiceLogger - rag_mcp_service.py:204 - --- [TIME] 结束意图分类, 耗时: 19.45s. Result: {'clarification_needed': False, 'reason': 'LLM分类失败或无结果。'}
-2025-06-05 12:33:25,733 - INFO - RagServiceLogger - rag_mcp_service.py:220 - --- 查询清晰，无需澄清。将对原始查询 '总结一下doc1.txt的主要内容。' 进行查询扩展 ---
-2025-06-05 12:33:41,096 - INFO - RagServiceLogger - rag_mcp_service.py:232 - --- 扩展后的查询列表 (共 4 个): ['文档的结构划分是否包含特定章节或分节？', '文档中有哪些核心论点或主要数据需要重点概括？', '文档中是否存在关键结论或建议？', '总结一下doc1.txt的主要内容。']. 耗时: 15.36s ---
-2025-06-05 12:33:41,097 - INFO - RagServiceLogger - rag_mcp_service.py:237 - --- [TIME] 开始并行召回 for 4 queries at 34.82s ---
-2025-06-05 12:33:41,097 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '文档的结构划分是否包含特定章节或分节？'
-2025-06-05 12:33:41,124 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '文档的结构划分是否包含特定章节或分节？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7562013896162265, 'distance': 0.48759722076754686, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7143654919328178, 'distance': 0.5712690161343643, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:33:41,124 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '文档的结构划分是否包含特定章节或分节？': found 2 docs.
-2025-06-05 12:33:41,125 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '文档的结构划分是否包含特定章节或分节？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.324974000453949}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}]
-2025-06-05 12:33:41,127 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '文档的结构划分是否包含特定章节或分节？': found 2 potential docs.
-2025-06-05 12:33:41,127 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '文档的结构划分是否包含特定章节或分节？'
-2025-06-05 12:33:47,401 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '文档的结构划分是否包含特定章节或分节？' raw output: []
-2025-06-05 12:33:47,401 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '文档的结构划分是否包含特定章节或分节？': found 0 results.
-2025-06-05 12:33:47,401 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '文档中有哪些核心论点或主要数据需要重点概括？'
-2025-06-05 12:33:47,415 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '文档中有哪些核心论点或主要数据需要重点概括？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7425170610105933, 'distance': 0.5149658779788133, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7161651467322423, 'distance': 0.5676697065355154, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:33:47,415 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '文档中有哪些核心论点或主要数据需要重点概括？': found 2 docs.
-2025-06-05 12:33:47,415 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '文档中有哪些核心论点或主要数据需要重点概括？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.06767776608467102}]
-2025-06-05 12:33:47,415 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '文档中有哪些核心论点或主要数据需要重点概括？': found 2 potential docs.
-2025-06-05 12:33:47,415 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '文档中有哪些核心论点或主要数据需要重点概括？'
-2025-06-05 12:33:47,944 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '文档中有哪些核心论点或主要数据需要重点概括？' raw output: []
-2025-06-05 12:33:47,945 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '文档中有哪些核心论点或主要数据需要重点概括？': found 0 results.
-2025-06-05 12:33:47,945 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '文档中是否存在关键结论或建议？'
-2025-06-05 12:33:47,967 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '文档中是否存在关键结论或建议？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7731468848061236, 'distance': 0.4537062303877528, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7370770164860636, 'distance': 0.5258459670278727, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:33:47,967 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '文档中是否存在关键结论或建议？': found 2 docs.
-2025-06-05 12:33:47,967 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '文档中是否存在关键结论或建议？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.06767776608467102}]
-2025-06-05 12:33:47,967 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '文档中是否存在关键结论或建议？': found 2 potential docs.
-2025-06-05 12:33:47,967 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '文档中是否存在关键结论或建议？'
-2025-06-05 12:33:48,469 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '文档中是否存在关键结论或建议？' raw output: []
-2025-06-05 12:33:48,469 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '文档中是否存在关键结论或建议？': found 0 results.
-2025-06-05 12:33:48,469 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '总结一下doc1.txt的主要内容。'
-2025-06-05 12:33:48,481 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '总结一下doc1.txt的主要内容。' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7796052798097877, 'distance': 0.4407894403804248, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7713835766155224, 'distance': 0.45723284676895526, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:33:48,481 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '总结一下doc1.txt的主要内容。': found 2 docs.
-2025-06-05 12:33:48,482 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '总结一下doc1.txt的主要内容。' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.35600942373275757}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0790628120303154}]
-2025-06-05 12:33:48,482 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '总结一下doc1.txt的主要内容。': found 2 potential docs.
-2025-06-05 12:33:48,482 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '总结一下doc1.txt的主要内容。'
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '总结一下doc1.txt的主要内容。' raw output: []
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '总结一下doc1.txt的主要内容。': found 0 results.
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - rag_mcp_service.py:317 - --- [TIME] 结束所有召回, 耗时: 8.01s ---
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - rag_mcp_service.py:318 - --- 总计从各路召回（所有查询处理后）的结果数: 16 ---
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 0 (Summary): type=vector_chroma, score=0.7562013896162265, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 1 (Summary): type=vector_chroma, score=0.7143654919328178, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 2 (Summary): type=keyword_bm25s, score=0.324974000453949, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - rag_mcp_service.py:332 - --- [TIME] 开始结果融合与重排序 at 42.83s ---
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - fusion_engine.py:144 - FusionEngine: Fusing 16 raw retrieved documents for query: '总结一下doc1.txt的主要内容。'. Target top_n_final: 3
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.324974000453949 vs existing 0.7562013896162265. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7143654919328178. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7425170610105933 vs existing 0.7425170610105933. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7161651467322423 vs existing 0.7562013896162265. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7425170610105933. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.06767776608467102 vs existing 0.7562013896162265. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7731468848061236 vs existing 0.7731468848061236. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7370770164860636 vs existing 0.7562013896162265. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7731468848061236. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.06767776608467102 vs existing 0.7562013896162265. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7796052798097877 vs existing 0.7796052798097877. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7713835766155224 vs existing 0.7731468848061236. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.35600942373275757 vs existing 0.7796052798097877. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0790628120303154 vs existing 0.7731468848061236. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - fusion_engine.py:170 - FusionEngine: After deduplication (content hash): 2 documents.
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - fusion_engine.py:189 - FusionEngine: Starting light screening for 2 unique documents.
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:216 -   Screening: Doc 0 (ID: N/A) passed light screening.
-2025-06-05 12:33:49,109 - DEBUG - RagServiceLogger - fusion_engine.py:216 -   Screening: Doc 1 (ID: N/A) passed light screening.
-2025-06-05 12:33:49,109 - INFO - RagServiceLogger - fusion_engine.py:218 - FusionEngine: After light screening: 2 documents remain.
-2025-06-05 12:33:49,133 - INFO - RagServiceLogger - fusion_engine.py:95 - FusionEngine: Reranking 2 documents with CrossEncoder...
-2025-06-05 12:33:49,177 - INFO - RagServiceLogger - fusion_engine.py:116 - FusionEngine: Reranking complete. 2 documents sorted.
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - fusion_engine.py:238 - FusionEngine: After reranking: 2 documents.
-2025-06-05 12:33:49,178 - DEBUG - RagServiceLogger - fusion_engine.py:240 -   Reranked Doc 0: type=vector_chroma, new_score=-3.5723, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:33:49,178 - DEBUG - RagServiceLogger - fusion_engine.py:240 -   Reranked Doc 1: type=vector_chroma, new_score=-3.8320, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - fusion_engine.py:245 - FusionEngine: Returning final top 2 documents.
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:348 - DEBUG_MODEL_DUMP: First item of log_final_context_docs_summary (from model_dump()): {"source_type": "vector_chroma", "content": "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。", "score": -3.572265625, "metadata": {"chunk_char_length": 29, "chunk_number": 1, "chunk_text": "项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。", "filename": "doc1.txt", "size_bytes": 77, "source_directory": "/home/zhz/zhz_agent/data/raw_documents/", "total_chunks_for_doc": 1, "original_query_part": "总结一下doc1.txt的主要内容。"}}
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:351 - --- [TIME] 结束结果融合与重排序, 耗时: 0.07s. Final context docs: 2 ---
-2025-06-05 12:33:49,178 - DEBUG - RagServiceLogger - rag_mcp_service.py:354 -    Fused Doc 0 (Summary): type=vector_chroma, score=-3.572265625, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:33:49,178 - DEBUG - RagServiceLogger - rag_mcp_service.py:354 -    Fused Doc 1 (Summary): type=vector_chroma, score=-3.83203125, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:376 - 
---- FUSED CONTEXT for LLM (length: 157 chars) ---
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:377 - Source Type: vector_chroma, Score: -3.5723
-Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。
-
----
-
-Source Type: vector_chroma, Score: -3.8320
-Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:378 - --- END OF FUSED CONTEXT ---
-
-2025-06-05 12:33:49,178 - INFO - RagServiceLogger - rag_mcp_service.py:380 - --- [TIME] 开始最终答案生成 at 42.90s ---
-2025-06-05 12:34:17,915 - INFO - RagServiceLogger - rag_mcp_service.py:384 - --- [TIME] 结束最终答案生成, 耗时: 28.74s ---
-2025-06-05 12:34:17,915 - INFO - RagServiceLogger - rag_mcp_service.py:398 - --- 'query_rag_v2' 逻辑执行完毕, 总耗时: 71.64s. ---
-2025-06-05 12:34:17,916 - INFO - RagServiceLogger - rag_mcp_service.py:462 - Full RAG interaction log (ID: da7c60ea-ad9c-4f57-b13d-cb8cbf870462) has been written.
-2025-06-05 12:34:39,466 - INFO - RagServiceLogger - rag_mcp_service.py:181 - 
---- RAG Service (query_rag_v2): 接收到查询: '今天天气怎么样？' ---
-2025-06-05 12:34:39,466 - INFO - RagServiceLogger - rag_mcp_service.py:182 -       Params: top_k_vector=5, top_k_kg=3, top_k_bm25=3, top_k_final=3
-2025-06-05 12:34:39,466 - INFO - RagServiceLogger - rag_mcp_service.py:200 - --- [TIME] 开始意图分类 at 0.00s ---
-2025-06-05 12:34:59,749 - INFO - RagServiceLogger - rag_mcp_service.py:204 - --- [TIME] 结束意图分类, 耗时: 20.28s. Result: {'clarification_needed': False, 'reason': 'LLM分类失败或无结果。'}
-2025-06-05 12:34:59,749 - INFO - RagServiceLogger - rag_mcp_service.py:220 - --- 查询清晰，无需澄清。将对原始查询 '今天天气怎么样？' 进行查询扩展 ---
-2025-06-05 12:35:11,817 - INFO - RagServiceLogger - rag_mcp_service.py:232 - --- 扩展后的查询列表 (共 4 个): ['今天气温范围和天气状况如何？', '影响今天天气的主要因素有哪些？', '今天天气是否适合出行或户外活动？', '今天天气怎么样？']. 耗时: 12.07s ---
-2025-06-05 12:35:11,817 - INFO - RagServiceLogger - rag_mcp_service.py:237 - --- [TIME] 开始并行召回 for 4 queries at 32.35s ---
-2025-06-05 12:35:11,817 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '今天气温范围和天气状况如何？'
-2025-06-05 12:35:11,829 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '今天气温范围和天气状况如何？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6609606554269477, 'distance': 0.6780786891461046, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.6288368309478083, 'distance': 0.7423263381043833, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:35:11,829 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '今天气温范围和天气状况如何？': found 2 docs.
-2025-06-05 12:35:11,830 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '今天气温范围和天气状况如何？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 12:35:11,832 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '今天气温范围和天气状况如何？': found 2 potential docs.
-2025-06-05 12:35:11,832 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '今天气温范围和天气状况如何？'
-2025-06-05 12:35:18,301 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '今天气温范围和天气状况如何？' raw output: []
-2025-06-05 12:35:18,301 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '今天气温范围和天气状况如何？': found 0 results.
-2025-06-05 12:35:18,301 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '影响今天天气的主要因素有哪些？'
-2025-06-05 12:35:18,315 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '影响今天天气的主要因素有哪些？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6548067856532859, 'distance': 0.6903864286934283, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.6297128473214245, 'distance': 0.740574305357151, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:35:18,315 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '影响今天天气的主要因素有哪些？': found 2 docs.
-2025-06-05 12:35:18,316 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '影响今天天气的主要因素有哪些？' raw output (IDs and scores): [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.25729623436927795}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}]
-2025-06-05 12:35:18,316 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '影响今天天气的主要因素有哪些？': found 2 potential docs.
-2025-06-05 12:35:18,316 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '影响今天天气的主要因素有哪些？'
-2025-06-05 12:35:18,837 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '影响今天天气的主要因素有哪些？' raw output: []
-2025-06-05 12:35:18,837 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '影响今天天气的主要因素有哪些？': found 0 results.
-2025-06-05 12:35:18,837 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '今天天气是否适合出行或户外活动？'
-2025-06-05 12:35:18,851 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '今天天气是否适合出行或户外活动？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6799993212400485, 'distance': 0.6400013575199031, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.6486423417951616, 'distance': 0.7027153164096769, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:35:18,851 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '今天天气是否适合出行或户外活动？': found 2 docs.
-2025-06-05 12:35:18,852 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '今天天气是否适合出行或户外活动？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 12:35:18,852 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '今天天气是否适合出行或户外活动？': found 2 potential docs.
-2025-06-05 12:35:18,852 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '今天天气是否适合出行或户外活动？'
-2025-06-05 12:35:19,443 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '今天天气是否适合出行或户外活动？' raw output: []
-2025-06-05 12:35:19,443 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '今天天气是否适合出行或户外活动？': found 0 results.
-2025-06-05 12:35:19,443 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '今天天气怎么样？'
-2025-06-05 12:35:19,464 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '今天天气怎么样？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6316905836021479, 'distance': 0.7366188327957042, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.5905228632028737, 'distance': 0.8189542735942525, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 12:35:19,464 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '今天天气怎么样？': found 2 docs.
-2025-06-05 12:35:19,464 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '今天天气怎么样？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 12:35:19,465 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '今天天气怎么样？': found 2 potential docs.
-2025-06-05 12:35:19,465 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '今天天气怎么样？'
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '今天天气怎么样？' raw output: []
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '今天天气怎么样？': found 0 results.
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - rag_mcp_service.py:317 - --- [TIME] 结束所有召回, 耗时: 8.12s ---
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - rag_mcp_service.py:318 - --- 总计从各路召回（所有查询处理后）的结果数: 16 ---
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 0 (Summary): type=vector_chroma, score=0.6609606554269477, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 1 (Summary): type=vector_chroma, score=0.6288368309478083, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 2 (Summary): type=keyword_bm25s, score=0.0, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - rag_mcp_service.py:332 - --- [TIME] 开始结果融合与重排序 at 40.48s ---
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - fusion_engine.py:144 - FusionEngine: Fusing 16 raw retrieved documents for query: '今天天气怎么样？'. Target top_n_final: 3
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6609606554269477. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6288368309478083. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6548067856532859 vs existing 0.6609606554269477. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6297128473214245 vs existing 0.6297128473214245. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.25729623436927795 vs existing 0.6297128473214245. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6609606554269477. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6799993212400485 vs existing 0.6799993212400485. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6486423417951616 vs existing 0.6486423417951616. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6799993212400485. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6486423417951616. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6316905836021479 vs existing 0.6799993212400485. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.5905228632028737 vs existing 0.6486423417951616. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6799993212400485. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6486423417951616. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - fusion_engine.py:170 - FusionEngine: After deduplication (content hash): 2 documents.
-2025-06-05 12:35:19,941 - INFO - RagServiceLogger - fusion_engine.py:189 - FusionEngine: Starting light screening for 2 unique documents.
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:209 -   Screening: Doc 0 (ID: N/A) failed Jaccard check. Similarity: 0.0000 < 0.05. Content: '第二个文档讨论了自然语言处理技术。...'
-2025-06-05 12:35:19,941 - DEBUG - RagServiceLogger - fusion_engine.py:209 -   Screening: Doc 1 (ID: N/A) failed Jaccard check. Similarity: 0.0000 < 0.05. Content: '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 12:35:19,942 - INFO - RagServiceLogger - fusion_engine.py:218 - FusionEngine: After light screening: 0 documents remain.
-2025-06-05 12:35:19,942 - INFO - RagServiceLogger - fusion_engine.py:221 - FusionEngine: No documents remain after light screening. Returning empty list.
-2025-06-05 12:35:19,942 - INFO - RagServiceLogger - rag_mcp_service.py:351 - --- [TIME] 结束结果融合与重排序, 耗时: 0.00s. Final context docs: 0 ---
-2025-06-05 12:35:19,942 - INFO - RagServiceLogger - rag_mcp_service.py:398 - --- 'query_rag_v2' 逻辑执行完毕, 总耗时: 40.48s. ---
-2025-06-05 12:35:19,942 - INFO - RagServiceLogger - rag_mcp_service.py:462 - Full RAG interaction log (ID: 2a261917-261a-4e18-922e-4e95c8930bf3) has been written.
-2025-06-05 13:12:18,411 - INFO - RagServiceLogger - rag_mcp_service.py:181 - 
---- RAG Service (query_rag_v2): 接收到查询: '人工智能在客户服务中有哪些应用场景？' ---
-2025-06-05 13:12:18,411 - INFO - RagServiceLogger - rag_mcp_service.py:182 -       Params: top_k_vector=5, top_k_kg=3, top_k_bm25=3, top_k_final=3
-2025-06-05 13:12:18,411 - INFO - RagServiceLogger - rag_mcp_service.py:200 - --- [TIME] 开始意图分类 at 0.00s ---
-2025-06-05 13:12:37,888 - INFO - RagServiceLogger - rag_mcp_service.py:204 - --- [TIME] 结束意图分类, 耗时: 19.48s. Result: {'clarification_needed': False, 'reason': 'LLM分类失败或无结果。'}
-2025-06-05 13:12:37,889 - INFO - RagServiceLogger - rag_mcp_service.py:220 - --- 查询清晰，无需澄清。将对原始查询 '人工智能在客户服务中有哪些应用场景？' 进行查询扩展 ---
-2025-06-05 13:12:53,146 - INFO - RagServiceLogger - rag_mcp_service.py:232 - --- 扩展后的查询列表 (共 4 个): ['人工智能在客户服务中主要应用于哪些具体领域？', '自然语言处理技术如何提升客户服务的交互体验？', '人工智能在客户预测和个性化服务方面有哪些创新应用？', '人工智能在客户服务中有哪些应用场景？']. 耗时: 15.26s ---
-2025-06-05 13:12:53,146 - INFO - RagServiceLogger - rag_mcp_service.py:237 - --- [TIME] 开始并行召回 for 4 queries at 34.73s ---
-2025-06-05 13:12:53,146 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '人工智能在客户服务中主要应用于哪些具体领域？'
-2025-06-05 13:12:53,183 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '人工智能在客户服务中主要应用于哪些具体领域？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.709173068491901, 'distance': 0.581653863016198, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6743691779158673, 'distance': 0.6512616441682655, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 13:12:53,183 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '人工智能在客户服务中主要应用于哪些具体领域？': found 2 docs.
-2025-06-05 13:12:53,183 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '人工智能在客户服务中主要应用于哪些具体领域？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 13:12:53,185 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '人工智能在客户服务中主要应用于哪些具体领域？': found 2 potential docs.
-2025-06-05 13:12:53,185 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '人工智能在客户服务中主要应用于哪些具体领域？'
-2025-06-05 13:12:59,292 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '人工智能在客户服务中主要应用于哪些具体领域？' raw output: []
-2025-06-05 13:12:59,292 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '人工智能在客户服务中主要应用于哪些具体领域？': found 0 results.
-2025-06-05 13:12:59,292 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '自然语言处理技术如何提升客户服务的交互体验？'
-2025-06-05 13:12:59,313 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '自然语言处理技术如何提升客户服务的交互体验？' raw output: [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.8063962578767718, 'distance': 0.38720748424645646, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.6775817103293293, 'distance': 0.6448365793413413, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 13:12:59,313 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '自然语言处理技术如何提升客户服务的交互体验？': found 2 docs.
-2025-06-05 13:12:59,313 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '自然语言处理技术如何提升客户服务的交互体验？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 1.5028986930847168}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.25729623436927795}]
-2025-06-05 13:12:59,313 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '自然语言处理技术如何提升客户服务的交互体验？': found 2 potential docs.
-2025-06-05 13:12:59,313 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '自然语言处理技术如何提升客户服务的交互体验？'
-2025-06-05 13:12:59,891 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '自然语言处理技术如何提升客户服务的交互体验？' raw output: []
-2025-06-05 13:12:59,891 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '自然语言处理技术如何提升客户服务的交互体验？': found 0 results.
-2025-06-05 13:12:59,891 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '人工智能在客户预测和个性化服务方面有哪些创新应用？'
-2025-06-05 13:12:59,911 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '人工智能在客户预测和个性化服务方面有哪些创新应用？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7253360659882387, 'distance': 0.5493278680235225, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.7036240165025432, 'distance': 0.5927519669949135, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 13:12:59,911 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '人工智能在客户预测和个性化服务方面有哪些创新应用？': found 2 docs.
-2025-06-05 13:12:59,911 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '人工智能在客户预测和个性化服务方面有哪些创新应用？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 13:12:59,911 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '人工智能在客户预测和个性化服务方面有哪些创新应用？': found 2 potential docs.
-2025-06-05 13:12:59,911 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '人工智能在客户预测和个性化服务方面有哪些创新应用？'
-2025-06-05 13:13:00,443 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '人工智能在客户预测和个性化服务方面有哪些创新应用？' raw output: []
-2025-06-05 13:13:00,443 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '人工智能在客户预测和个性化服务方面有哪些创新应用？': found 0 results.
-2025-06-05 13:13:00,443 - INFO - RagServiceLogger - rag_mcp_service.py:241 - Processing retrievals for query: '人工智能在客户服务中有哪些应用场景？'
-2025-06-05 13:13:00,462 - DEBUG - RagServiceLogger - rag_mcp_service.py:247 -    ChromaDB for '人工智能在客户服务中有哪些应用场景？' raw output: [{'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'score': 0.7176656036403103, 'distance': 0.5646687927193794, 'metadata': {'chunk_char_length': 29, 'chunk_number': 1, 'chunk_text': '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。', 'filename': 'doc1.txt', 'size_bytes': 77, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}, {'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'text': '第二个文档讨论了自然语言处理技术。', 'score': 0.6760496612703446, 'distance': 0.6479006774593108, 'metadata': {'chunk_char_length': 17, 'chunk_number': 1, 'chunk_text': '第二个文档讨论了自然语言处理技术。', 'filename': 'doc2.txt', 'size_bytes': 52, 'source_directory': '/home/zhz/zhz_agent/data/raw_documents/', 'total_chunks_for_doc': 1}}]
-2025-06-05 13:13:00,463 - INFO - RagServiceLogger - rag_mcp_service.py:257 -    ChromaDB for '人工智能在客户服务中有哪些应用场景？': found 2 docs.
-2025-06-05 13:13:00,463 - DEBUG - RagServiceLogger - rag_mcp_service.py:265 -    BM25 for '人工智能在客户服务中有哪些应用场景？' raw output (IDs and scores): [{'id': 'a67db1e0-f7b4-4de0-aac7-231b236b32a4', 'score': 0.0}, {'id': '425087b5-58ed-47f3-ade3-69ebca135812', 'score': 0.0}]
-2025-06-05 13:13:00,463 - INFO - RagServiceLogger - rag_mcp_service.py:295 -    BM25s for '人工智能在客户服务中有哪些应用场景？': found 2 potential docs.
-2025-06-05 13:13:00,463 - INFO - RagServiceLogger - rag_mcp_service.py:302 -    Performing KG retrieval for query: '人工智能在客户服务中有哪些应用场景？'
-2025-06-05 13:13:00,946 - DEBUG - RagServiceLogger - rag_mcp_service.py:304 -    KG for '人工智能在客户服务中有哪些应用场景？' raw output: []
-2025-06-05 13:13:00,946 - INFO - RagServiceLogger - rag_mcp_service.py:313 -    KG Retrieval for '人工智能在客户服务中有哪些应用场景？': found 0 results.
-2025-06-05 13:13:00,946 - INFO - RagServiceLogger - rag_mcp_service.py:317 - --- [TIME] 结束所有召回, 耗时: 7.80s ---
-2025-06-05 13:13:00,946 - INFO - RagServiceLogger - rag_mcp_service.py:318 - --- 总计从各路召回（所有查询处理后）的结果数: 16 ---
-2025-06-05 13:13:00,946 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 0 (Summary): type=vector_chroma, score=0.709173068491901, content='项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 1 (Summary): type=vector_chroma, score=0.6743691779158673, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - rag_mcp_service.py:321 -    Raw Doc 2 (Summary): type=keyword_bm25s, score=0.0, content='第二个文档讨论了自然语言处理技术。...'
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - rag_mcp_service.py:332 - --- [TIME] 开始结果融合与重排序 at 42.54s ---
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - fusion_engine.py:144 - FusionEngine: Fusing 16 raw retrieved documents for query: '人工智能在客户服务中有哪些应用场景？'. Target top_n_final: 3
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.6743691779158673. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.709173068491901. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.8063962578767718 vs existing 0.8063962578767718. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6775817103293293 vs existing 0.709173068491901. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 1.5028986930847168 vs existing 1.5028986930847168. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.25729623436927795 vs existing 0.709173068491901. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7253360659882387 vs existing 0.7253360659882387. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7036240165025432 vs existing 1.5028986930847168. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 1.5028986930847168. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.7253360659882387. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.7176656036403103 vs existing 0.7253360659882387. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.6760496612703446 vs existing 1.5028986930847168. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 1.5028986930847168. Content: 第二个文档讨论了自然语言处理技术。...
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:167 - FusionEngine: Duplicate content hash found. Doc with score 0.0 vs existing 0.7253360659882387. Content: 项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - fusion_engine.py:170 - FusionEngine: After deduplication (content hash): 2 documents.
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - fusion_engine.py:189 - FusionEngine: Starting light screening for 2 unique documents.
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:209 -   Screening: Doc 0 (ID: N/A) failed Jaccard check. Similarity: 0.0000 < 0.05. Content: '项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。...'
-2025-06-05 13:13:00,947 - DEBUG - RagServiceLogger - fusion_engine.py:209 -   Screening: Doc 1 (ID: a67db1e0-f7b4-4de0-aac7-231b236b32a4) failed Jaccard check. Similarity: 0.0000 < 0.05. Content: '第二个文档讨论了自然语言处理技术。...'
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - fusion_engine.py:218 - FusionEngine: After light screening: 0 documents remain.
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - fusion_engine.py:221 - FusionEngine: No documents remain after light screening. Returning empty list.
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - rag_mcp_service.py:351 - --- [TIME] 结束结果融合与重排序, 耗时: 0.00s. Final context docs: 0 ---
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - rag_mcp_service.py:398 - --- 'query_rag_v2' 逻辑执行完毕, 总耗时: 42.54s. ---
-2025-06-05 13:13:00,947 - INFO - RagServiceLogger - rag_mcp_service.py:462 - Full RAG interaction log (ID: 7dfaf74b-c6b4-4f23-934c-d985f29d9d94) has been written.
-2025-06-05 13:16:31,002 - INFO - RagServiceLogger - rag_mcp_service.py:160 - --- RAG Service (FastMCP): 正在清理资源 ---
-2025-06-05 13:16:31,006 - INFO - RagServiceLogger - rag_mcp_service.py:163 - --- RAG Service (FastMCP): 清理完成 ---
-
-    --- END OF FILE CONTENT ---
-
   File: task_manager_api.py
     --- START OF FILE CONTENT ---
 # zhz_agent/task_manager_service.py
@@ -13933,6 +13803,60 @@ Directory: core/tools/
   File: __init__.py
     --- File is empty ---
 
+  File: calculator_tool.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/core/tools/calculator_tool.py
+from typing import Type, Any
+from pydantic import BaseModel, Field
+from crewai.tools import BaseTool
+import logging
+import re
+
+logger = logging.getLogger(__name__)
+
+class CalculateToolInput(BaseModel):
+    expression: str = Field(description="要计算的数学表达式字符串。例如：'(10 + 20) * 3 / 5 - 10'")
+
+class CalculateTool(BaseTool):
+    name: str = "calculate_tool"
+    description: str = (
+        "【计算器工具】执行数学表达式的计算并返回数值结果。支持常见的算术运算（加、减、乘、除、括号）。"
+    )
+    args_schema: Type[BaseModel] = CalculateToolInput
+
+    def _run(self, expression: str, **kwargs: Any) -> str:
+        logger.info(f"CalculateTool._run called with expression: '{expression}'")
+        
+        # 安全性检查：只允许数字、操作符、括号和点
+        # 移除了对字母的允许，以防止执行不安全代码
+        # 允许科学计数法中的 'e' 或 'E'
+        if not re.match(r"^[0-9+\-*/().\sEe]+$", expression):
+            logger.error(f"Invalid characters in expression: '{expression}'")
+            return "错误：表达式中包含无效字符。只允许数字、操作符 (+, -, *, /)、括号、小数点和空格。"
+        
+        # 另一个安全措施：避免非常长的表达式
+        if len(expression) > 100: # 限制表达式长度
+            logger.error(f"Expression too long: '{expression}'")
+            return "错误：表达式过长。"
+
+        try:
+            # 使用 eval 进行计算，前面已经做了基本的字符过滤
+            # 注意：eval 仍然有潜在风险，如果过滤不完美。
+            # 对于生产环境，强烈建议使用更安全的表达式求值库，如 numexpr 或 ast.literal_eval (但后者功能有限)
+            result = eval(expression, {"__builtins__": {}}, {}) # 限制 eval 的命名空间
+            logger.info(f"Expression '{expression}' evaluated to: {result}")
+            return f"计算结果: {expression} = {result}"
+        except ZeroDivisionError:
+            logger.error(f"Error evaluating expression '{expression}': Division by zero")
+            return "错误：表达式中存在除以零的操作。"
+        except SyntaxError:
+            logger.error(f"Error evaluating expression '{expression}': Syntax error")
+            return "错误：数学表达式语法错误。"
+        except Exception as e:
+            logger.error(f"Error evaluating expression '{expression}': {e}", exc_info=True)
+            return f"计算表达式时发生错误: {str(e)}"
+    --- END OF FILE CONTENT ---
+
   File: enhanced_rag_tool.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/core/tools/enhanced_rag_tool.py
@@ -13941,10 +13865,10 @@ import asyncio
 from typing import Type, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
-import json 
-import traceback 
+import json
+import traceback
 
-from utils.common_utils import call_mcpo_tool 
+from utils.common_utils import call_mcpo_tool
 
 import logging
 logger = logging.getLogger(__name__)
@@ -13960,65 +13884,80 @@ class EnhancedRAGTool(BaseTool):
     name: str = "enhanced_rag_tool"
     description: str = "【核心RAG工具】用于从本地知识库查找信息、回答复杂问题，整合了向量、关键词和图谱检索。"
     args_schema: Type[BaseModel] = EnhancedRAGToolInput
-    mcp_service_name: str = "zhz_rag_mcp_service" 
-    mcp_tool_path: str = "query_rag_v2" 
+    mcp_service_name: str = "zhz_rag_mcp_service"
+    mcp_tool_path: str = "query_rag_v2"
 
     async def _acall_mcp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         异步调用 MCP 工具服务，并处理其包装响应。
-        如果 MCP 调用成功且其内部的 RAG 服务也成功，则返回 RAG 服务的实际数据。
-        如果任何层面出错，则返回一个符合 RAG 服务错误格式的字典。
+        目标是返回 RAG 服务本身的业务响应字典。
         """
         tool_path_on_mcp = f"{self.mcp_service_name}/{self.mcp_tool_path}"
         logger.critical(f"!!! EnhancedRAGTool._acall_mcp: ENTERING. Calling MCP endpoint '{tool_path_on_mcp}' with payload: {payload}")
         try:
             mcp_wrapper_response = await call_mcpo_tool(tool_path_on_mcp, payload)
 
-             # --- 新增日志 ---
             logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED from call_mcpo_tool - Type: {type(mcp_wrapper_response)}")
             if isinstance(mcp_wrapper_response, dict):
                 logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED keys: {list(mcp_wrapper_response.keys())}")
             logger.critical(f"!!! EnhancedRAGTool._acall_mcp: RECEIVED content preview: {str(mcp_wrapper_response)[:500]}")
-            # --- 结束新增日志 ---
-            
-            if isinstance(mcp_wrapper_response, dict) and mcp_wrapper_response.get("success") is True and "data" in mcp_wrapper_response:
-                # MCP 调用成功，现在获取 RAG 服务本身的响应数据
-                rag_service_actual_data = mcp_wrapper_response["data"]
-                logger.info("!!! EnhancedRAGTool._acall_mcp: MCP call successful, returning actual RAG data.")
-                # 确保 RAG 服务数据也是字典，如果不是，也视为错误
-                if not isinstance(rag_service_actual_data, dict):
-                    logger.error(f"!!! EnhancedRAGTool._acall_mcp: RAG service data ('data' field from MCP wrapper) is not a dict, got {type(rag_service_actual_data)}. Wrapping as error.")
+
+            # 场景1: call_mcpo_tool 返回 MCP 框架的成功响应 ({"success": True, "data": RAG_response})
+            if isinstance(mcp_wrapper_response, dict) and mcp_wrapper_response.get("success") is True:
+                rag_service_data = mcp_wrapper_response.get("data")
+                if isinstance(rag_service_data, dict):
+                    logger.info("!!! EnhancedRAGTool._acall_mcp: MCP call successful (success:True), returning RAG 'data' field.")
+                    return rag_service_data
+                else:
+                    logger.error(f"!!! EnhancedRAGTool._acall_mcp: MCP 'data' field is not a dict. Got {type(rag_service_data)}. Payload: {payload}")
                     return {
-                        "status": "error", 
-                        "error_message": f"Internal error: RAG service data was not a dict. Got: {str(rag_service_actual_data)[:200]}", 
-                        "error_code": "INVALID_RAG_DATA_FROM_MCP"
+                        "status": "error", "original_query": payload.get("query", "N/A"), "retrieved_context_docs": [],
+                        "error_message": f"Internal error: RAG service data from MCP was not a dict. Got: {str(rag_service_data)[:200]}",
+                        "error_code": "INVALID_RAG_DATA_FROM_MCP_SUCCESS"
                     }
-                return rag_service_actual_data # 返回 RAG 服务的直接响应
-            
+
+            # 场景2: call_mcpo_tool 返回 MCP 框架的失败响应 ({"success": False, "error": ...})
             elif isinstance(mcp_wrapper_response, dict) and mcp_wrapper_response.get("success") is False:
-                # MCP 调用本身失败（例如 HTTP 错误，超时等）
                 error_msg = mcp_wrapper_response.get("error", "Unknown error from MCP call wrapper.")
                 error_type = mcp_wrapper_response.get("error_type", "MCP_CALL_FAILED")
-                logger.error(f"!!! EnhancedRAGTool._acall_mcp: MCP call failed. Type: {error_type}, Error: {error_msg}")
-                return {
-                    "status": "error", 
-                    "error_message": error_msg,
-                    "error_code": error_type 
+                status_code = mcp_wrapper_response.get("status_code")
+                logger.error(f"!!! EnhancedRAGTool._acall_mcp: MCP call failed (success:False). Type: {error_type}, Error: {error_msg}, Status Code: {status_code}")
+                return { # 构造一个符合RAG错误格式的字典
+                    "status": "error", "original_query": payload.get("query", "N/A"), "retrieved_context_docs": [],
+                    "error_message": error_msg, "error_code": error_type,
+                    "debug_info": {"mcp_error_type": error_type, "mcp_status_code": status_code}
                 }
-            else: 
-                # call_mcpo_tool 返回了意外的格式 (不包含 "success" 键)
-                logger.error(f"!!! EnhancedRAGTool._acall_mcp: call_mcpo_tool returned unexpected format: {type(mcp_wrapper_response)}. Content: {str(mcp_wrapper_response)[:200]}")
+
+            # 场景3: call_mcpo_tool 直接返回了 RAG 服务的业务 JSON (例如，包含 "status" 但不含 "success")
+            # 这种情况通常是 MCP 代理透传了下游服务的响应。
+            elif isinstance(mcp_wrapper_response, dict) and "status" in mcp_wrapper_response:
+                logger.info("!!! EnhancedRAGTool._acall_mcp: Received a direct business response from RAG service (contains 'status' key).")
+                return mcp_wrapper_response
+
+            # 场景4: call_mcpo_tool 返回了其他无法识别的字典格式
+            elif isinstance(mcp_wrapper_response, dict):
+                logger.error(f"!!! EnhancedRAGTool._acall_mcp: call_mcpo_tool returned an unexpected dictionary format: {str(mcp_wrapper_response)[:200]}")
                 return {
-                    "status": "error", 
-                    "error_message": f"Internal error: call_mcpo_tool returned unexpected format. Got: {str(mcp_wrapper_response)[:200]}", 
-                    "error_code": "INVALID_MCP_WRAPPER_RESPONSE"
+                    "status": "error", "original_query": payload.get("query", "N/A"), "retrieved_context_docs": [],
+                    "error_message": f"Internal error: MCP wrapper response format unknown. Got: {str(mcp_wrapper_response)[:200]}",
+                    "error_code": "INVALID_MCP_WRAPPER_DICT_FORMAT_UNKNOWN"
                 }
+            
+            # 场景5: call_mcpo_tool 返回的不是字典
+            else:
+                logger.error(f"!!! EnhancedRAGTool._acall_mcp: call_mcpo_tool returned non-dict type: {type(mcp_wrapper_response)}. Content: {str(mcp_wrapper_response)[:200]}")
+                return {
+                    "status": "error", "original_query": payload.get("query", "N/A"), "retrieved_context_docs": [],
+                    "error_message": f"Internal error: MCP wrapper returned non-dict. Got: {str(mcp_wrapper_response)[:200]}",
+                    "error_code": "INVALID_MCP_WRAPPER_NON_DICT"
+                }
+
         except Exception as e_acall:
             logger.critical(f"!!! EnhancedRAGTool._acall_mcp: EXCEPTION during call_mcpo_tool or its processing: {e_acall}", exc_info=True)
             return {
-                "status": "error", 
-                "error_message": f"Exception in _acall_mcp: {str(e_acall)}", 
-                "error_code": "ACALL_MCP_UNHANDLED_EXCEPTION", 
+                "status": "error", "original_query": payload.get("query", "N/A"), "retrieved_context_docs": [],
+                "error_message": f"Exception in _acall_mcp: {str(e_acall)}",
+                "error_code": "ACALL_MCP_UNHANDLED_EXCEPTION",
                 "traceback": traceback.format_exc()
             }
 
@@ -14028,7 +13967,7 @@ class EnhancedRAGTool(BaseTool):
         top_k_vector: int = 5,
         top_k_kg: int = 3,
         top_k_bm25: int = 3,
-        **kwargs: Any 
+        **kwargs: Any
     ) -> str:
         logger.critical(f"!!! EnhancedRAGTool._run: ENTERING. Query: '{query}'")
         payload = {
@@ -14037,9 +13976,8 @@ class EnhancedRAGTool(BaseTool):
             "top_k_kg": top_k_kg,
             "top_k_bm25": top_k_bm25,
         }
-        # 初始化为 RAG 服务期望的错误格式
-        rag_service_response_data: Dict[str, Any] = { 
-            "status": "error", 
+        rag_service_response_data: Dict[str, Any] = {
+            "status": "error", "original_query": query, "retrieved_context_docs": [],
             "error_message": "Initialization error in _run before async call",
             "error_code": "RUN_INIT_ERROR"
         }
@@ -14056,76 +13994,82 @@ class EnhancedRAGTool(BaseTool):
                     logger.critical("!!! EnhancedRAGTool._run: Submitting _acall_mcp to executor...")
                     future = executor.submit(asyncio.run, self._acall_mcp(payload))
                     logger.critical("!!! EnhancedRAGTool._run: Waiting for future.result()...")
-                    rag_service_response_data = future.result(timeout=120) 
+                    rag_service_response_data = future.result(timeout=120)
                     logger.critical("!!! EnhancedRAGTool._run: future.result() RETURNED.")
             else:
                 logger.critical("!!! EnhancedRAGTool._run: Loop is NOT running. Using asyncio.run directly.")
                 rag_service_response_data = asyncio.run(self._acall_mcp(payload))
                 logger.critical("!!! EnhancedRAGTool._run: asyncio.run(_acall_mcp) RETURNED.")
-        
-        except asyncio.TimeoutError as e_timeout: 
+
+        except asyncio.TimeoutError as e_timeout:
             logger.critical(f"!!! EnhancedRAGTool._run: ASYNCIO TIMEOUT during RAG tool execution: {e_timeout}", exc_info=True)
             rag_service_response_data = {
-                "status": "error", 
-                "error_message": f"RAG tool execution timed out: {str(e_timeout)}", 
+                "status": "error", "original_query": query, "retrieved_context_docs": [],
+                "error_message": f"RAG tool execution timed out: {str(e_timeout)}",
                 "error_code": "ASYNC_TIMEOUT_IN_RUN"
             }
         except Exception as e_run:
             logger.critical(f"!!! EnhancedRAGTool._run: EXCEPTION during RAG tool execution: {e_run}", exc_info=True)
             rag_service_response_data = {
-                "status": "error", 
-                "error_message": f"Exception in _run: {str(e_run)}", 
-                "error_code": "RUN_UNHANDLED_EXCEPTION", 
+                "status": "error", "original_query": query, "retrieved_context_docs": [],
+                "error_message": f"Exception in _run: {str(e_run)}",
+                "error_code": "RUN_UNHANDLED_EXCEPTION",
                 "traceback": traceback.format_exc()
             }
-        
+
         logger.critical(f"!!! EnhancedRAGTool._run: Raw RAG service data before _handle_mcp_result: {str(rag_service_response_data)[:500]}")
-        
-        # 确保传递给 _handle_mcp_result 的是字典
+
         if not isinstance(rag_service_response_data, dict):
             logger.error(f"!!! EnhancedRAGTool._run: rag_service_response_data is not a dict, type: {type(rag_service_response_data)}. Wrapping in error dict.")
             rag_service_response_data = {
-                "status": "error", 
-                "error_message": f"Internal error: _acall_mcp did not return a dict as expected. Got: {str(rag_service_response_data)[:200]}", 
+                "status": "error", "original_query": query, "retrieved_context_docs": [],
+                "error_message": f"Internal error: _acall_mcp did not return a dict as expected. Got: {str(rag_service_response_data)[:200]}",
                 "error_code": "INVALID_ACALL_RETURN_TYPE_FINAL"
             }
+        # 确保 rag_service_response_data 至少包含 'status' 键，如果它在 _acall_mcp 中因为某些路径没有返回标准错误结构
+        if "status" not in rag_service_response_data:
+            logger.warning(f"!!! EnhancedRAGTool._run: rag_service_response_data missing 'status' key. Data: {str(rag_service_response_data)[:200]}. Defaulting to error status.")
+            rag_service_response_data["status"] = "error"
+            rag_service_response_data.setdefault("error_message", "Malformed response from RAG service call.")
+            rag_service_response_data.setdefault("error_code", "MALFORMED_RAG_RESPONSE_IN_RUN")
+            rag_service_response_data.setdefault("original_query", query)
+            rag_service_response_data.setdefault("retrieved_context_docs", [])
+
 
         return self._handle_mcp_result(rag_service_response_data)
 
     def _handle_mcp_result(self, rag_service_data: Dict[str, Any]) -> str:
         """
         处理来自 RAG 服务 (zhz_rag_mcp_service) 的直接响应。
-        _acall_mcp 应该已经处理了 MCP 包装层，这里接收的是 RAG 服务本身的输出。
         """
         logger.info(f"EnhancedRAGTool._handle_mcp_result received RAG service data: {str(rag_service_data)[:500]}...")
 
         if not isinstance(rag_service_data, dict):
             error_msg = f"TOOL_ERROR: {self.name} received an invalid response format (expected dict from RAG service, got {type(rag_service_data)}). Content: {str(rag_service_data)[:200]}"
             logger.error(error_msg)
-            return error_msg # 返回给 Agent 的错误信息
+            return error_msg
 
         status_from_rag = rag_service_data.get("status")
-        
+
         if status_from_rag == "success":
             final_answer = rag_service_data.get("final_answer")
             retrieved_docs_raw = rag_service_data.get("retrieved_context_docs")
 
-            if final_answer is None: # 即使 status 是 success，也可能没有 final_answer
+            if final_answer is None:
                 no_answer_msg = f"TOOL_INFO: {self.name} RAG service status is 'success', but did not provide a final_answer."
                 logger.warning(no_answer_msg)
-                # 对于 Agent，这仍然是一个有效的工具执行，只是结果是“未找到答案”
-                return "RAG service processed successfully but found no specific answer." 
+                return "RAG service processed successfully but found no specific answer."
 
-            response_parts = [f"RAG Answer: {str(final_answer).strip()}"] 
+            response_parts = [f"RAG Answer: {str(final_answer).strip()}"]
             if retrieved_docs_raw and isinstance(retrieved_docs_raw, list) and retrieved_docs_raw:
                 response_parts.append("\n\nSupporting Context Snippets (Top 2):")
-                for i, doc_data in enumerate(retrieved_docs_raw[:2]): 
+                for i, doc_data in enumerate(retrieved_docs_raw[:2]):
                     content = doc_data.get("content", "N/A")
                     source = doc_data.get("source_type", "N/A")
-                    score = doc_data.get("score") 
+                    score = doc_data.get("score")
                     score_str = f"{score:.2f}" if isinstance(score, float) else str(score if score is not None else 'N/A')
                     response_parts.append(f"  - Source: {source}, Score: {score_str}, Content: {str(content)[:100]}...")
-            
+
             final_tool_output_str = "\n".join(response_parts)
             logger.info(f"EnhancedRAGTool: Successfully processed RAG success response. Output for agent (first 200 chars): {final_tool_output_str[:200]}...")
             return final_tool_output_str
@@ -14136,18 +14080,17 @@ class EnhancedRAGTool(BaseTool):
             clarification_output = f"CLARIFICATION_NEEDED: {clarification_question} (Reason: {uncertainty_reason})"
             logger.info(f"EnhancedRAGTool: RAG service requires clarification. Output for agent: {clarification_output}")
             return clarification_output
-            
-        elif status_from_rag == "error": 
+
+        elif status_from_rag == "error":
             rag_error_msg = rag_service_data.get("error_message", "RAG服务内部发生未知错误。")
             rag_error_code = rag_service_data.get("error_code", "RAG_UNKNOWN_ERROR")
             error_output = f"TOOL_ERROR: {self.name} failed. RAG service reported an error (Code: {rag_error_code}): {rag_error_msg}"
             logger.error(error_output)
-            return error_output # 返回给 Agent 的错误信息
-        else: 
-            # 如果 status 字段不是 "success", "clarification_needed", 或 "error"
+            return error_output
+        else:
             unknown_status_msg = f"TOOL_ERROR: {self.name} received an unknown or missing status '{status_from_rag}' from RAG service."
             logger.error(f"{unknown_status_msg} Full RAG data: {str(rag_service_data)[:300]}")
-            return unknown_status_msg # 返回给 Agent 的错误信息
+            return unknown_status_msg
     --- END OF FILE CONTENT ---
 
   File: excel_tool.py
@@ -14275,7 +14218,8 @@ from typing import Type, Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
 import json
-from utils.common_utils import call_mcpo_tool
+from utils.common_utils import call_mcpo_tool # 确保从正确的相对路径导入
+import traceback
 
 # --- 日志记录 ---
 import logging
@@ -14287,12 +14231,24 @@ class WebSearchToolInput(BaseModel):
     max_results: Optional[int] = Field(default=5, description="希望返回的最大搜索结果数量。")
 
 class WebSearchTool(BaseTool):
-    name: str = "web_search_tool"
+    name: str = "web_search_tool" # Agent将使用这个名字
     description: str = ("【网络搜索工具】使用DuckDuckGo搜索引擎在互联网上查找与用户查询相关的信息。"
                         "返回搜索结果列表，每个结果包含标题、链接和摘要。")
     args_schema: Type[BaseModel] = WebSearchToolInput
-    mcp_service_name: str = "ddgsearch" # 与 mcpo_servers.json 中定义的服务名一致 (如果使用)
+    mcp_service_name: str = "ddgsearch" # 与 mcpo_servers.json 中定义的服务名一致
     mcp_tool_path: str = "search"      # DuckDuckGo 搜索服务提供的端点
+
+    async def _acall_mcp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        实际调用 MCP 服务的异步方法。
+        """
+        tool_path_on_mcp = f"{self.mcp_service_name}/{self.mcp_tool_path}"
+        logger.info(f"WebSearchTool: Calling MCP endpoint '{tool_path_on_mcp}' with payload: {payload}")
+        # call_mcpo_tool 期望返回一个包含 success 和 data/error 的字典
+        mcp_wrapper_response = await call_mcpo_tool(tool_path_on_mcp, payload)
+        
+        # 直接返回 call_mcpo_tool 的结果，让 _handle_mcp_result 处理
+        return mcp_wrapper_response
 
     def _run(
         self,
@@ -14309,70 +14265,123 @@ class WebSearchTool(BaseTool):
             "max_results": max_results,
         }
         
+        mcp_response_data: Dict[str, Any] = {
+            "success": False, # 默认失败
+            "error": "Initialization error in _run before async call for WebSearchTool",
+            "error_type": "RUN_INIT_ERROR_WEBSEARCH"
+        }
+
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(asyncio.run, self._acall_mcp(payload))
-                    result = future.result(timeout=60) 
+                    mcp_response_data = future.result(timeout=60) 
             else:
-                result = asyncio.run(self._acall_mcp(payload))
+                mcp_response_data = asyncio.run(self._acall_mcp(payload))
         except Exception as e:
             logger.error(f"Error running WebSearchTool for query '{query}': {e}", exc_info=True)
-            return f"Error executing Web Search tool: {str(e)}"
+            mcp_response_data = {
+                "success": False,
+                "error": f"Exception in WebSearchTool _run: {str(e)}",
+                "error_type": "RUN_EXCEPTION_WEBSEARCH",
+                "traceback": traceback.format_exc()
+            }
         
-        return self._handle_mcp_result(result)
-
-    async def _acall_mcp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        实际调用 MCP 服务的异步方法。
-        """
-        tool_path_on_mcp = f"{self.mcp_service_name}/{self.mcp_tool_path}"
-        logger.info(f"WebSearchTool: Calling MCP endpoint '{tool_path_on_mcp}' with payload: {payload}")
-        mcp_response = await call_mcpo_tool(tool_path_on_mcp, payload)
-        return mcp_response
+        return self._handle_mcp_result(mcp_response_data)
 
     def _handle_mcp_result(self, mcp_response: Dict[str, Any]) -> str:
         """
         处理来自 MCP ddgsearch 服务的响应。
-        ddgsearch 服务成功时应该返回一个包含搜索结果列表的 JSON。
+        call_mcpo_tool 会返回一个包含 "success": True/False 和 "data"/"error" 的字典。
         """
-        if mcp_response.get("error"):
-            error_msg = f"Web Search tool failed: {mcp_response['error']}"
-            logger.error(error_msg)
-            return error_msg
+        logger.info(f"WebSearchTool._handle_mcp_result received: {str(mcp_response)[:500]}...")
 
-        # ddgsearch MCP 服务返回的原始结果可能是一个字典，其中 "results" 键包含列表
-        # 或者直接是一个列表（取决于MCP服务的封装）
-        # 我们需要查看 ddgsearch 服务的实际输出格式来确定如何解析
-        # 假设它返回一个包含 "results" 键的字典，其值为列表，每个列表项是一个包含 "title", "href", "body" 的字典
-        
-        search_results = mcp_response.get("results") # 假设 MCP 服务返回的 JSON 中有一个 'results' 键
+        if not isinstance(mcp_response, dict):
+            return f"TOOL_ERROR: {self.name} received invalid response format from MCP call (expected dict, got {type(mcp_response)})."
+
+        if mcp_response.get("success") is False:
+            error_msg = mcp_response.get("error", "Unknown error from ddgsearch MCP call.")
+            logger.error(f"WebSearchTool failed via MCP: {error_msg}")
+            return f"TOOL_ERROR: {self.name} failed: {error_msg}"
+
+        # 如果 success 为 True，则 data 字段包含 ddgsearch 服务的实际输出
+        ddg_service_data = mcp_response.get("data")
+        if not isinstance(ddg_service_data, dict):
+            logger.warning(f"WebSearchTool: 'data' field from successful MCP call is not a dict. Raw data: {str(ddg_service_data)[:200]}")
+            return f"TOOL_ERROR: {self.name} received unexpected data format from ddgsearch service."
+
+        # ddgsearch 服务成功时应该返回一个包含搜索结果列表的 JSON 结构
+        # 参考 ddg-search MCP 工具的输出，它通常是 {"results": [{"title": ..., "href": ..., "body": ...}, ...]}
+        search_results = ddg_service_data.get("results")
         
         if isinstance(search_results, list):
             if not search_results:
                 return "网络搜索没有找到相关结果。"
             
             formatted_results = ["网络搜索结果："]
-            for i, res in enumerate(search_results):
+            for i, res in enumerate(search_results[:5]): # 最多展示5条给Agent
                 if isinstance(res, dict):
                     title = res.get("title", "无标题")
                     link = res.get("href", "#")
                     snippet = res.get("body", "无摘要")
                     formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
-                else: # 如果列表项不是字典，直接转字符串
+                else:
                     formatted_results.append(f"{i+1}. {str(res)[:200]}...")
-
             return "\n".join(formatted_results)
-        elif search_results is not None: # 如果 results 存在但不是列表
-             return f"网络搜索返回了意外格式的数据: {str(search_results)[:300]}"
-        else: # 如果 mcp_response 中没有 "results" 键，或者 "results" 为 None
-            logger.warning(f"Web Search tool: 'results' key not found or is None in MCP response. Raw response: {mcp_response}")
-            return f"网络搜索未能获取结果。原始响应: {json.dumps(mcp_response, ensure_ascii=False, indent=2)}"
+        else:
+            logger.warning(f"WebSearchTool: 'results' key not found or is not a list in ddgsearch service data. Raw service data: {str(ddg_service_data)[:300]}")
+            return f"网络搜索未能获取到预期的结果列表。原始响应: {json.dumps(ddg_service_data, ensure_ascii=False, indent=2)}"
+    --- END OF FILE CONTENT ---
 
-# 确保 core/tools 目录也有一个 __init__.py 文件
-# touch /home/zhz/zhz_agent/core/tools/__init__.py (如果不存在)
+  File: time_tool.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/core/tools/time_tool.py
+from datetime import datetime
+import pytz # 用于处理时区
+from typing import Type, Optional, Any
+from pydantic import BaseModel, Field
+from crewai.tools import BaseTool
+import logging
+
+logger = logging.getLogger(__name__)
+
+class GetCurrentTimeToolInput(BaseModel):
+    timezone_str: Optional[str] = Field(
+        default="Asia/Shanghai", 
+        description="可选参数。IANA时区名称，例如 'Asia/Shanghai', 'America/New_York', 'UTC'. 默认为 'Asia/Shanghai'."
+    )
+
+class GetCurrentTimeTool(BaseTool):
+    name: str = "get_current_time_tool"
+    description: str = (
+        "【时间工具】获取并返回当前的日期和时间。可以指定时区（例如 'Asia/Shanghai', 'America/New_York', 'UTC'），"
+        "如果未指定，则默认为 'Asia/Shanghai' (中国标准时间)。"
+        "当你需要知道“现在几点了”、“今天是什么日期”或在执行与时间相关的操作（如设置提醒）前获取基准时间时使用。"
+    )
+    args_schema: Type[BaseModel] = GetCurrentTimeToolInput
+
+    def _run(self, timezone_str: Optional[str] = "Asia/Shanghai", **kwargs: Any) -> str:
+        logger.info(f"GetCurrentTimeTool._run called with timezone_str: '{timezone_str}'")
+        try:
+            if not timezone_str or not timezone_str.strip():
+                effective_timezone_str = "Asia/Shanghai"
+                logger.info(f"Timezone was empty, defaulting to {effective_timezone_str}")
+            else:
+                effective_timezone_str = timezone_str
+
+            target_tz = pytz.timezone(effective_timezone_str)
+            now_in_tz = datetime.now(target_tz)
+            formatted_time = now_in_tz.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+            logger.info(f"Current time in {effective_timezone_str}: {formatted_time}")
+            return f"当前时间 ({effective_timezone_str}): {formatted_time}"
+        except pytz.exceptions.UnknownTimeZoneError:
+            logger.error(f"Unknown timezone provided: '{timezone_str}'")
+            return f"错误：提供的时区 '{timezone_str}' 无效。请使用标准的IANA时区名称。"
+        except Exception as e:
+            logger.error(f"Error in GetCurrentTimeTool: {e}", exc_info=True)
+            return f"获取当前时间时发生错误: {str(e)}"
     --- END OF FILE CONTENT ---
 
 
@@ -14774,7 +14783,5 @@ if __name__ == "__main__":
     pass
     --- END OF FILE CONTENT ---
 
-
-Directory: litellm_config.yaml/
 
 --- End of Project Snapshot ---
