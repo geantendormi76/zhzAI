@@ -466,12 +466,8 @@ async def execute_task_endpoint(request: AgentTaskRequest):
         
         # --- 测试用硬编码 ---
         test_excel_file_path_on_windows = r"C:\\FlutterProjects\\data\\test2.xlsx" # 确保这个路径在Windows上是有效的
-        test_excel_sheet_name: Union[str, int] = 0 
+        test_excel_sheet_name: Union[str, int] = "Sheet1"
         # --- 测试用硬编码结束 ---
-
-        # Worker Agent会迭代这个列表，为每个SQO调用ExcelOperationTool
-        # 因此，worker_task_description 需要指导Worker Agent这样做
-        # worker_task_inputs 需要包含这个列表以及文件和表名信息
         
         worker_task_description = (
             f"你需要处理一个Excel文件相关的任务。目标文件路径是 '{test_excel_file_path_on_windows}'，工作表是 '{test_excel_sheet_name}'。\n"

@@ -15,7 +15,7 @@ def get_manager_agent_goal(tool_options_str: str) -> str:
 
 2.  **【规则2：任何数学计算 - 强制使用计算器工具】**
     *   如果用户查询明确是要求【执行任何数学表达式的计算】。
-    *   **行动**：【必须且只能选择】`"calculate_tool"`。**不要尝试自己计算，也不要因表达式复杂而选择其他工具。**
+    *   **行动**：【必须且只能选择】`"calculate_tool"`。**不要尝试自己计算，也不要因表达式复杂而选择其他工具。** `calculate_tool` 负责尝试执行表达式，如果它无法处理特定函数或操作，它会返回相应的错误信息。
     *   **参数**：为 `tool_input_args` 准备 `expression`。
 
 3.  **【规则3：实时/外部信息查询 - 强制使用网络搜索工具】**
@@ -29,16 +29,20 @@ def get_manager_agent_goal(tool_options_str: str) -> str:
     *   **行动**：选择 `"enhanced_rag_tool"`。
     *   **参数**：为 `tool_input_args` 准备 `query` 等。
 
-5.  **【规则5：Excel文件操作 - 强制使用Excel工具并生成SQO列表】** 
+5.  **【规则5：Excel文件操作 - 强制使用Excel工具并生成SQO列表】**
     *   如果用户明确要求或其意图明显指向需要对【Excel文件进行数据提取、分析、或复杂查询】。
     *   **行动**：【必须选择】`"excel_operation_tool"`。
     *   **任务**：你【必须】为用户的请求构建一个或多个【结构化查询对象 (SQO) 的JSON列表】，并将其赋值给 `excel_sqo_payload` 字段。
         *   `excel_sqo_payload` **必须是一个JSON数组（列表）**。即使只有一个Excel操作，也应该将对应的SQO字典放入一个单元素的列表中。
-        *   列表中的【每一个SQO字典】代表一个独立的数据操作步骤，并且【必须】包含一个明确的 `"operation_type"` 键 (例如: `"get_unique_values"`, `"group_by_aggregate"`, `"find_top_n_rows"`, `"direct_sql_query"`)。
-        *   除了 `"operation_type"`，每个SQO字典还【必须】包含该操作类型所必需的所有其他参数（例如，`"column_name": "区域"`；或 `"group_by_columns": ["区域"], "aggregation_column": "季度总销售额", "aggregation_function": "mean"`；或 `"sql_query": "SELECT * FROM df LIMIT 5"` 等）。
+        *   列表中的每个SQO字典代表一个独立的数据操作步骤，并且【必须】包含一个明确的 `"operation_type"` 键 (例如: `"get_unique_values"`, `"group_by_aggregate"`, `"find_top_n_rows"`, `"direct_sql_query"`)。
+        *   除了 `"operation_type"`，每个SQO字典还【必须】包含该操作类型所必需的所有其他参数。
+            例如，对于 `"group_by_aggregate"` 操作，`"aggregation_function"` 可以是：
+            `"sum"` (求和), `"mean"` (平均值), `"median"` (中位数), `"min"` (最小值), 
+            `"max"` (最大值), `"count"` (计数), `"nunique"` (唯一值计数), `"std"` (标准差), `"var"` (方差)。
+            请确保使用这些标准的Pandas聚合函数名。
         *   在生成的SQO操作定义字典中，【绝对不要包含 "file_path" 或 "sheet_name"】这两个键，这些信息将由后续流程处理。
         *   仔细分析用户请求，判断需要多少个独立的SQO操作来完成用户的全部意图。例如，如果用户要求“先获取A列的唯一值，然后根据这些唯一值筛选B列并求和”，这可能需要两个SQO。
-        *   **如果用户请求的是对Excel文件的操作，但你无法为其构建出有效的SQO列表，那么这是一个规划错误，你不应该选择excel_operation_tool，而是应该考虑规则7（无法处理）。**       
+        *   如果用户请求的是对Excel文件的操作，但你无法为其构建出有效的SQO列表，那么这是一个规划错误，你不应该选择excel_operation_tool，而是应该考虑规则7（无法处理）。
 
 6.  **【规则6：LLM直接回答 - 仅当无工具适用且信息通用时】**
     *   **适用条件**：
@@ -56,73 +60,6 @@ def get_manager_agent_goal(tool_options_str: str) -> str:
 {tool_options_str}
 
 **【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
-
-<example>
-  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
-  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
-  <output_json>{{
-    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
-    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
-    "selected_tool_names": ["excel_operation_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": null, # Excel工具的参数由excel_sqo_payload提供
-    "excel_sqo_payload": [
-      {{
-        "operation_type": "group_by_aggregate",
-        # "parameters" 字段可以省略，直接将参数放在SQO字典的顶层
-        "group_by_columns": ["区域", "产品类别"],
-        "aggregation_column": "销售额",
-        "aggregation_function": "sum"
-      }}
-    ]
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”。</user_query>
-  <thought>用户请求对一个Excel文件执行多个分析操作。第一个是分组聚合，第二个是查找TopN。根据规则5，应选择excel_operation_tool，并为每个分析点生成一个SQO，组成一个SQO列表。</thought>
-  <output_json>{{
-  "task_description": "请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”。",
-  "reasoning_for_plan": "用户要求对Excel文件执行多个分析操作（分组聚合和TopN查找），根据规则5选择Excel工具并为每个操作生成SQO，形成SQO列表。",
-  "selected_tool_names": ["excel_operation_tool"],
-  "direct_answer_content": null,
-  "tool_input_args": null,
-  "excel_sqo_payload": [
-      {{
-      "operation_type": "group_by_aggregate",
-      "group_by_columns": ["产品类型"],
-      "aggregation_column": "总销售额",
-      "aggregation_function": "sum"
-      }},
-      {{
-      "operation_type": "find_top_n_rows",
-      "select_columns": ["订单ID", "利润"],
-      "condition_column": "利润",
-      "sort_order": "descending",
-      "n_rows": 2
-      }}
-  ]
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？</user_query>
-  <thought>用户要求获取Excel文件中某一列的唯一值。根据规则5，应选择excel_operation_tool，并生成包含一个get_unique_values操作的SQO列表。</thought>
-  <output_json>{{
-    "task_description": "请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？",
-    "reasoning_for_plan": "用户要求获取Excel列的唯一值，根据规则5选择Excel工具并生成SQO列表。",
-    "selected_tool_names": ["excel_operation_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": null, // 对于excel_operation_tool，参数在excel_sqo_payload中
-    "excel_sqo_payload": [ 
-      {{
-        "operation_type": "get_unique_values",
-        "column_name": "城市" 
-      }}
-    ]
-  }}</output_json>
-</example>
-
 <example>
   <user_query>现在几点了？</user_query>
   <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
@@ -214,6 +151,94 @@ def get_manager_agent_goal(tool_options_str: str) -> str:
   }}</output_json>
 </example>
 
+<example>
+  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
+  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。这个请求对应一个SQO操作。</thought>
+  <output_json>{{
+    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
+    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["区域", "产品类别"],
+        "aggregation_column": "销售额",
+        "aggregation_function": "sum"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？</user_query>
+  <thought>用户要求获取Excel文件中某一列的唯一值。根据规则5，应选择excel_operation_tool，并生成包含一个get_unique_values操作的SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？",
+    "reasoning_for_plan": "用户要求获取Excel列的唯一值，根据规则5选择Excel工具并生成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [ 
+      {{
+        "operation_type": "get_unique_values",
+        "column_name": "城市" 
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”；最后，计算所有交易的平均“折扣率”。</user_query>
+  <thought>用户请求对一个Excel文件执行多个分析操作。第一个是分组求和，第二个是查找TopN，第三个是计算全局平均值。根据规则5，应选择excel_operation_tool，并为每个分析点生成一个SQO，组成一个SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”；最后，计算所有交易的平均“折扣率”。",
+    "reasoning_for_plan": "用户要求对Excel文件执行多个分析操作（分组求和、TopN查找、全局平均值计算），根据规则5选择Excel工具并为每个操作生成SQO，形成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["产品类型"],
+        "aggregation_column": "总销售额",
+        "aggregation_function": "sum"
+      }},
+      {{
+        "operation_type": "find_top_n_rows",
+        "select_columns": ["订单ID", "利润"],
+        "condition_column": "利润",
+        "sort_order": "descending",
+        "n_rows": 2
+      }},
+      {{ 
+        "operation_type": "group_by_aggregate", 
+        "group_by_columns": [], 
+        "aggregation_column": "折扣率",
+        "aggregation_function": "mean"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>从 sales.xlsx 中筛选出 'Category' 为 'Electronics' 且 'Region' 为 'North' 的所有记录，并显示 'Product Name' 和 'Sales Amount' 列。</user_query>
+  <thought>用户要求根据多个条件筛选Excel数据并选择特定列显示。这是一个适合使用direct_sql_query的场景。我将构建一个SQL查询来实现这个筛选和选择。</thought>
+  <output_json>{{
+    "task_description": "从 sales.xlsx 中筛选出 'Category' 为 'Electronics' 且 'Region' 为 'North' 的所有记录，并显示 'Product Name' 和 'Sales Amount' 列。",
+    "reasoning_for_plan": "用户要求进行多条件筛选和列选择，使用direct_sql_query操作类型生成SQL语句是最直接的方式。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "direct_sql_query",
+        "sql_query": "SELECT `Product Name`, `Sales Amount` FROM df WHERE Category = 'Electronics' AND Region = 'North'"
+      }}
+    ]
+  }}</output_json>
+</example>
 
 **【输出格式要求 - 必须严格遵守！】**
 你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
