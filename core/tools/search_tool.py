@@ -78,8 +78,6 @@ class WebSearchTool(BaseTool):
         
         return self._handle_mcp_result(mcp_response_data)
 
-    # /home/zhz/zhz_agent/core/tools/search_tool.py
-# ... (imports and class definition up to _run method) ...
 
     def _handle_mcp_result(self, mcp_response: Dict[str, Any]) -> str:
         logger.info(f"WebSearchTool._handle_mcp_result received raw MCP wrapper response: {str(mcp_response)[:1000]}...")
@@ -111,21 +109,21 @@ class WebSearchTool(BaseTool):
                         return "网络搜索没有找到相关结果（返回内容为空）。" # 如果文本为空，也返回这个
         
         # 如果上面的分支没有成功返回（例如 ddg_service_data 结构不对），则尝试旧的 "results" 逻辑
-        if isinstance(ddg_service_data, dict) and "results" in ddg_service_data:
-            search_results = ddg_service_data.get("results")
-            if isinstance(search_results, list):
-                if not search_results:
-                    return "网络搜索没有找到相关结果。"
-                formatted_results = ["网络搜索结果："]
-                for i, res in enumerate(search_results[:5]): 
-                    if isinstance(res, dict):
-                        title = res.get("title", "无标题")
-                        link = res.get("href", "#")
-                        snippet = res.get("body", "无摘要")
-                        formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
-                    else:
-                        formatted_results.append(f"{i+1}. {str(res)[:200]}...")
-                return "\n".join(formatted_results)
+        # if isinstance(ddg_service_data, dict) and "results" in ddg_service_data:
+        #     search_results = ddg_service_data.get("results")
+        #     if isinstance(search_results, list):
+        #         if not search_results:
+        #             return "网络搜索没有找到相关结果。"
+        #         formatted_results = ["网络搜索结果："]
+        #         for i, res in enumerate(search_results[:5]): 
+        #             if isinstance(res, dict):
+        #                 title = res.get("title", "无标题")
+        #                 link = res.get("href", "#")
+        #                 snippet = res.get("body", "无摘要")
+        #                 formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
+        #             else:
+        #                 formatted_results.append(f"{i+1}. {str(res)[:200]}...")
+        #         return "\n".join(formatted_results)
 
         # 如果所有尝试都失败了
         logger.warning(f"WebSearchTool: Could not extract 'results' list or 'content' text as expected from ddgsearch service data. Raw service data: {str(ddg_service_data)[:500]}")

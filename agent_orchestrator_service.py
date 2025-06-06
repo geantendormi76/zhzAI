@@ -19,6 +19,10 @@ service_logger = logging.getLogger(__name__)
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import BaseTool
 
+# --- 添加开始 ---
+from core.prompts.manager_prompts import get_manager_agent_goal, MANAGER_AGENT_BACKSTORY
+# --- 添加结束 ---
+
 from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
@@ -179,199 +183,16 @@ async def lifespan(app: FastAPI):
 
     # --- 步骤 3: 初始化 Agent 实例 ---
     if manager_llm:
+        current_manager_goal = get_manager_agent_goal(TOOL_OPTIONS_STR_FOR_MANAGER)
         manager_agent_instance = Agent(
-            role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
-            goal=f"""你的核心任务是分析用户的请求（该请求将在后续的任务描述中提供），并决定最佳的处理路径。你必须严格按照以下【工具选择规则和优先级】以及【示例】进行决策。
-
-**【重要前提】以下所有列出的工具均已正确配置并可供你规划使用。请根据规则自信地选择最合适的工具。**
-
-**【决策规则与优先级】**
-
-1.  **【规则1：时间查询 - 强制使用工具】**
-    *   如果用户查询明确是关于【获取当前日期或时间】。
-    *   **行动**：【必须选择】`"get_current_time_tool"`。不要尝试自己回答“我没有实时时钟”。
-    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
-
-2.  **【规则2：任何数学计算 - 强制使用计算器工具】**
-    *   如果用户查询明确是要求【执行任何数学表达式的计算】，无论表达式看起来简单还是复杂（例如包含加减乘除、括号、幂运算、百分比、甚至用户可能期望的函数如平方根、阶乘等）。
-    *   **行动**：【必须且只能选择】`"calculate_tool"`。**不要尝试自己计算，也不要因为表达式看起来复杂就选择其他工具（如RAG工具）。** `calculate_tool` 负责尝试执行表达式，如果它无法处理特定函数或操作，它会返回相应的错误信息。
-    *   **参数**：为 `tool_input_args` 准备 `expression`，其值为用户原始请求中的完整数学表达式字符串。
-
-3.  **【规则3：实时/最新信息查询 - 网络搜索强制】**
-    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价等）。
-    *   **行动**：【必须且只能】选择 `"web_search_tool"`。 **不要因为任何原因认为此工具不可用而选择其他工具（如RAG工具）作为替代。**
-    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
-    *   **禁止**：不要使用 "enhanced_rag_tool" 查找此类信息。
-
-4.  **【规则4：内部知识/文档深度查询 - RAG】**
-    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】。
-    *   **行动**：选择 `"enhanced_rag_tool"`。
-    *   **参数**：为 `tool_input_args` 准备 `query` 等。
-
-5.  **【规则5：Excel文件操作 - 强制使用工具】**
-    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行复杂操作】。
-    *   **行动**：【必须选择】`"excel_operation_tool"`。
-    *   **任务**：为其构建【结构化查询对象 (SQO) 的JSON列表】到 `excel_sqo_payload`。SQO不含 "file_path" 或 "sheet_name"。
-
-6.  **【规则6：LLM直接回答（在工具不适用后）】**
-    *   **仅当**以上所有规则都不适用，并且你判断可以基于你【已有的知识和常识】直接、准确、完整地回答用户的全部请求时。
-    *   **行动**：`selected_tool_names` 设为 `[]`，在 `direct_answer_content` 提供答案。
-
-7.  **【规则7：无法处理/需要澄清（最终回退）】**
-    *   如果所有规则都不适用，且你也无法直接回答。
-    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释，如果合适，在 `direct_answer_content` 中礼貌回复。
-
-**【可用工具的参考描述】：**
-{TOOL_OPTIONS_STR_FOR_MANAGER}
-
-**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
-
-<example>
-  <user_query>现在几点了？</user_query>
-  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
-  <output_json>{{
-    "task_description": "现在几点了？",
-    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
-    "selected_tool_names": ["get_current_time_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>计算 5 * (10 + 3)</user_query>
-  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
-  <output_json>{{
-    "task_description": "计算 5 * (10 + 3)",
-    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
-    "selected_tool_names": ["calculate_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>计算 (12 / (2 + 2))^2 + 10%3</user_query>
-  <thought>用户要求进行数学计算，包含括号、除法、幂运算和取模。根据规则2，必须使用calculate_tool。</thought>
-  <output_json>{{
-    "task_description": "计算 (12 / (2 + 2))^2 + 10%3",
-    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具，即使表达式包含多个操作符。",
-    "selected_tool_names": ["calculate_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"expression": "(12 / (2 + 2))^2 + 10%3"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>今天上海的天气怎么样？</user_query>
-  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
-  <output_json>{{
-    "task_description": "今天上海的天气怎么样？",
-    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
-    "selected_tool_names": ["web_search_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "今天上海天气"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>我们公司的报销政策是什么？</user_query>
-  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
-  <output_json>{{
-    "task_description": "我们公司的报销政策是什么？",
-    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
-    "selected_tool_names": ["enhanced_rag_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "公司报销政策"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>中国的首都是哪里？</user_query>
-  <thought>这是一个常见的常识性问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
-  <output_json>{{
-    "task_description": "中国的首都是哪里？",
-    "reasoning_for_plan": "常识性问题，可直接回答。",
-    "selected_tool_names": [],
-    "direct_answer_content": "中国的首都是北京。",
-    "tool_input_args": null,
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
-  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
-  <output_json>{{
-    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
-    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
-    "selected_tool_names": ["excel_operation_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": null,
-    "excel_sqo_payload": [
-      {{
-        "operation_type": "group_by_aggregate",
-        "group_by_columns": ["区域", "产品类别"],
-        "aggregation_column": "销售额",
-        "aggregation_function": "sum"
-      }}
-    ]
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>最近关于人工智能在教育领域应用的新闻有哪些？</user_query>
-  <thought>用户查询最新的新闻，这需要实时外部信息。根据规则3，必须使用web_search_tool。</thought>
-  <output_json>{{
-    "task_description": "最近关于人工智能在教育领域应用的新闻有哪些？",
-    "reasoning_for_plan": "用户查询需要最新的新闻信息，根据规则3，应使用网络搜索工具。",
-    "selected_tool_names": ["web_search_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "人工智能在教育领域应用的新闻", "max_results": 5}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-**【输出格式要求 - 必须严格遵守！】**
-你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
-*   `task_description`: (字符串) 用户的原始请求。
-*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
-*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
-*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
-*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
-*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
-
-我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
-""",
-            # --- 添加/恢复 backstory 参数 ---
-            backstory="""我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我的工作流程严谨细致：
-
-1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
-
-2.  **【决策优先级：优先自主解决】**：在考虑动用任何外部工具之前，我会首先评估我的内部知识库和推理能力是否足以直接、完整且准确地回答用户的问题。只有当我确认无法自主解决时，我才会启动工具选择流程。
-
-3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
-    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
-    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)，因为它能从我们精心构建的本地知识库中提取精确信息。
-    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作——无论是读取、计算、筛选、聚合还是修改——我都会委派给【Excel操作工具】(`excel_operation_tool`)。此时，我的核心任务是为该工具生成一个或多个清晰、准确的【结构化查询对象 (SQO) 的JSON列表】，放入 `excel_sqo_payload` 字段。我深知SQO的质量直接影响执行结果，因此我会仔细构造每一个SQO的操作类型 (`operation_type`) 和所需参数，并且我【绝不会】在SQO中包含文件路径 (`file_path`) 或工作表名 (`sheet_name`)，这些将由后续流程处理。
-    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
-    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，我不会强行匹配工具或给出猜测性答复。我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
-
-4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。这个JSON对象不仅包含了用户的原始请求 (`task_description`) 和我的决策理由 (`reasoning_for_plan`)，更重要的是，它清晰地指明了选定的工具 (`selected_tool_names`) 以及调用这些工具所需的一切参数（在 `tool_input_args` 或 `excel_sqo_payload` 中）。
-
-我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
-""",
-            # --- backstory 参数结束 ---
-            llm=manager_llm,
-            verbose=True,
-            allow_delegation=False,
-            tools=[] 
-        )
+        role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
+        goal=current_manager_goal,
+        backstory=MANAGER_AGENT_BACKSTORY,
+        llm=manager_llm,
+        verbose=True,
+        allow_delegation=False,
+        tools=[] 
+    )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
 
     if worker_llm:
@@ -627,6 +448,15 @@ async def execute_task_endpoint(request: AgentTaskRequest):
 
     elif selected_tool_name == "excel_operation_tool":
         excel_sqo_list = manager_plan_object.excel_sqo_payload # excel_sqo_list 在这里赋值
+
+        # --- 添加调试打印开始 ---
+        print(f"DEBUG_EXCEL_TOOL: Type of manager_plan_object.excel_sqo_payload: {type(manager_plan_object.excel_sqo_payload)}")
+        print(f"DEBUG_EXCEL_TOOL: Value of manager_plan_object.excel_sqo_payload: {manager_plan_object.excel_sqo_payload}")
+        print(f"DEBUG_EXCEL_TOOL: Value of excel_sqo_list: {excel_sqo_list}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list None? {excel_sqo_list is None}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list an empty list? {isinstance(excel_sqo_list, list) and not excel_sqo_list}")
+        # --- 添加调试打印结束 ---
+
         if not excel_sqo_list:
             return AgentTaskResponse(
                 answer="Manager选择Excel工具但未提供SQO列表。", status="error",
@@ -634,20 +464,28 @@ async def execute_task_endpoint(request: AgentTaskRequest):
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
         
-        excel_file_path = "/home/zhz/zhz_agent/data/test.xlsx" 
-        excel_sheet_name: Union[str, int] = 0 
+        # --- 测试用硬编码 ---
+        test_excel_file_path_on_windows = r"C:\\FlutterProjects\\data\\test2.xlsx" # 确保这个路径在Windows上是有效的
+        test_excel_sheet_name: Union[str, int] = 0 
+        # --- 测试用硬编码结束 ---
 
+        # Worker Agent会迭代这个列表，为每个SQO调用ExcelOperationTool
+        # 因此，worker_task_description 需要指导Worker Agent这样做
+        # worker_task_inputs 需要包含这个列表以及文件和表名信息
+        
         worker_task_description = (
-            f"你需要处理一个Excel文件相关的任务。文件路径是 '{excel_file_path}'，工作表是 '{excel_sheet_name}'。\n"
-            f"请严格按照以下SQO操作列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
-            f"SQO操作列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
-            f"对于列表中的每一个SQO字典，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
-            f"将该SQO字典作为 'sqo_dict' 参数，同时传递 'file_path': '{excel_file_path}' 和 'sheet_name': '{excel_sheet_name}'。"
+            f"你需要处理一个Excel文件相关的任务。目标文件路径是 '{test_excel_file_path_on_windows}'，工作表是 '{test_excel_sheet_name}'。\n"
+            f"请严格按照以下SQO操作定义列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
+            f"SQO操作定义列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
+            f"对于列表中的【每一个SQO操作定义字典】，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
+            f"将该字典作为 'sqo_operation_definition' 参数，"
+            f"同时传递 'target_excel_file_path': '{test_excel_file_path_on_windows}' 和 "
+            f"'target_excel_sheet_name': '{test_excel_sheet_name}'。"
         )
         worker_task_inputs = {
-            "excel_sqo_list_to_execute": excel_sqo_list,
-            "target_excel_file_path": excel_file_path,
-            "target_excel_sheet_name": excel_sheet_name
+            "excel_sqo_list_to_execute": excel_sqo_list, # Worker Agent会迭代这个
+            "target_excel_file_path_for_worker": test_excel_file_path_on_windows, # Worker Agent使用这个传递给工具
+            "target_excel_sheet_name_for_worker": test_excel_sheet_name # Worker Agent使用这个传递给工具
         }
         
     elif selected_tool_name == "web_search_tool": # 这是唯一且正确的 web_search_tool 分支
