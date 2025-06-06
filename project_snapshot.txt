@@ -38,6 +38,10 @@ service_logger = logging.getLogger(__name__)
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import BaseTool
 
+# --- 添加开始 ---
+from core.prompts.manager_prompts import get_manager_agent_goal, MANAGER_AGENT_BACKSTORY
+# --- 添加结束 ---
+
 from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
@@ -198,171 +202,16 @@ async def lifespan(app: FastAPI):
 
     # --- 步骤 3: 初始化 Agent 实例 ---
     if manager_llm:
+        current_manager_goal = get_manager_agent_goal(TOOL_OPTIONS_STR_FOR_MANAGER)
         manager_agent_instance = Agent(
-            role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
-            goal=f"""你的核心任务是分析用户的请求（该请求将在后续的任务描述中提供），并决定最佳的处理路径。你必须严格按照以下【工具选择规则和优先级】以及【示例】进行决策。
-
-**【决策规则与优先级】**
-
-1.  **【规则1：时间查询 - 强制使用工具】**
-    *   如果用户查询明确是关于【获取当前日期或时间】。
-    *   **行动**：【必须选择】`"get_current_time_tool"`。不要尝试自己回答“我没有实时时钟”。
-    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
-
-2.  **【规则2：数学计算 - 强制使用工具】**
-    *   如果用户查询明确是要求【执行一个数学表达式的计算】。
-    *   **行动**：【必须选择】`"calculate_tool"`。不要尝试自己计算，即使很简单。
-    *   **参数**：为 `tool_input_args` 准备 `expression`。
-
-3.  **【规则3：实时/最新信息查询 - 网络搜索强制】**
-    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价等）。
-    *   **行动**：【必须且只能】选择 `"web_search_tool"`。
-    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
-    *   **禁止**：不要使用 "enhanced_rag_tool" 查找此类信息。
-
-4.  **【规则4：内部知识/文档深度查询 - RAG】**
-    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】。
-    *   **行动**：选择 `"enhanced_rag_tool"`。
-    *   **参数**：为 `tool_input_args` 准备 `query` 等。
-
-5.  **【规则5：Excel文件操作 - 强制使用工具】**
-    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行复杂操作】。
-    *   **行动**：【必须选择】`"excel_operation_tool"`。
-    *   **任务**：为其构建【结构化查询对象 (SQO) 的JSON列表】到 `excel_sqo_payload`。SQO不含 "file_path" 或 "sheet_name"。
-
-6.  **【规则6：LLM直接回答（在工具不适用后）】**
-    *   **仅当**以上所有规则都不适用，并且你判断可以基于你【已有的知识和常识】直接、准确、完整地回答用户的全部请求时。
-    *   **行动**：`selected_tool_names` 设为 `[]`，在 `direct_answer_content` 提供答案。
-
-7.  **【规则7：无法处理/需要澄清（最终回退）】**
-    *   如果所有规则都不适用，且你也无法直接回答。
-    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释，如果合适，在 `direct_answer_content` 中礼貌回复。
-
-**【可用工具的参考描述】：**
-{TOOL_OPTIONS_STR_FOR_MANAGER}
-
-**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
-
-<example>
-  <user_query>现在几点了？</user_query>
-  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
-  <output_json>{{
-    "task_description": "现在几点了？",
-    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
-    "selected_tool_names": ["get_current_time_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>计算 5 * (10 + 3)</user_query>
-  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
-  <output_json>{{
-    "task_description": "计算 5 * (10 + 3)",
-    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
-    "selected_tool_names": ["calculate_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>今天上海的天气怎么样？</user_query>
-  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
-  <output_json>{{
-    "task_description": "今天上海的天气怎么样？",
-    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
-    "selected_tool_names": ["web_search_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "今天上海天气"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>我们公司的报销政策是什么？</user_query>
-  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
-  <output_json>{{
-    "task_description": "我们公司的报销政策是什么？",
-    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
-    "selected_tool_names": ["enhanced_rag_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "公司报销政策"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>中国的首都是哪里？</user_query>
-  <thought>这是一个常见的常识性问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
-  <output_json>{{
-    "task_description": "中国的首都是哪里？",
-    "reasoning_for_plan": "常识性问题，可直接回答。",
-    "selected_tool_names": [],
-    "direct_answer_content": "中国的首都是北京。",
-    "tool_input_args": null,
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
-  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
-  <output_json>{{
-    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
-    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
-    "selected_tool_names": ["excel_operation_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": null,
-    "excel_sqo_payload": [
-      {{
-        "operation_type": "group_by_aggregate",
-        "group_by_columns": ["区域", "产品类别"],
-        "aggregation_column": "销售额",
-        "aggregation_function": "sum"
-      }}
-    ]
-  }}</output_json>
-</example>
-
-**【输出格式要求 - 必须严格遵守！】**
-你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
-*   `task_description`: (字符串) 用户的原始请求。
-*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
-*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
-*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
-*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
-*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
-
-我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
-""",
-            # --- 添加/恢复 backstory 参数 ---
-            backstory="""我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我的工作流程严谨细致：
-
-1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
-
-2.  **【决策优先级：优先自主解决】**：在考虑动用任何外部工具之前，我会首先评估我的内部知识库和推理能力是否足以直接、完整且准确地回答用户的问题。只有当我确认无法自主解决时，我才会启动工具选择流程。
-
-3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
-    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
-    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)，因为它能从我们精心构建的本地知识库中提取精确信息。
-    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作——无论是读取、计算、筛选、聚合还是修改——我都会委派给【Excel操作工具】(`excel_operation_tool`)。此时，我的核心任务是为该工具生成一个或多个清晰、准确的【结构化查询对象 (SQO) 的JSON列表】，放入 `excel_sqo_payload` 字段。我深知SQO的质量直接影响执行结果，因此我会仔细构造每一个SQO的操作类型 (`operation_type`) 和所需参数，并且我【绝不会】在SQO中包含文件路径 (`file_path`) 或工作表名 (`sheet_name`)，这些将由后续流程处理。
-    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
-    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，我不会强行匹配工具或给出猜测性答复。我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
-
-4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。这个JSON对象不仅包含了用户的原始请求 (`task_description`) 和我的决策理由 (`reasoning_for_plan`)，更重要的是，它清晰地指明了选定的工具 (`selected_tool_names`) 以及调用这些工具所需的一切参数（在 `tool_input_args` 或 `excel_sqo_payload` 中）。
-
-我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
-""",
-            # --- backstory 参数结束 ---
-            llm=manager_llm,
-            verbose=True,
-            allow_delegation=False,
-            tools=[] 
-        )
+        role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
+        goal=current_manager_goal,
+        backstory=MANAGER_AGENT_BACKSTORY,
+        llm=manager_llm,
+        verbose=True,
+        allow_delegation=False,
+        tools=[] 
+    )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
 
     if worker_llm:
@@ -412,15 +261,13 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     # Manager Agent 的 goal 和 backstory 已经包含了大部分指令
     # Task 的 description 主要用于传递动态信息，如当前用户查询
     manager_task_description_for_crewai = f"""
-    请仔细分析以下用户请求：
-    '{request.user_query}'
+    用户的原始请求是：'{request.user_query}'
 
-    你的目标是：
-    1.  理解用户的核心意图。
-    2.  **优先判断**：你能否基于你现有的知识直接、准确地回答这个问题？
-        - 如果是，请在输出的JSON中填充 `direct_answer_content` 字段，并将 `selected_tool_names` 设为空列表。
-    3.  **如果不能直接回答**：你当前只有一个核心工具可用：'enhanced_rag_tool'。请判断是否需要使用它。
-    4.  如果选择了 'enhanced_rag_tool'，请准备好传递给该工具的参数，并将其放入 `tool_input_args` 字段。
+    你的任务是：
+    1.  仔细分析此用户请求的意图。
+    2.  严格回顾并遵循你在 `goal` 中被赋予的【决策规则与优先级】以及【决策示例】。
+    3.  基于这些规则和示例，决定最佳的处理路径：是直接回答，还是选择一个最合适的工具。
+    4.  如果选择了工具，请准备好调用该工具所需的参数。
     5.  严格按照 `SubTaskDefinitionForManagerOutput` 的JSON格式输出你的规划。`task_description` 字段必须是用户的原始请求原文: '{request.user_query}'。同时提供你的 `reasoning_for_plan`。
     """
     
@@ -602,7 +449,7 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     print(f"Manager planned to use tool: {selected_tool_name}. Instance found: {tool_instance_for_worker is not None}")
 
     worker_task_description = ""
-    worker_task_inputs = {} # 用于传递给 task.execute(inputs=...)
+    worker_task_inputs = {} 
 
     if selected_tool_name == "enhanced_rag_tool":
         rag_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
@@ -619,65 +466,66 @@ async def execute_task_endpoint(request: AgentTaskRequest):
         }
 
     elif selected_tool_name == "excel_operation_tool":
-        excel_sqo_list = manager_plan_object.excel_sqo_payload
+        excel_sqo_list = manager_plan_object.excel_sqo_payload # excel_sqo_list 在这里赋值
+
+        # --- 添加调试打印开始 ---
+        print(f"DEBUG_EXCEL_TOOL: Type of manager_plan_object.excel_sqo_payload: {type(manager_plan_object.excel_sqo_payload)}")
+        print(f"DEBUG_EXCEL_TOOL: Value of manager_plan_object.excel_sqo_payload: {manager_plan_object.excel_sqo_payload}")
+        print(f"DEBUG_EXCEL_TOOL: Value of excel_sqo_list: {excel_sqo_list}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list None? {excel_sqo_list is None}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list an empty list? {isinstance(excel_sqo_list, list) and not excel_sqo_list}")
+        # --- 添加调试打印结束 ---
+
         if not excel_sqo_list:
             return AgentTaskResponse(
                 answer="Manager选择Excel工具但未提供SQO列表。", status="error",
                 error_message="excel_sqo_payload is missing for excel_operation_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
-        # --- 添加 elif 分支来处理 web_search_tool ---
-    elif selected_tool_name == "web_search_tool": 
+        
+        # --- 测试用硬编码 ---
+        test_excel_file_path_on_windows = r"C:\\FlutterProjects\\data\\test2.xlsx" # 确保这个路径在Windows上是有效的
+        test_excel_sheet_name: Union[str, int] = "Sheet1"
+        # --- 测试用硬编码结束 ---
+        
+        worker_task_description = (
+            f"你需要处理一个Excel文件相关的任务。目标文件路径是 '{test_excel_file_path_on_windows}'，工作表是 '{test_excel_sheet_name}'。\n"
+            f"请严格按照以下SQO操作定义列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
+            f"SQO操作定义列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
+            f"对于列表中的【每一个SQO操作定义字典】，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
+            f"将该字典作为 'sqo_operation_definition' 参数，"
+            f"同时传递 'target_excel_file_path': '{test_excel_file_path_on_windows}' 和 "
+            f"'target_excel_sheet_name': '{test_excel_sheet_name}'。"
+        )
+        worker_task_inputs = {
+            "excel_sqo_list_to_execute": excel_sqo_list, # Worker Agent会迭代这个
+            "target_excel_file_path_for_worker": test_excel_file_path_on_windows, # Worker Agent使用这个传递给工具
+            "target_excel_sheet_name_for_worker": test_excel_sheet_name # Worker Agent使用这个传递给工具
+        }
+        
+    elif selected_tool_name == "web_search_tool": # 这是唯一且正确的 web_search_tool 分支
         search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
         max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
         worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
         worker_task_inputs = {"query": search_query, "max_results": max_results}
-    # --- 添加结束 ---
-    # --- 添加开始 ---
+        
     elif selected_tool_name == "get_current_time_tool":
         timezone_str = manager_plan_object.tool_input_args.get("timezone", "Asia/Shanghai") if manager_plan_object.tool_input_args else "Asia/Shanghai"
         worker_task_description = f"请使用时间工具获取当前时间。时区参数为: '{timezone_str}'。"
-        worker_task_inputs = {"timezone_str": timezone_str} # 注意参数名与工具类 _run 方法的参数名一致
+        worker_task_inputs = {"timezone_str": timezone_str} 
 
     elif selected_tool_name == "calculate_tool":
         expression_str = manager_plan_object.tool_input_args.get("expression", "") if manager_plan_object.tool_input_args else ""
         if not expression_str:
-            return AgentTaskResponse(
+             return AgentTaskResponse(
                 answer="Manager选择计算器工具但未提供表达式。", status="error",
                 error_message="expression is missing for calculate_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
         worker_task_description = f"请使用计算器工具计算以下表达式: '{expression_str}'。"
-        worker_task_inputs = {"expression": expression_str} # 注意参数名与工具类 _run 方法的参数名一致
-        # --- 添加结束 ---
-        # TODO: 从用户原始请求 manager_plan_object.task_description 中提取 file_path 和 sheet_name
-
-        excel_file_path = "/home/zhz/zhz_agent/data/test.xlsx" # 临时硬编码，后续需要动态获取
-        excel_sheet_name: Union[str, int] = 0 # 临时硬编码
-
-        worker_task_description = (
-            f"你需要处理一个Excel文件相关的任务。文件路径是 '{excel_file_path}'，工作表是 '{excel_sheet_name}'。\n"
-            f"请严格按照以下SQO操作列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
-            f"SQO操作列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
-            f"对于列表中的每一个SQO字典，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
-            f"将该SQO字典作为 'sqo_dict' 参数，同时传递 'file_path': '{excel_file_path}' 和 'sheet_name': '{excel_sheet_name}'。"
-        )
-        # Worker Task的inputs将是整个SQO列表以及文件和工作表信息
-        # Worker Agent的Prompt需要指导它如何迭代处理这个列表
-        worker_task_inputs = {
-            "excel_sqo_list_to_execute": excel_sqo_list,
-            "target_excel_file_path": excel_file_path,
-            "target_excel_sheet_name": excel_sheet_name
-        }
+        worker_task_inputs = {"expression": expression_str}
         
-    elif selected_tool_name == "web_search_tool":
-        search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
-        max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
-
-        worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
-        worker_task_inputs = {"query": search_query, "max_results": max_results}
-        
-    else:
+    else: # 这是处理未知工具的 else
         return AgentTaskResponse(
             answer=f"未知的工具名称 '{selected_tool_name}' 被Manager规划。", status="error",
             error_message=f"Unknown tool '{selected_tool_name}' planned by manager.",
@@ -1614,6 +1462,10 @@ service_logger = logging.getLogger(__name__)
 from crewai import Agent, Task, Crew, Process
 from crewai.tools import BaseTool
 
+# --- 添加开始 ---
+from core.prompts.manager_prompts import get_manager_agent_goal, MANAGER_AGENT_BACKSTORY
+# --- 添加结束 ---
+
 from core.llm_manager import get_llm_instance, CustomLiteLLMWrapper
 from core.tools.enhanced_rag_tool import EnhancedRAGTool
 from core.tools.excel_tool import ExcelOperationTool
@@ -1774,171 +1626,16 @@ async def lifespan(app: FastAPI):
 
     # --- 步骤 3: 初始化 Agent 实例 ---
     if manager_llm:
+        current_manager_goal = get_manager_agent_goal(TOOL_OPTIONS_STR_FOR_MANAGER)
         manager_agent_instance = Agent(
-            role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
-            goal=f"""你的核心任务是分析用户的请求（该请求将在后续的任务描述中提供），并决定最佳的处理路径。你必须严格按照以下【工具选择规则和优先级】以及【示例】进行决策。
-
-**【决策规则与优先级】**
-
-1.  **【规则1：时间查询 - 强制使用工具】**
-    *   如果用户查询明确是关于【获取当前日期或时间】。
-    *   **行动**：【必须选择】`"get_current_time_tool"`。不要尝试自己回答“我没有实时时钟”。
-    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
-
-2.  **【规则2：数学计算 - 强制使用工具】**
-    *   如果用户查询明确是要求【执行一个数学表达式的计算】。
-    *   **行动**：【必须选择】`"calculate_tool"`。不要尝试自己计算，即使很简单。
-    *   **参数**：为 `tool_input_args` 准备 `expression`。
-
-3.  **【规则3：实时/最新信息查询 - 网络搜索强制】**
-    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价等）。
-    *   **行动**：【必须且只能】选择 `"web_search_tool"`。
-    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
-    *   **禁止**：不要使用 "enhanced_rag_tool" 查找此类信息。
-
-4.  **【规则4：内部知识/文档深度查询 - RAG】**
-    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】。
-    *   **行动**：选择 `"enhanced_rag_tool"`。
-    *   **参数**：为 `tool_input_args` 准备 `query` 等。
-
-5.  **【规则5：Excel文件操作 - 强制使用工具】**
-    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行复杂操作】。
-    *   **行动**：【必须选择】`"excel_operation_tool"`。
-    *   **任务**：为其构建【结构化查询对象 (SQO) 的JSON列表】到 `excel_sqo_payload`。SQO不含 "file_path" 或 "sheet_name"。
-
-6.  **【规则6：LLM直接回答（在工具不适用后）】**
-    *   **仅当**以上所有规则都不适用，并且你判断可以基于你【已有的知识和常识】直接、准确、完整地回答用户的全部请求时。
-    *   **行动**：`selected_tool_names` 设为 `[]`，在 `direct_answer_content` 提供答案。
-
-7.  **【规则7：无法处理/需要澄清（最终回退）】**
-    *   如果所有规则都不适用，且你也无法直接回答。
-    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释，如果合适，在 `direct_answer_content` 中礼貌回复。
-
-**【可用工具的参考描述】：**
-{TOOL_OPTIONS_STR_FOR_MANAGER}
-
-**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
-
-<example>
-  <user_query>现在几点了？</user_query>
-  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
-  <output_json>{{
-    "task_description": "现在几点了？",
-    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
-    "selected_tool_names": ["get_current_time_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>计算 5 * (10 + 3)</user_query>
-  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
-  <output_json>{{
-    "task_description": "计算 5 * (10 + 3)",
-    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
-    "selected_tool_names": ["calculate_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>今天上海的天气怎么样？</user_query>
-  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
-  <output_json>{{
-    "task_description": "今天上海的天气怎么样？",
-    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
-    "selected_tool_names": ["web_search_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "今天上海天气"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>我们公司的报销政策是什么？</user_query>
-  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
-  <output_json>{{
-    "task_description": "我们公司的报销政策是什么？",
-    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
-    "selected_tool_names": ["enhanced_rag_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": {{"query": "公司报销政策"}},
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>中国的首都是哪里？</user_query>
-  <thought>这是一个常见的常识性问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
-  <output_json>{{
-    "task_description": "中国的首都是哪里？",
-    "reasoning_for_plan": "常识性问题，可直接回答。",
-    "selected_tool_names": [],
-    "direct_answer_content": "中国的首都是北京。",
-    "tool_input_args": null,
-    "excel_sqo_payload": null
-  }}</output_json>
-</example>
-
-<example>
-  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
-  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。</thought>
-  <output_json>{{
-    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
-    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO。",
-    "selected_tool_names": ["excel_operation_tool"],
-    "direct_answer_content": null,
-    "tool_input_args": null,
-    "excel_sqo_payload": [
-      {{
-        "operation_type": "group_by_aggregate",
-        "group_by_columns": ["区域", "产品类别"],
-        "aggregation_column": "销售额",
-        "aggregation_function": "sum"
-      }}
-    ]
-  }}</output_json>
-</example>
-
-**【输出格式要求 - 必须严格遵守！】**
-你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
-*   `task_description`: (字符串) 用户的原始请求。
-*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
-*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
-*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
-*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
-*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
-
-我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
-""",
-            # --- 添加/恢复 backstory 参数 ---
-            backstory="""我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我的工作流程严谨细致：
-
-1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
-
-2.  **【决策优先级：优先自主解决】**：在考虑动用任何外部工具之前，我会首先评估我的内部知识库和推理能力是否足以直接、完整且准确地回答用户的问题。只有当我确认无法自主解决时，我才会启动工具选择流程。
-
-3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
-    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
-    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)，因为它能从我们精心构建的本地知识库中提取精确信息。
-    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作——无论是读取、计算、筛选、聚合还是修改——我都会委派给【Excel操作工具】(`excel_operation_tool`)。此时，我的核心任务是为该工具生成一个或多个清晰、准确的【结构化查询对象 (SQO) 的JSON列表】，放入 `excel_sqo_payload` 字段。我深知SQO的质量直接影响执行结果，因此我会仔细构造每一个SQO的操作类型 (`operation_type`) 和所需参数，并且我【绝不会】在SQO中包含文件路径 (`file_path`) 或工作表名 (`sheet_name`)，这些将由后续流程处理。
-    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
-    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，我不会强行匹配工具或给出猜测性答复。我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
-
-4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。这个JSON对象不仅包含了用户的原始请求 (`task_description`) 和我的决策理由 (`reasoning_for_plan`)，更重要的是，它清晰地指明了选定的工具 (`selected_tool_names`) 以及调用这些工具所需的一切参数（在 `tool_input_args` 或 `excel_sqo_payload` 中）。
-
-我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
-""",
-            # --- backstory 参数结束 ---
-            llm=manager_llm,
-            verbose=True,
-            allow_delegation=False,
-            tools=[] 
-        )
+        role='资深AI任务分解与Excel查询规划师 (Senior AI Task Decomposition and Excel Query Planner)',
+        goal=current_manager_goal,
+        backstory=MANAGER_AGENT_BACKSTORY,
+        llm=manager_llm,
+        verbose=True,
+        allow_delegation=False,
+        tools=[] 
+    )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
 
     if worker_llm:
@@ -1988,15 +1685,13 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     # Manager Agent 的 goal 和 backstory 已经包含了大部分指令
     # Task 的 description 主要用于传递动态信息，如当前用户查询
     manager_task_description_for_crewai = f"""
-    请仔细分析以下用户请求：
-    '{request.user_query}'
+    用户的原始请求是：'{request.user_query}'
 
-    你的目标是：
-    1.  理解用户的核心意图。
-    2.  **优先判断**：你能否基于你现有的知识直接、准确地回答这个问题？
-        - 如果是，请在输出的JSON中填充 `direct_answer_content` 字段，并将 `selected_tool_names` 设为空列表。
-    3.  **如果不能直接回答**：你当前只有一个核心工具可用：'enhanced_rag_tool'。请判断是否需要使用它。
-    4.  如果选择了 'enhanced_rag_tool'，请准备好传递给该工具的参数，并将其放入 `tool_input_args` 字段。
+    你的任务是：
+    1.  仔细分析此用户请求的意图。
+    2.  严格回顾并遵循你在 `goal` 中被赋予的【决策规则与优先级】以及【决策示例】。
+    3.  基于这些规则和示例，决定最佳的处理路径：是直接回答，还是选择一个最合适的工具。
+    4.  如果选择了工具，请准备好调用该工具所需的参数。
     5.  严格按照 `SubTaskDefinitionForManagerOutput` 的JSON格式输出你的规划。`task_description` 字段必须是用户的原始请求原文: '{request.user_query}'。同时提供你的 `reasoning_for_plan`。
     """
     
@@ -2178,7 +1873,7 @@ async def execute_task_endpoint(request: AgentTaskRequest):
     print(f"Manager planned to use tool: {selected_tool_name}. Instance found: {tool_instance_for_worker is not None}")
 
     worker_task_description = ""
-    worker_task_inputs = {} # 用于传递给 task.execute(inputs=...)
+    worker_task_inputs = {} 
 
     if selected_tool_name == "enhanced_rag_tool":
         rag_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
@@ -2195,65 +1890,66 @@ async def execute_task_endpoint(request: AgentTaskRequest):
         }
 
     elif selected_tool_name == "excel_operation_tool":
-        excel_sqo_list = manager_plan_object.excel_sqo_payload
+        excel_sqo_list = manager_plan_object.excel_sqo_payload # excel_sqo_list 在这里赋值
+
+        # --- 添加调试打印开始 ---
+        print(f"DEBUG_EXCEL_TOOL: Type of manager_plan_object.excel_sqo_payload: {type(manager_plan_object.excel_sqo_payload)}")
+        print(f"DEBUG_EXCEL_TOOL: Value of manager_plan_object.excel_sqo_payload: {manager_plan_object.excel_sqo_payload}")
+        print(f"DEBUG_EXCEL_TOOL: Value of excel_sqo_list: {excel_sqo_list}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list None? {excel_sqo_list is None}")
+        print(f"DEBUG_EXCEL_TOOL: Is excel_sqo_list an empty list? {isinstance(excel_sqo_list, list) and not excel_sqo_list}")
+        # --- 添加调试打印结束 ---
+
         if not excel_sqo_list:
             return AgentTaskResponse(
                 answer="Manager选择Excel工具但未提供SQO列表。", status="error",
                 error_message="excel_sqo_payload is missing for excel_operation_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
-        # --- 添加 elif 分支来处理 web_search_tool ---
-    elif selected_tool_name == "web_search_tool": 
+        
+        # --- 测试用硬编码 ---
+        test_excel_file_path_on_windows = r"C:\\FlutterProjects\\data\\test2.xlsx" # 确保这个路径在Windows上是有效的
+        test_excel_sheet_name: Union[str, int] = "Sheet1"
+        # --- 测试用硬编码结束 ---
+        
+        worker_task_description = (
+            f"你需要处理一个Excel文件相关的任务。目标文件路径是 '{test_excel_file_path_on_windows}'，工作表是 '{test_excel_sheet_name}'。\n"
+            f"请严格按照以下SQO操作定义列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
+            f"SQO操作定义列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
+            f"对于列表中的【每一个SQO操作定义字典】，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
+            f"将该字典作为 'sqo_operation_definition' 参数，"
+            f"同时传递 'target_excel_file_path': '{test_excel_file_path_on_windows}' 和 "
+            f"'target_excel_sheet_name': '{test_excel_sheet_name}'。"
+        )
+        worker_task_inputs = {
+            "excel_sqo_list_to_execute": excel_sqo_list, # Worker Agent会迭代这个
+            "target_excel_file_path_for_worker": test_excel_file_path_on_windows, # Worker Agent使用这个传递给工具
+            "target_excel_sheet_name_for_worker": test_excel_sheet_name # Worker Agent使用这个传递给工具
+        }
+        
+    elif selected_tool_name == "web_search_tool": # 这是唯一且正确的 web_search_tool 分支
         search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
         max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
         worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
         worker_task_inputs = {"query": search_query, "max_results": max_results}
-    # --- 添加结束 ---
-    # --- 添加开始 ---
+        
     elif selected_tool_name == "get_current_time_tool":
         timezone_str = manager_plan_object.tool_input_args.get("timezone", "Asia/Shanghai") if manager_plan_object.tool_input_args else "Asia/Shanghai"
         worker_task_description = f"请使用时间工具获取当前时间。时区参数为: '{timezone_str}'。"
-        worker_task_inputs = {"timezone_str": timezone_str} # 注意参数名与工具类 _run 方法的参数名一致
+        worker_task_inputs = {"timezone_str": timezone_str} 
 
     elif selected_tool_name == "calculate_tool":
         expression_str = manager_plan_object.tool_input_args.get("expression", "") if manager_plan_object.tool_input_args else ""
         if not expression_str:
-            return AgentTaskResponse(
+             return AgentTaskResponse(
                 answer="Manager选择计算器工具但未提供表达式。", status="error",
                 error_message="expression is missing for calculate_tool.",
                 debug_info={"manager_plan": manager_plan_object.model_dump()}
             )
         worker_task_description = f"请使用计算器工具计算以下表达式: '{expression_str}'。"
-        worker_task_inputs = {"expression": expression_str} # 注意参数名与工具类 _run 方法的参数名一致
-        # --- 添加结束 ---
-        # TODO: 从用户原始请求 manager_plan_object.task_description 中提取 file_path 和 sheet_name
-
-        excel_file_path = "/home/zhz/zhz_agent/data/test.xlsx" # 临时硬编码，后续需要动态获取
-        excel_sheet_name: Union[str, int] = 0 # 临时硬编码
-
-        worker_task_description = (
-            f"你需要处理一个Excel文件相关的任务。文件路径是 '{excel_file_path}'，工作表是 '{excel_sheet_name}'。\n"
-            f"请严格按照以下SQO操作列表，顺序执行每一个操作，并整合所有操作的结果形成最终答案。\n"
-            f"SQO操作列表: {json.dumps(excel_sqo_list, ensure_ascii=False)}\n\n"
-            f"对于列表中的每一个SQO字典，你需要调用 '{tool_instance_for_worker.name}' 工具一次，"
-            f"将该SQO字典作为 'sqo_dict' 参数，同时传递 'file_path': '{excel_file_path}' 和 'sheet_name': '{excel_sheet_name}'。"
-        )
-        # Worker Task的inputs将是整个SQO列表以及文件和工作表信息
-        # Worker Agent的Prompt需要指导它如何迭代处理这个列表
-        worker_task_inputs = {
-            "excel_sqo_list_to_execute": excel_sqo_list,
-            "target_excel_file_path": excel_file_path,
-            "target_excel_sheet_name": excel_sheet_name
-        }
+        worker_task_inputs = {"expression": expression_str}
         
-    elif selected_tool_name == "web_search_tool":
-        search_query = manager_plan_object.tool_input_args.get("query", request.user_query) if manager_plan_object.tool_input_args else request.user_query
-        max_results = manager_plan_object.tool_input_args.get("max_results", 5) if manager_plan_object.tool_input_args else 5
-
-        worker_task_description = f"请使用网络搜索工具查找关于 '{search_query}' 的信息，返回最多 {max_results} 条结果。"
-        worker_task_inputs = {"query": search_query, "max_results": max_results}
-        
-    else:
+    else: # 这是处理未知工具的 else
         return AgentTaskResponse(
             answer=f"未知的工具名称 '{selected_tool_name}' 被Manager规划。", status="error",
             error_message=f"Unknown tool '{selected_tool_name}' planned by manager.",
@@ -9486,6 +9182,7 @@ Directory: zhz_rag/stored_data/
 
 Directory: zhz_rag/stored_data/rag_interaction_logs/
   File (skipped, extension not included): rag_interactions_20250605.jsonl
+  File (skipped, extension not included): rag_interactions_20250606.jsonl
 
 Directory: zhz_rag/stored_data/evaluation_results_logs/
 
@@ -12766,63 +12463,355 @@ import httpx
 import json
 import traceback
 import os
+import glob
+from dotenv import load_dotenv
+from datetime import datetime, timezone
+import uuid
 import logging
+import asyncio
+from typing import List, Dict, Any, Optional
+import re
+import unicodedata
 
-# --- 日志配置 ---
-logger = logging.getLogger(__name__)
-# (您可以根据需要添加更详细的日志配置)
+load_dotenv()
 
-# --- MCP 配置 ---
+# --- Logger Configuration ---
+# 使用一个统一的 logger 名称，方便管理
+# 您可以根据需要在调用此模块的顶层配置这个 logger
+# 例如，在 agent_orchestrator_service.py 的开头配置 "ZhzAgentUtils"
+utils_logger = logging.getLogger("ZhzAgentUtils")
+if not utils_logger.handlers: # 避免重复添加处理器
+    utils_logger.setLevel(os.getenv("UTILS_LOG_LEVEL", "INFO").upper())
+    _utils_console_handler = logging.StreamHandler()
+    _utils_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s')
+    _utils_console_handler.setFormatter(_utils_formatter)
+    utils_logger.addHandler(_utils_console_handler)
+    utils_logger.propagate = False # 通常在自定义logger中设置为False
+utils_logger.info("--- ZhzAgentUtils Logger configured ---")
+
+
+# --- MCP Configuration ---
 MCPO_BASE_URL = os.getenv("MCPO_BASE_URL", "http://localhost:8006")
 
-async def call_mcpo_tool(tool_name_with_prefix: str, payload: dict) -> dict:
-    """
-    异步调用MCP工具服务。
-    tool_name_with_prefix 例如: "zhz_rag_mcp_service/query_rag_v2" 或 "ddgsearch/search"
-    payload 是传递给MCP工具的参数字典。
-    返回一个字典，成功时包含工具的输出，失败时包含 "error" 键。
-    """
+# --- Directory Paths (统一管理，基于此文件位置推断项目结构) ---
+_CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 假设 common_utils.py 在 zhz_agent/utils/ 或 zhz_agent/zhz_rag/utils/
+# 我们需要项目根目录 zhz_agent/
+_PROJECT_ROOT_GUESS_1 = os.path.abspath(os.path.join(_CURRENT_FILE_DIR, "..")) # 如果在 utils/ 下
+_PROJECT_ROOT_GUESS_2 = os.path.abspath(os.path.join(_CURRENT_FILE_DIR, "..", "..")) # 如果在 zhz_rag/utils/ 下
+
+# 尝试确定正确的项目根目录
+if os.path.basename(_PROJECT_ROOT_GUESS_1) == "zhz_agent":
+    PROJECT_ROOT_DIR = _PROJECT_ROOT_GUESS_1
+elif os.path.basename(_PROJECT_ROOT_GUESS_2) == "zhz_agent":
+    PROJECT_ROOT_DIR = _PROJECT_ROOT_GUESS_2
+else:
+    # 如果都猜不到，就用一个相对路径或者发出警告
+    utils_logger.warning(f"Could not reliably determine PROJECT_ROOT_DIR from common_utils.py location. Using current dir as fallback for relative paths: {_CURRENT_FILE_DIR}")
+    PROJECT_ROOT_DIR = _CURRENT_FILE_DIR # 或者您的固定路径
+
+STORED_DATA_ROOT_DIR = os.path.join(PROJECT_ROOT_DIR, 'zhz_rag', 'stored_data')
+RAG_INTERACTION_LOGS_DIR = os.path.join(STORED_DATA_ROOT_DIR, 'rag_interaction_logs')
+EVALUATION_RESULTS_LOGS_DIR = os.path.join(STORED_DATA_ROOT_DIR, 'evaluation_results_logs')
+FINETUNING_GENERATED_DATA_DIR = os.path.join(PROJECT_ROOT_DIR, 'zhz_rag', 'finetuning', 'generated_data')
+
+_DIRECTORIES_TO_CREATE = [
+    STORED_DATA_ROOT_DIR, # 确保父目录也创建
+    RAG_INTERACTION_LOGS_DIR,
+    EVALUATION_RESULTS_LOGS_DIR,
+    FINETUNING_GENERATED_DATA_DIR
+]
+for dir_path in _DIRECTORIES_TO_CREATE:
+    if not os.path.exists(dir_path):
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+            utils_logger.info(f"Successfully created directory: {dir_path}")
+        except Exception as e:
+            utils_logger.error(f"Error creating directory {dir_path}: {e}. Consider creating it manually.")
+
+# --- Log File Path Getters ---
+def get_interaction_log_filepath() -> str:
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return os.path.join(RAG_INTERACTION_LOGS_DIR, f"rag_interactions_{today_str}.jsonl")
+
+def get_evaluation_result_log_filepath(evaluation_name: str) -> str:
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return os.path.join(EVALUATION_RESULTS_LOGS_DIR, f"eval_results_{evaluation_name}_{today_str}.jsonl")
+
+def find_latest_rag_interaction_log(log_dir: str = RAG_INTERACTION_LOGS_DIR) -> Optional[str]:
+    utils_logger.debug(f"Searching for RAG interaction logs in: {log_dir}")
+    rag_log_pattern = os.path.join(log_dir, "rag_interactions_*.jsonl")
+    candidate_rag_logs = glob.glob(rag_log_pattern)
+    if candidate_rag_logs:
+        candidate_rag_logs.sort(key=os.path.getmtime, reverse=True)
+        utils_logger.info(f"Automatically selected RAG interaction log: {candidate_rag_logs[0]}")
+        return candidate_rag_logs[0]
+    else:
+        utils_logger.warning(f"No RAG interaction log files found matching pattern: {rag_log_pattern} in directory {log_dir}")
+        return None
+
+# --- Logging Function ---
+async def log_interaction_data(
+    interaction_data: Dict[str, Any],
+    is_evaluation_result: bool = False,
+    evaluation_name_for_file: Optional[str] = None
+):
+    if is_evaluation_result:
+        if not evaluation_name_for_file:
+            evaluation_name_for_file = interaction_data.get("task_type", "general_eval_result")
+        filepath = get_evaluation_result_log_filepath(evaluation_name=evaluation_name_for_file)
+    else:
+        filepath = get_interaction_log_filepath()
+
+    if "timestamp_utc" not in interaction_data:
+        interaction_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+    if "interaction_id" not in interaction_data and not is_evaluation_result:
+        interaction_data["interaction_id"] = str(uuid.uuid4())
+    elif "interaction_id" not in interaction_data and is_evaluation_result and "original_interaction_id_ref" in interaction_data:
+         interaction_data["interaction_id"] = str(uuid.uuid4())
+
+    try:
+        def _write_sync():
+            log_file_dir = os.path.dirname(filepath)
+            if not os.path.exists(log_file_dir):
+                try:
+                    os.makedirs(log_file_dir, exist_ok=True)
+                    utils_logger.info(f"Created directory for log file: {log_file_dir}")
+                except Exception as e_mkdir:
+                    utils_logger.error(f"Error creating directory {log_file_dir} for log file: {e_mkdir}")
+                    return
+            with open(filepath, 'a', encoding='utf-8') as f:
+                json_string_to_write = json.dumps(interaction_data, ensure_ascii=False, default=str)
+                f.write(json_string_to_write + "\n")
+        await asyncio.to_thread(_write_sync)
+    except Exception as e:
+        utils_logger.error(f"Failed to log interaction data to {filepath}: {e}", exc_info=True)
+
+# --- MCP Tool Calling Utility ---
+async def call_mcpo_tool(tool_name_with_prefix: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     api_url = f"{MCPO_BASE_URL}/{tool_name_with_prefix}"
     cleaned_payload = {k: v for k, v in (payload or {}).items() if v is not None}
 
-    logger.info(f"Calling MCP endpoint: POST {api_url} with payload: {json.dumps(cleaned_payload, ensure_ascii=False)}")
+    utils_logger.info(f"CALL_MCPO_TOOL: Attempting to call {api_url}")
+    utils_logger.debug(f"CALL_MCPO_TOOL: Payload: {json.dumps(cleaned_payload, ensure_ascii=False)}")
 
-    async with httpx.AsyncClient(timeout=120.0) as client: # 增加超时
-        response = None
+    timeout_config = httpx.Timeout(120.0, connect=10.0, read=120.0, write=10.0)
+    
+    async with httpx.AsyncClient(timeout=timeout_config) as client:
+        response: Optional[httpx.Response] = None
         try:
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "ZhzAgent/1.0 (call_mcpo_tool)"
+            }
+            utils_logger.debug(f"CALL_MCPO_TOOL: Sending POST request to {api_url} with headers: {headers}")
             response = await client.post(api_url, json=cleaned_payload, headers=headers)
-            logger.info(f"MCP status code for {tool_name_with_prefix}: {response.status_code}")
+            
+            utils_logger.info(f"CALL_MCPO_TOOL: Response from {api_url} - Status: {response.status_code}")
+            utils_logger.debug(f"CALL_MCPO_TOOL: Response Headers: {response.headers}")
+            
+            try:
+                response_text_snippet = response.text[:500]
+                utils_logger.debug(f"CALL_MCPO_TOOL: Response Text Snippet (first 500 chars): {response_text_snippet}")
+            except Exception as e_read_snippet:
+                utils_logger.warning(f"CALL_MCPO_TOOL: Could not read response text snippet: {e_read_snippet}")
 
             if response.status_code == 200:
                 try:
                     result_data = response.json()
-                    # 检查 MCP 服务本身是否返回了错误结构 (例如 MCP 框架的错误包装)
-                    if isinstance(result_data, dict) and result_data.get("isError"): # 假设 MCP 错误格式
-                        error_text = result_data.get("content", [{"text": "Unknown error from MCP tool"}])[0].get("text")
-                        logger.error(f"MCP Tool '{tool_name_with_prefix}' execution failed (isError=true): {error_text}")
-                        return {"error": f"Tool '{tool_name_with_prefix}' failed via MCP: {error_text}"}
-                    return result_data # 假设成功时直接返回工具的 JSON 输出
+                    utils_logger.info(f"CALL_MCPO_TOOL: Successfully received and parsed JSON response from {api_url}.")
+                    
+                    if isinstance(result_data, dict) and result_data.get("isError"):
+                        error_content_list = result_data.get("content", [{"type": "text", "text": "Unknown error from MCP tool"}])
+                        error_text_from_mcp_payload = "Unknown error from MCP tool"
+                        for item in error_content_list:
+                            if item.get("type") == "text":
+                                error_text_from_mcp_payload = item.get("text", error_text_from_mcp_payload)
+                                break
+                        utils_logger.error(f"CALL_MCPO_TOOL: MCP Tool '{tool_name_with_prefix}' reported an application-level error (isError=true): {error_text_from_mcp_payload}")
+                        return {
+                            "success": False,
+                            "error": f"MCP tool '{tool_name_with_prefix}' reported failure: {error_text_from_mcp_payload}",
+                            "error_type": "MCP_APPLICATION_ERROR",
+                            "status_code": response.status_code
+                        }
+                    return {
+                            "success": True, 
+                            "data": result_data 
+                    }
                 except json.JSONDecodeError:
-                    logger.warning(f"MCP call to '{tool_name_with_prefix}' returned status 200 but response is not JSON. Raw text: {response.text[:500]}...")
-                    return {"error": "Non-JSON response from MCP tool", "raw_response": response.text}
+                    utils_logger.warning(f"CALL_MCPO_TOOL: Response from {api_url} was 200 OK but not valid JSON. Assuming plain text response. Raw text: {response.text[:200]}...")
+                    return {
+                        "success": True,
+                        "data": { 
+                            "content": [{"type": "text", "text": response.text}]
+                        } 
+                    }
             else:
-                error_text = f"MCP call to '{tool_name_with_prefix}' failed with status {response.status_code}. Response: {response.text[:500]}..."
-                logger.error(error_text)
-                return {"error": error_text, "status_code": response.status_code}
+                error_message = f"HTTP Error {response.status_code} when calling {api_url}."
+                utils_logger.error(f"CALL_MCPO_TOOL: {error_message} Response: {response.text[:500]}", exc_info=False)
+                error_detail_from_response = response.text
+                try:
+                    parsed_error_json = response.json()
+                    if isinstance(parsed_error_json, dict) and "detail" in parsed_error_json:
+                        error_detail_from_response = parsed_error_json["detail"]
+                    elif isinstance(parsed_error_json, dict) and "error" in parsed_error_json: 
+                        error_detail_from_response = parsed_error_json["error"]
+                except json.JSONDecodeError:
+                    pass 
+                return {
+                    "success": False,
+                    "error": f"HTTP error from MCP service: {error_detail_from_response}",
+                    "error_type": "HTTP_STATUS_ERROR",
+                    "status_code": response.status_code,
+                    "raw_response_snippet": response.text[:500] if response else "N/A"
+                }
+        except httpx.TimeoutException as exc_timeout:
+            utils_logger.error(f"CALL_MCPO_TOOL: Timeout when calling {api_url}. Error: {exc_timeout}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Request to MCP service timed out after {timeout_config.read if timeout_config else 'default'}s.",
+                "error_type": "TIMEOUT_ERROR",
+                "status_code": None 
+            }
+        except httpx.ConnectError as exc_connect:
+            utils_logger.error(f"CALL_MCPO_TOOL: Connection error when calling {api_url}. Is the MCP service running at {MCPO_BASE_URL}? Error: {exc_connect}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"Could not connect to MCP service at {MCPO_BASE_URL}.",
+                "error_type": "CONNECTION_ERROR",
+                "status_code": None
+            }
+        except httpx.RequestError as exc_request_other: 
+            utils_logger.error(f"CALL_MCPO_TOOL: Network request error when calling {api_url}. Error: {exc_request_other}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"A network request error occurred: {str(exc_request_other)}",
+                "error_type": type(exc_request_other).__name__,
+                "status_code": None
+            }
+        except Exception as exc_unexpected:
+            utils_logger.error(f"CALL_MCPO_TOOL: Unexpected error when calling {api_url}. Error: {exc_unexpected}", exc_info=True)
+            return {
+                "success": False,
+                "error": f"An unexpected error occurred during MCP call: {str(exc_unexpected)}",
+                "error_type": type(exc_unexpected).__name__,
+                "status_code": response.status_code if response else None, 
+                "traceback": traceback.format_exc() 
+            }
 
-        except httpx.RequestError as exc:
-            error_msg = f"HTTP RequestError calling MCP tool '{tool_name_with_prefix}': {type(exc).__name__} - {exc}"
-            logger.error(error_msg, exc_info=True)
-            return {"error": error_msg, "exception_type": type(exc).__name__}
-        except Exception as exc:
-            error_msg = f"Unexpected error calling MCP tool '{tool_name_with_prefix}': {type(exc).__name__} - {exc}"
-            response_text_snippet = response.text[:500] if response and hasattr(response, 'text') else "N/A"
-            logger.error(f"{error_msg}. Response snippet: {response_text_snippet}", exc_info=True)
-            return {"error": error_msg, "exception_type": type(exc).__name__}
+# --- JSONL File Loading Utility ---
+def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, Any]]:
+    data_list: List[Dict[str, Any]] = []
+    if not os.path.exists(filepath):
+        utils_logger.error(f"File not found: {filepath}")
+        return data_list
+    try:
+        with open(filepath, 'r', encoding=encoding) as f:
+            for line_number, line in enumerate(f, 1):
+                try:
+                    if line.strip():
+                        data_list.append(json.loads(line.strip()))
+                except json.JSONDecodeError as e_json:
+                    utils_logger.warning(f"Skipping malformed JSON line {line_number} in {filepath}: {e_json}")
+                except Exception as e_line:
+                    utils_logger.warning(f"Error processing line {line_number} in {filepath}: {e_line}")
+    except FileNotFoundError:
+        utils_logger.error(f"File not found during open: {filepath}")
+    except Exception as e_file:
+        utils_logger.error(f"Error reading or processing file {filepath}: {e_file}", exc_info=True)
+        return []
+    utils_logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
+    return data_list
 
-# 确保 utils 目录也有一个 __init__.py 文件
-# touch /home/zhz/zhz_agent/utils/__init__.py (如果不存在)
+# --- Text Normalization Utility ---
+def normalize_text_for_id(text: str) -> str:
+    if not isinstance(text, str):
+        return str(text)
+    try:
+        normalized_text = unicodedata.normalize('NFKD', text)
+        normalized_text = normalized_text.lower()
+        normalized_text = normalized_text.strip()
+        normalized_text = re.sub(r'\s+', ' ', normalized_text) # Collapse multiple whitespaces
+        return normalized_text
+    except Exception: # pylint: disable=broad-except
+        # Fallback to original text if normalization fails for any reason
+        return text
+
+# --- DB Utils (Moved from zhz_rag.utils.db_utils to here for consolidation if needed) ---
+# from databases import Database # This would require 'databases' and 'aiosqlite' in requirements
+# from sqlalchemy import create_engine
+# from sqlalchemy.orm import declarative_base
+# import pytz
+# from apscheduler.schedulers.asyncio import AsyncIOScheduler
+# from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+# ZHZ_AGENT_DIR_FOR_DB = PROJECT_ROOT_DIR # Use the determined project root
+# DB_NAME = "ZHZ_AGENT_tasks.db" # Or your desired DB name
+# DATABASE_FILE_PATH = os.path.join(ZHZ_AGENT_DIR_FOR_DB, DB_NAME) # Store DB in project root
+# DATABASE_URL = f"sqlite+aiosqlite:///{DATABASE_FILE_PATH}"
+
+# database_instance: Optional[Database] = None
+# sqlalchemy_engine_instance = None
+# SQLAlchemyBase = declarative_base()
+# scheduler_instance: Optional[AsyncIOScheduler] = None
+
+# def get_database() -> Database:
+#     global database_instance
+#     if database_instance is None:
+#         database_instance = Database(DATABASE_URL)
+#     return database_instance
+
+# def get_sqlalchemy_engine():
+#     global sqlalchemy_engine_instance
+#     if sqlalchemy_engine_instance is None:
+#         sqlalchemy_engine_instance = create_engine(DATABASE_URL.replace("+aiosqlite", ""))
+#     return sqlalchemy_engine_instance
+
+# def get_scheduler() -> AsyncIOScheduler:
+#     global scheduler_instance
+#     if scheduler_instance is None:
+#         jobstore_url = f"sqlite:///{DATABASE_FILE_PATH}" # Scheduler uses its own tables in the same DB
+#         jobstores = {
+#             'default': SQLAlchemyJobStore(url=jobstore_url, tablename='apscheduler_jobs_v2_common_utils')
+#         }
+#         scheduler_instance = AsyncIOScheduler(jobstores=jobstores, timezone=pytz.utc)
+#         logging.getLogger('apscheduler').setLevel(os.getenv("SCHEDULER_LOG_LEVEL", "WARNING").upper())
+#         utils_logger.info(f"APScheduler (common_utils) initialized with timezone: {pytz.utc}")
+#     return scheduler_instance
+
+# async def connect_database():
+#     db_to_connect = get_database()
+#     if not db_to_connect.is_connected:
+#         await db_to_connect.connect()
+#         utils_logger.info("Database connected (common_utils).")
+
+# async def disconnect_database():
+#     db_to_disconnect = get_database()
+#     if db_to_disconnect.is_connected:
+#         await db_to_disconnect.disconnect()
+#         utils_logger.info("Database disconnected (common_utils).")
+
+# def create_db_tables():
+#     engine = get_sqlalchemy_engine()
+#     SQLAlchemyBase.metadata.create_all(bind=engine)
+#     utils_logger.info("SQLAlchemy tables created via common_utils (if not exist).")
+
+# def start_scheduler():
+#     sched = get_scheduler()
+#     if not sched.running:
+#         sched.start()
+#         utils_logger.info("APScheduler started via common_utils.")
+
+# def shutdown_scheduler():
+#     sched = get_scheduler()
+#     if sched.running:
+#         sched.shutdown()
+#         utils_logger.info("APScheduler shutdown via common_utils.")
+
+# (如果决定将数据库和调度器逻辑也合并到这里，请取消注释上面的DB相关部分，
+# 并确保相关的依赖（databases, sqlalchemy, apscheduler, pytz）已添加到项目的 requirements.txt)
     --- END OF FILE CONTENT ---
 
 
@@ -12833,816 +12822,397 @@ Directory: stored_data/rag_interaction_logs/
 Directory: local_agent/
   File: local_agent_app.py
     --- START OF FILE CONTENT ---
-# /home/zhz/zhz_agent/local_agent/local_agent_app.py
+# local_agent_app.py
+import sys
+import os
+import logging
+import traceback
+from typing import Dict, Any, List, Optional, Union
+from xml.etree import ElementTree
 
+# --- Path and DLL setup ---
+print("--- sys.path at the very beginning of local_agent_app.py ---")
+for p in sys.path:
+    print(p)
+print(f"--- os.getcwd() at the very beginning: {os.getcwd()} ---")
+print("-----------------------------------------------------------")
+
+venv_path = os.path.dirname(sys.executable)
+scripts_path = os.path.join(venv_path)
+dlls_path = os.path.join(venv_path, "..", "DLLs")
+
+if os.path.exists(scripts_path) and hasattr(os, 'add_dll_directory'):
+    try:
+        os.add_dll_directory(scripts_path)
+        print(f"INFO: Added to DLL search path: {scripts_path}")
+    except Exception as e_dll_add:
+        print(f"WARN: Could not add {scripts_path} to DLL search path: {e_dll_add}")
+
+if os.path.exists(dlls_path) and hasattr(os, 'add_dll_directory'):
+    try:
+        os.add_dll_directory(dlls_path)
+        print(f"INFO: Added to DLL search path: {dlls_path}")
+    except Exception as e_dll_add:
+        print(f"WARN: Could not add {dlls_path} to DLL search path: {e_dll_add}")
+
+# --- Library Imports and Global Status ---
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
-import pandas as pd # 用于处理 Excel 数据
-from pandasql import PandaSQL # 用于在 Pandas DataFrame 上执行 SQL 查询
-import os
-import logging # 用于日志记录
-import traceback # 用于更详细的错误信息
+from winotify import Notification
 
-# --- [新增] 导入 winotify 用于发送 Windows 桌面通知 ---
-from winotify import Notification #
+# Global variables to store import status and library objects
+_PANDAS_IMPORTED = False
+_PANDASQL_IMPORTED = False
+pd = None
+PandaSQL = None
 
-# --- 配置常量 ---
-LOCAL_AGENT_PORT = 8003 # 本地代理服务监听的端口
-LOG_LEVEL = logging.INFO # 日志级别
+try:
+    import pandas as pd_temp
+    pd = pd_temp
+    logging.info(f"Successfully imported pandas. pd is: {pd}")
+    logging.info(f"pandas version: {pd.__version__}")
+    _PANDAS_IMPORTED = True
+except ImportError as e_pandas_global:
+    logging.critical(f"CRITICAL_IMPORT_ERROR: Failed to import pandas at global scope: {e_pandas_global}", exc_info=True)
+except Exception as e_pandas_other_global:
+    logging.critical(f"CRITICAL_OTHER_ERROR: Error during pandas import or version check: {e_pandas_other_global}", exc_info=True)
 
-# --- 日志配置 ---
-# 配置日志记录器，方便调试和追踪
-logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - LocalAgent - %(message)s') #
-logger = logging.getLogger(__name__) #
+try:
+    from pandasql import PandaSQL as PandaSQL_temp
+    PandaSQL = PandaSQL_temp
+    logging.info(f"Successfully imported PandaSQL. PandaSQL is: {PandaSQL}")
+    _PANDASQL_IMPORTED = True
+except ImportError as e_pandasql_global:
+    logging.warning(f"IMPORT_WARNING: Failed to import pandasql at global scope: {e_pandasql_global}")
+except Exception as e_pandasql_other_global:
+    logging.warning(f"OTHER_IMPORT_WARNING: Error during pandasql import: {e_pandasql_other_global}")
 
-# --- FastAPI 应用实例 ---
+# --- Configuration ---
+LOCAL_AGENT_PORT = 8003
+LOG_LEVEL = logging.INFO
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - LocalAgent - %(message)s')
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
-    title="ZhzAI Local Agent", #
-    description="本地代理程序，提供处理本地文件（如Excel）和执行特定本地任务（如桌面通知）的MCP服务。", #
-    version="0.1.1" # 更新版本号以反映添加了通知功能
+    title="ZhzAI Local Agent",
+    description="本地代理程序，提供处理本地文件和执行特定任务的MCP服务。",
+    version="0.1.1"
 )
 
-# --- Pydantic 模型定义 ---
+# --- Pydantic Model Definitions ---
+class ExecuteSQORequest(BaseModel):
+    sqo: Dict[str, Any] = Field(description="必需。一个结构化查询对象 (SQO) 的JSON字典...")
 
-# 用于 Excel SQO (Structured Query Object) 操作的请求体
-class ExecuteSQORequest(BaseModel): #
-    sqo: Dict[str, Any] = Field(description="必需。一个结构化查询对象 (SQO) 的JSON字典，用于描述要对Excel执行的操作。") #
+class SQOResponse(BaseModel):
+    success: bool
+    result: Any = None
+    error: Optional[str] = None
+    error_details: Optional[str] = None
 
-# Excel SQO 操作的通用响应体
-class SQOResponse(BaseModel): #
-    success: bool # 操作是否成功
-    result: Any = None # 成功时的结果数据
-    error: Optional[str] = None # 失败时的简要错误信息
-    error_details: Optional[str] = None # 失败时的详细技术错误信息或堆栈
+class NotificationRequest(BaseModel):
+    title: str = Field(default="任务提醒", description="通知的标题")
+    message: str = Field(description="通知的主要内容")
+    app_name: str = Field(default="终端大脑助手", description="显示在通知来源的应用名称")
 
-# 用于桌面通知的请求体
-class NotificationRequest(BaseModel): #
-    title: str = Field(default="任务提醒", description="通知的标题") #
-    message: str = Field(description="通知的主要内容") #
-    app_name: str = Field(default="终端大脑助手", description="显示在通知来源的应用名称") #
-    # icon_path: Optional[str] = Field(None, description="通知图标的绝对路径 (可选)") #
+class NotificationResponse(BaseModel):
+    success: bool
+    message: str
 
-# 桌面通知操作的响应体
-class NotificationResponse(BaseModel): #
-    success: bool # 操作是否成功 #
-    message: str # 返回的消息，成功或失败的说明 #
+# --- Filter Helper Function ---
+def apply_filters_to_dataframe(df: 'pd.DataFrame', filters: List[Dict[str, Any]]) -> 'pd.DataFrame':
+    if not filters:
+        return df
+    df_filtered = df.copy()
+    for f_obj in filters:
+        column = f_obj.get("column")
+        operator = f_obj.get("operator")
+        value = f_obj.get("value")
+        is_date = f_obj.get("is_date", False)
 
-# --- 核心功能函数 ---
+        if not all([column, operator, value is not None]):
+            logger.warning(f"Skipping invalid filter object: {f_obj}")
+            continue
 
-def apply_filters_to_dataframe(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame: #
-    """
-    将一系列过滤器应用于 Pandas DataFrame。
-    这是 Excel SQO 操作的核心辅助函数，用于在执行聚合、查询等操作前筛选数据。
-    """
-    if not filters: #
-        return df #
+        if column not in df_filtered.columns:
+            logger.warning(f"Filter column '{column}' not found in DataFrame. Available: {df_filtered.columns.tolist()}. Skipping filter: {f_obj}")
+            continue
 
-    df_filtered = df.copy() #
-    for f_obj in filters: #
-        column = f_obj.get("column") #
-        operator = f_obj.get("operator") #
-        value = f_obj.get("value") #
-        is_date = f_obj.get("is_date", False) #
+        try:
+            series_to_filter = df_filtered[column]
+            if is_date:
+                try:
+                    series_to_filter = pd.to_datetime(series_to_filter, errors='coerce')
+                    filter_value_dt = pd.to_datetime(value, errors='coerce')
+                    if pd.isna(filter_value_dt) and not (isinstance(value, list) and operator in ["in", "is_in_list", "not in", "is_not_in_list"]):
+                        logger.warning(f"Cannot convert filter value '{value}' to date for column '{column}'. Skipping filter.")
+                        continue
+                    value = filter_value_dt
+                except Exception as e_date:
+                    logger.warning(f"Error converting column '{column}' or value '{value}' to datetime: {e_date}. Skipping filter.")
+                    continue
 
-        if not all([column, operator, value is not None]): #
-            logger.warning(f"Skipping invalid filter object: {f_obj}") #
-            continue #
+            condition = None
+            if operator in ["equals", "=="]: condition = (series_to_filter == value)
+            elif operator in ["not_equals", "!="]: condition = (series_to_filter != value)
+            elif operator in ["greater_than", ">"]: condition = (series_to_filter > value)
+            elif operator in ["greater_than_or_equals", ">="]: condition = (series_to_filter >= value)
+            elif operator in ["less_than", "<"]: condition = (series_to_filter < value)
+            elif operator in ["less_than_or_equals", "<="]: condition = (series_to_filter <= value)
+            elif operator == "contains":
+                if is_date: logger.warning(f"'contains' not applicable to date column '{column}'. Skip."); continue
+                condition = (series_to_filter.astype(str).str.contains(str(value), case=False, na=False))
+            elif operator == "not_contains":
+                if is_date: logger.warning(f"'not_contains' not applicable to date column '{column}'. Skip."); continue
+                condition = (~series_to_filter.astype(str).str.contains(str(value), case=False, na=False))
+            elif operator in ["is_in_list", "in"]:
+                if not isinstance(value, list): logger.warning(f"'is_in_list' expects list value for '{column}'. Skip."); continue
+                if is_date:
+                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist()
+                    if not list_value_dt: logger.warning(f"Cannot convert list values to dates for 'is_in_list' on '{column}'. Skip."); continue
+                    condition = (series_to_filter.isin(list_value_dt))
+                else: condition = (series_to_filter.isin(value))
+            elif operator in ["is_not_in_list", "not in"]:
+                if not isinstance(value, list): logger.warning(f"'is_not_in_list' expects list value for '{column}'. Skip."); continue
+                if is_date:
+                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist()
+                    if not list_value_dt: logger.warning(f"Cannot convert list values for 'is_not_in_list' on '{column}'. Skip."); continue
+                    condition = (~series_to_filter.isin(list_value_dt))
+                else: condition = (~series_to_filter.isin(value))
+            elif operator == "between":
+                if not (isinstance(value, list) and len(value) == 2): logger.warning(f"'between' expects list of two values for '{column}'. Skip."); continue
+                val1, val2 = value
+                if is_date:
+                    val1_dt, val2_dt = pd.to_datetime(val1, errors='coerce'), pd.to_datetime(val2, errors='coerce')
+                    if pd.isna(val1_dt) or pd.isna(val2_dt): logger.warning(f"Cannot convert 'between' values to dates for '{column}'. Skip."); continue
+                    condition = (series_to_filter.between(min(val1_dt, val2_dt), max(val1_dt, val2_dt)))
+                else: condition = (series_to_filter.between(min(val1, val2), max(val1, val2)))
+            elif operator in ["is_null", "isnull"]: condition = (series_to_filter.isnull())
+            elif operator in ["is_not_null", "notnull"]: condition = (series_to_filter.notnull())
+            else: logger.warning(f"Unsupported filter operator '{operator}' for column '{column}'. Skipping."); continue
 
-        if column not in df_filtered.columns: #
-            logger.warning(f"Filter column '{column}' not found in DataFrame. Available: {df_filtered.columns.tolist()}. Skipping filter: {f_obj}") #
-            continue #
+            if condition is not None: df_filtered = df_filtered[condition]
+            else: logger.warning(f"Condition was None for filter {f_obj}.")
+        except Exception as e_filter:
+            logger.error(f"Error applying filter {f_obj} on column '{column}': {e_filter}", exc_info=True)
+            continue
+    return df_filtered
 
-        try: #
-            series_to_filter = df_filtered[column] # 操作副本以避免 SettingWithCopyWarning #
-            
-            # 尝试转换日期，如果失败则记录警告并可能跳过
-            if is_date: #
-                try: #
-                    series_to_filter = pd.to_datetime(series_to_filter, errors='coerce') #
-                    filter_value_dt = pd.to_datetime(value, errors='coerce') #
-                    # 如果日期转换失败且操作符不是处理列表的类型（列表值在后面处理）
-                    if pd.isna(filter_value_dt) and not (isinstance(value, list) and operator in ["in", "is_in_list", "not in", "is_not_in_list"]): #
-                        logger.warning(f"Cannot convert filter value '{value}' to date for column '{column}'. Skipping filter.") #
-                        continue #
-                    value = filter_value_dt # 更新 value 为日期对象或 NaT #
-                except Exception as e_date: #
-                    logger.warning(f"Error converting column '{column}' or value '{value}' to datetime: {e_date}. Skipping filter.") #
-                    continue #
-            
-            condition = None #
-            # 根据操作符构建筛选条件
-            if operator == "equals" or operator == "==": #
-                condition = (series_to_filter == value) #
-            elif operator == "not_equals" or operator == "!=": #
-                condition = (series_to_filter != value) #
-            elif operator == "greater_than" or operator == ">": #
-                condition = (series_to_filter > value) #
-            elif operator == "greater_than_or_equals" or operator == ">=": #
-                condition = (series_to_filter >= value) #
-            elif operator == "less_than" or operator == "<": #
-                condition = (series_to_filter < value) #
-            elif operator == "less_than_or_equals" or operator == "<=": #
-                condition = (series_to_filter <= value) #
-            elif operator == "contains": #
-                if is_date: #
-                    logger.warning(f"'contains' operator is not directly applicable to date column '{column}'. Skipping filter.") #
-                    continue #
-                condition = (series_to_filter.astype(str).str.contains(str(value), case=False, na=False)) #
-            elif operator == "not_contains": #
-                if is_date: #
-                    logger.warning(f"'not_contains' operator is not directly applicable to date column '{column}'. Skipping filter.") #
-                    continue #
-                condition = (~series_to_filter.astype(str).str.contains(str(value), case=False, na=False)) #
-            elif operator == "is_in_list" or operator == "in": #
-                if not isinstance(value, list): #
-                    logger.warning(f"'is_in_list' operator expects a list value for column '{column}'. Skipping filter.") #
-                    continue #
-                if is_date: #
-                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist() #
-                    if not list_value_dt: #
-                        logger.warning(f"Cannot convert list values to dates for 'is_in_list' on column '{column}'. Skipping filter.") #
-                        continue #
-                    condition = (series_to_filter.isin(list_value_dt)) #
-                else: #
-                    condition = (series_to_filter.isin(value)) #
-            elif operator == "is_not_in_list" or operator == "not in": #
-                if not isinstance(value, list): #
-                    logger.warning(f"'is_not_in_list' operator expects a list value for column '{column}'. Skipping filter.") #
-                    continue #
-                if is_date: #
-                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist() #
-                    if not list_value_dt: #
-                         logger.warning(f"Cannot convert list values to dates for 'is_not_in_list' on column '{column}'. Skipping filter.") #
-                         continue #
-                    condition = (~series_to_filter.isin(list_value_dt)) #
-                else: #
-                    condition = (~series_to_filter.isin(value)) #
-            elif operator == "between": #
-                if not (isinstance(value, list) and len(value) == 2): #
-                    logger.warning(f"'between' operator expects a list of two values for column '{column}'. Skipping filter.") #
-                    continue #
-                val1, val2 = value #
-                if is_date: #
-                    val1_dt = pd.to_datetime(val1, errors='coerce') #
-                    val2_dt = pd.to_datetime(val2, errors='coerce') #
-                    if pd.isna(val1_dt) or pd.isna(val2_dt): #
-                        logger.warning(f"Cannot convert 'between' values to dates for column '{column}'. Skipping filter.") #
-                        continue #
-                    condition = (series_to_filter.between(min(val1_dt, val2_dt), max(val1_dt, val2_dt))) #
-                else: #
-                    condition = (series_to_filter.between(min(val1, val2), max(val1, val2))) #
-            elif operator == "is_null" or operator == "isnull": #
-                condition = (series_to_filter.isnull()) #
-            elif operator == "is_not_null" or operator == "notnull": #
-                condition = (series_to_filter.notnull()) #
-            else: #
-                logger.warning(f"Unsupported filter operator '{operator}' for column '{column}'. Skipping filter.") #
-                continue # 跳过不支持的操作符 #
+# --- API Endpoints ---
+@app.post("/notify", response_model=NotificationResponse)
+async def send_desktop_notification(req: NotificationRequest):
+    logger.info(f"Received notification request: Title='{req.title}', Message='{req.message}'")
+    try:
+        toast = Notification(app_id=req.app_name, title=req.title, msg=req.message)
+        toast.show()
+        logger.info(f"Desktop notification successfully shown: '{req.title}'")
+        return NotificationResponse(success=True, message="Notification successfully shown.")
+    except Exception as e:
+        logger.error(f"Failed to show desktop notification: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to show notification: {str(e)}")
 
-            if condition is not None: #
-                 df_filtered = df_filtered[condition] #
-            else: #
-                logger.warning(f"Condition was None for filter {f_obj}. This should not happen if operator is supported.") #
+@app.post("/excel_sqo_mcp/execute_operation", response_model=SQOResponse)
+async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
+    # Check global import status at the beginning
+    if not _PANDAS_IMPORTED:
+        logger.critical("Pandas (pd) was not imported successfully at global scope.")
+        return SQOResponse(success=False, error="内部服务器错误：Pandas库未能加载。", error_details="Pandas (pd) is None or import failed at startup.")
 
-        except Exception as e_filter: #
-            logger.error(f"Error applying filter {f_obj} on column '{column}': {e_filter}", exc_info=True) #
-            # 根据策略，可以选择跳过此过滤器或在此处引发异常/返回错误
-            # 为保持流程继续，我们选择跳过错误的过滤器
-            continue #
-            
-    return df_filtered #
+    sqo = request_data.sqo
+    operation_type = sqo.get("operation_type")
+    file_path_from_sqo = sqo.get("file_path")
+    sheet_name_from_sqo = sqo.get("sheet_name", 0)
 
-# --- FastAPI 端点 ---
+    # Check for PandaSQL only when the specific operation requires it
+    if operation_type == "direct_sql_query" and not _PANDASQL_IMPORTED:
+        logger.critical("PandaSQL was not imported successfully at global scope and is required for 'direct_sql_query' operation.")
+        return SQOResponse(success=False, error="内部服务器错误：PandaSQL库未能加载，无法执行direct_sql_query。", error_details="PandaSQL import failed at startup.")
 
-@app.post("/notify", response_model=NotificationResponse) #
-async def send_desktop_notification(req: NotificationRequest): #
-    """
-    接收通知请求并在 Windows 桌面上显示一个通知。
-    """
-    logger.info(f"Received notification request: Title='{req.title}', Message='{req.message}'") #
-    try: #
-        toast = Notification( #
-            app_id=req.app_name, #
-            title=req.title, #
-            msg=req.message, #
-            # duration="long", # 可选 #
-            # icon=req.icon_path if req.icon_path and os.path.exists(req.icon_path) else "" # 可选 #
-        )
-        toast.show() #
+    logger.info(f"Received SQO request: operation='{operation_type}', original_file_path='{file_path_from_sqo}', sheet='{sheet_name_from_sqo}'")
+    logger.debug(f"Full SQO received: {sqo}")
+
+    if not file_path_from_sqo or not operation_type:
+        logger.error("SQO missing 'file_path' or 'operation_type'.")
+        return SQOResponse(success=False, error="SQO中缺少 'file_path' 或 'operation_type' 参数。")
+
+    effective_file_path = file_path_from_sqo
+    if not os.path.isabs(effective_file_path):
+        logger.warning(f"Received file path '{effective_file_path}' is not absolute.")
+    
+    if not os.path.exists(effective_file_path):
+        path_alt_forward_slash = file_path_from_sqo.replace("\\", "/")
+        if os.path.exists(path_alt_forward_slash):
+            effective_file_path = path_alt_forward_slash
+        else:
+            logger.error(f"Excel file not found at path: '{file_path_from_sqo}' (and alternative '{path_alt_forward_slash}' also not found).")
+            return SQOResponse(success=False, error=f"Excel文件在路径 '{file_path_from_sqo}' 未找到。")
+
+    logger.info(f"Effective file path for pandas: '{effective_file_path}'")
+
+    df = None  # Initialize df
+    try:
+        # --- 修改开始：明确指定工作表名称 ---
+        # 假设您的第一个工作表名为 "Sheet1" (这是Excel的默认值)
+        # 请根据您实际的Excel文件中的工作表名称进行修改
+        actual_sheet_to_read: Union[str, int] = "Sheet1" 
         
-        logger.info(f"Desktop notification successfully shown: '{req.title}'") #
-        return NotificationResponse(success=True, message="Notification successfully shown.") #
-    except Exception as e: #
-        logger.error(f"Failed to show desktop notification: {e}", exc_info=True) #
-        raise HTTPException(status_code=500, detail=f"Failed to show notification: {str(e)}") #
-
-
-@app.post("/excel_sqo_mcp/execute_operation", response_model=SQOResponse) #
-async def execute_excel_sqo_operation(request_data: ExecuteSQORequest): #
-    """
-    执行 Excel 结构化查询对象 (SQO) 操作。
-    这个端点负责根据传入的 SQO 对指定的 Excel 文件进行数据读取、筛选、聚合等操作。
-    """
-    sqo = request_data.sqo #
-    operation_type = sqo.get("operation_type") #
-    file_path = sqo.get("file_path") #
-    sheet_name = sqo.get("sheet_name", 0) # 默认为第一个工作表 #
-
-    logger.info(f"Received SQO request: operation='{operation_type}', file='{file_path}', sheet='{sheet_name}'") #
-    logger.debug(f"Full SQO received: {sqo}") #
-
-    if not file_path or not operation_type: #
-        logger.error("SQO missing 'file_path' or 'operation_type'.") #
-        return SQOResponse(success=False, error="SQO中缺少 'file_path' 或 'operation_type' 参数。") #
-
-    # 安全性提示：在生产环境中，需要对 file_path 进行严格校验，防止路径遍历等安全风险。
-    # 例如，限制只能访问特定目录下的文件。
-    if not os.path.exists(file_path): #
-        logger.error(f"Excel file not found: {file_path}") #
-        return SQOResponse(success=False, error=f"Excel文件未找到 '{file_path}'") #
-
-    try: #
-        # 读取 Excel 文件到 Pandas DataFrame
-        df = pd.read_excel(file_path, sheet_name=sheet_name) #
-        logger.info(f"Successfully loaded DataFrame. Shape: {df.shape}, Columns: {df.columns.tolist()}") #
-
-        result_data = None #
-
-        # --- 根据操作类型执行不同逻辑 ---
-
-        if operation_type == "get_unique_values": #
-            column_name = sqo.get("column_name") #
-            if not column_name or column_name not in df.columns: #
-                error_msg = f"'get_unique_values' 操作缺少有效 'column_name' 或列 '{column_name}' 不存在。可用列: {df.columns.tolist()}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            df_to_process = df.copy() #
-            filters_from_sqo = sqo.get("filters") #
-            if filters_from_sqo and isinstance(filters_from_sqo, list): #
-                logger.info(f"Applying filters for get_unique_values: {filters_from_sqo}") #
-                df_to_process = apply_filters_to_dataframe(df_to_process, filters_from_sqo) #
-                logger.info(f"DataFrame shape after filtering for get_unique_values: {df_to_process.shape}") #
-
-            unique_values_series = df_to_process[column_name].unique() #
-            if sqo.get('options', {}).get('drop_na', False): # 默认为 False #
-                unique_values = pd.Series(unique_values_series).dropna().tolist() #
-            else: #
-                unique_values = unique_values_series.tolist() #
-            result_data = unique_values #
-
-        elif operation_type == "group_by_aggregate": #
-            group_by_cols = sqo.get("group_by_columns") #
-            agg_col = sqo.get("aggregation_column") #
-            agg_func = sqo.get("aggregation_function") #
-            if not (group_by_cols and agg_col and agg_func): #
-                error_msg = "'group_by_aggregate' 操作缺少 'group_by_columns', 'aggregation_column', 或 'aggregation_function' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            columns_to_check = [] #
-            if isinstance(group_by_cols, list): columns_to_check.extend(group_by_cols) #
-            elif isinstance(group_by_cols, str): columns_to_check.append(group_by_cols) #
-            if agg_col: columns_to_check.append(agg_col) #
-            for col in columns_to_check: #
-                if col not in df.columns: #
-                    error_msg = f"列 '{col}' 在Excel中未找到。可用列: {df.columns.tolist()}" #
-                    logger.error(error_msg) #
-                    return SQOResponse(success=False, error=error_msg) #
-            
-            df_to_group = df.copy() #
-            filters_from_sqo = sqo.get("filters") #
-            if filters_from_sqo and isinstance(filters_from_sqo, list): #
-                logger.info(f"Applying filters for group_by_aggregate: {filters_from_sqo}") #
-                df_to_group = apply_filters_to_dataframe(df_to_group, filters_from_sqo) #
-                logger.info(f"DataFrame shape after filtering: {df_to_group.shape}") #
-            elif "filters" in sqo and sqo["filters"]: #
-                 logger.warning(f"SQO中的 'filters' 字段格式不正确（期望列表），将被忽略。Filters: {sqo['filters']}") #
-
-            grouped_data = df_to_group.groupby(group_by_cols)[agg_col].agg(agg_func) #
-            output_col_name = sqo.get('options', {}).get('output_column_name') #
-            if output_col_name: #
-                if isinstance(grouped_data, pd.Series): grouped_data = grouped_data.rename(output_col_name) #
-                elif isinstance(grouped_data, pd.DataFrame) and len(grouped_data.columns)==1: grouped_data.columns = [output_col_name] #
-            result_data = grouped_data.reset_index().to_dict(orient='records') #
-
-        elif operation_type == "find_top_n_rows": #
-            select_columns = sqo.get("select_columns") #
-            condition_col = sqo.get("condition_column") #
-            sort_order_str = sqo.get("sort_order", "descending").lower() #
-            n_rows_param = sqo.get("n_rows", 1) # 使用 n_rows_param 避免与内置名称冲突 #
-            if not (select_columns and condition_col): #
-                error_msg = "'find_top_n_rows' 操作缺少 'select_columns' 或 'condition_column' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            columns_to_check_top_n = [] # 使用不同变量名以避免作用域问题 #
-            if isinstance(select_columns, list): columns_to_check_top_n.extend(select_columns) #
-            elif isinstance(select_columns, str): columns_to_check_top_n.append(select_columns) #
-            if condition_col: columns_to_check_top_n.append(condition_col) #
-            for col_top_n in columns_to_check_top_n: # 使用不同迭代变量 #
-                 if col_top_n not in df.columns: #
-                    error_msg = f"列 '{col_top_n}' 在Excel中未找到。可用列: {df.columns.tolist()}" #
-                    logger.error(error_msg) #
-                    return SQOResponse(success=False, error=error_msg) #
-
-            if sort_order_str not in ['ascending', 'descending']: #
-                error_msg = f"无效的 sort_order: {sort_order_str}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            if not isinstance(n_rows_param, int) or n_rows_param <= 0: #
-                error_msg = f"n_rows 必须是正整数，但收到: {n_rows_param}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-
-            df_to_sort = df.copy() #
-            filters_from_sqo_top_n = sqo.get("filters") # 使用不同变量名 #
-            if filters_from_sqo_top_n and isinstance(filters_from_sqo_top_n, list): #
-                logger.info(f"Applying filters for find_top_n_rows: {filters_from_sqo_top_n}") #
-                df_to_sort = apply_filters_to_dataframe(df_to_sort, filters_from_sqo_top_n) #
-                logger.info(f"DataFrame shape after filtering: {df_to_sort.shape}") #
-            elif "filters" in sqo and sqo["filters"]: #
-                 logger.warning(f"SQO中的 'filters' 字段格式不正确（期望列表），将被忽略。Filters: {sqo['filters']}") #
-            
-            ascending_order = True if sort_order_str == 'ascending' else False #
-            sorted_df = df_to_sort.sort_values(by=condition_col, ascending=ascending_order) #
-            result_df = sorted_df.head(n_rows_param) # 使用 n_rows_param #
-            result_data = result_df[select_columns].to_dict(orient='records') #
+        # 如果SQO中明确指定了sheet_name，并且不是默认的0，则优先使用SQO中的
+        if sheet_name_from_sqo != 0: # 0是我们之前的默认值，表示尝试第一个
+            actual_sheet_to_read = sheet_name_from_sqo
         
-        elif operation_type == "direct_sql_query": #
-            sql_query_from_sqo = sqo.get("sql_query") #
-            if not sql_query_from_sqo: #
-                error_msg = "'direct_sql_query' 操作缺少 'sql_query' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            pdsql = PandaSQL(persist=False) #
-            logger.debug(f"Executing direct_sql_query: {sql_query_from_sqo} on columns: {df.columns.tolist()}") #
-            # 在执行SQL之前，对DataFrame应用过滤器（如果提供了）
-            df_for_sql = df.copy() #
-            filters_for_sql = sqo.get("filters") #
-            if filters_for_sql and isinstance(filters_for_sql, list): #
-                logger.info(f"Applying filters before direct_sql_query: {filters_for_sql}") #
-                df_for_sql = apply_filters_to_dataframe(df_for_sql, filters_for_sql) #
-                logger.info(f"DataFrame shape after filtering for direct_sql_query: {df_for_sql.shape}") #
+        logger.info(f"Attempting to read Excel sheet: '{actual_sheet_to_read}' from file: '{effective_file_path}'")
+        df = pd.read_excel(effective_file_path, sheet_name=actual_sheet_to_read)
+        # --- 修改结束 ---
+        logger.info(f"Successfully loaded DataFrame from '{effective_file_path}'. Shape: {df.shape}, Columns: {df.columns.tolist()}")
+        result_data = None
 
-            query_result_df = pdsql(sql_query_from_sqo, env={'df': df_for_sql}) # 在过滤后的df上执行 #
-            
-            if query_result_df is None: #
-                result_data = "SQL查询成功执行，但没有返回数据。" #
-            elif query_result_df.empty: #
-                result_data = "SQL查询成功执行，但未找到符合条件的数据。" #
-            else: #
-                result_list_of_dicts = query_result_df.to_dict(orient='records') #
-                if len(result_list_of_dicts) == 1: #
-                    if len(result_list_of_dicts[0]) == 1: result_data = list(result_list_of_dicts[0].values())[0] #
-                    else: result_data = result_list_of_dicts[0] #
-                else: #
-                    if result_list_of_dicts and len(result_list_of_dicts[0]) == 1: # 添加检查 result_list_of_dicts 是否为空 #
-                        single_col_name = list(result_list_of_dicts[0].keys())[0] #
-                        result_data = [row[single_col_name] for row in result_list_of_dicts] #
-                    else: result_data = result_list_of_dicts #
-        else: #
-            error_msg = f"不支持的操作类型 '{operation_type}'。" #
-            logger.error(error_msg) #
-            return SQOResponse(success=False, error=error_msg) #
+        # --- Operation Type Handling ---
+        if operation_type == "get_unique_values":
+            logger.info(f"Executing 'get_unique_values' for SQO: {sqo}")
+            column_name = sqo.get("column_name")
+            if not column_name or column_name not in df.columns:
+                error_msg = f"'get_unique_values' 操作缺少有效 'column_name' 或列 '{column_name}' 不存在。可用列: {df.columns.tolist()}"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            df_to_process = df.copy()
+            filters_from_sqo = sqo.get("filters")
+            if filters_from_sqo and isinstance(filters_from_sqo, list):
+                df_to_process = apply_filters_to_dataframe(df_to_process, filters_from_sqo)
+            unique_values_series = df_to_process[column_name].unique()
+            if sqo.get('options', {}).get('drop_na', False):
+                unique_values = pd.Series(unique_values_series).dropna().tolist()
+            else:
+                unique_values = unique_values_series.tolist()
+            result_data = unique_values
 
-        logger.info(f"SQO operation '{operation_type}' executed successfully.") #
-        return SQOResponse(success=True, result=result_data) #
+        elif operation_type == "group_by_aggregate":
+            logger.info(f"Executing 'group_by_aggregate' for SQO: {sqo}")
+            group_by_cols = sqo.get("group_by_columns")
+            agg_col = sqo.get("aggregation_column")
+            agg_func = sqo.get("aggregation_function")
+            if not (group_by_cols and agg_col and agg_func):
+                error_msg = "'group_by_aggregate' 操作缺少 'group_by_columns', 'aggregation_column', 或 'aggregation_function' 参数。"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            columns_to_check = []
+            if isinstance(group_by_cols, list): columns_to_check.extend(group_by_cols)
+            elif isinstance(group_by_cols, str): columns_to_check.append(group_by_cols)
+            if agg_col: columns_to_check.append(agg_col)
+            for col_check in columns_to_check:
+                if col_check not in df.columns:
+                    error_msg = f"列 '{col_check}' 在Excel中未找到。可用列: {df.columns.tolist()}"
+                    logger.error(error_msg)
+                    return SQOResponse(success=False, error=error_msg)
+            df_to_group = df.copy()
+            filters_from_sqo_group = sqo.get("filters")
+            if filters_from_sqo_group and isinstance(filters_from_sqo_group, list):
+                df_to_group = apply_filters_to_dataframe(df_to_group, filters_from_sqo_group)
+            grouped_data = df_to_group.groupby(group_by_cols)[agg_col].agg(agg_func)
+            output_col_name = sqo.get('options', {}).get('output_column_name')
+            if output_col_name:
+                if isinstance(grouped_data, pd.Series): grouped_data = grouped_data.rename(output_col_name)
+                elif isinstance(grouped_data, pd.DataFrame) and len(grouped_data.columns)==1: grouped_data.columns = [output_col_name]
+            result_data = grouped_data.reset_index().to_dict(orient='records')
 
-    except ImportError: #
-        logger.critical("Pandas或PandaSQL未正确安装。") #
-        return SQOResponse(success=False, error="执行Excel查询所需的库 (Pandas/PandaSQL) 未安装。", error_details=traceback.format_exc()) #
-    except FileNotFoundError as e_fnf: # 更具体的异常捕获 #
-        logger.error(f"File not found during operation: {e_fnf}", exc_info=True) #
-        return SQOResponse(success=False, error=str(e_fnf), error_details=traceback.format_exc()) #
-    except pd.errors.EmptyDataError as e_empty: #
-        logger.error(f"Pandas EmptyDataError for file {file_path}, sheet {sheet_name}: {e_empty}", exc_info=True) #
-        return SQOResponse(success=False, error=f"无法读取Excel文件 '{os.path.basename(file_path)}' (工作表: {sheet_name})，文件可能为空或格式不正确。", error_details=traceback.format_exc()) #
-    except KeyError as e_key: # 捕获列名不存在等错误 #
-        logger.error(f"KeyError during operation '{operation_type}': {e_key}. SQO: {sqo}", exc_info=True) #
-        return SQOResponse(success=False, error=f"操作失败：列名 '{str(e_key)}' 可能不存在或不正确。请检查SQO参数和Excel列名。可用列: {df.columns.tolist() if 'df' in locals() else '未知'}", error_details=traceback.format_exc()) #
-    except Exception as e: #
-        error_message = f"执行SQO操作 '{operation_type}' 时发生内部错误: {type(e).__name__} - {str(e)}" #
-        logger.error(error_message, exc_info=True) #
-        return SQOResponse(success=False, error=error_message, error_details=traceback.format_exc()) #
+        elif operation_type == "find_top_n_rows":
+            logger.info(f"Executing 'find_top_n_rows' for SQO: {sqo}")
+            select_columns = sqo.get("select_columns")
+            condition_col = sqo.get("condition_column")
+            sort_order_str = sqo.get("sort_order", "descending").lower()
+            n_rows_param = sqo.get("n_rows", 1)
+            if not (select_columns and condition_col):
+                error_msg = "'find_top_n_rows' 操作缺少 'select_columns' 或 'condition_column' 参数。"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            columns_to_check_top = []
+            if isinstance(select_columns, list): columns_to_check_top.extend(select_columns)
+            elif isinstance(select_columns, str): columns_to_check_top.append(select_columns)
+            if condition_col: columns_to_check_top.append(condition_col)
+            for col_check_top in columns_to_check_top:
+                 if col_check_top not in df.columns:
+                    error_msg = f"列 '{col_check_top}' 在Excel中未找到。可用列: {df.columns.tolist()}"
+                    logger.error(error_msg)
+                    return SQOResponse(success=False, error=error_msg)
+            if sort_order_str not in ['ascending', 'descending']:
+                error_msg = f"无效的 sort_order: {sort_order_str}"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            if not isinstance(n_rows_param, int) or n_rows_param <= 0:
+                error_msg = f"n_rows 必须是正整数，但收到: {n_rows_param}"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            df_to_sort = df.copy()
+            filters_from_sqo_sort = sqo.get("filters")
+            if filters_from_sqo_sort and isinstance(filters_from_sqo_sort, list):
+                df_to_sort = apply_filters_to_dataframe(df_to_sort, filters_from_sqo_sort)
+            ascending_order = True if sort_order_str == 'ascending' else False
+            sorted_df = df_to_sort.sort_values(by=condition_col, ascending=ascending_order)
+            result_df = sorted_df.head(n_rows_param)
+            result_data = result_df[select_columns].to_dict(orient='records')
 
+        elif operation_type == "direct_sql_query":
+            logger.info(f"Executing 'direct_sql_query' for SQO: {sqo}")
+            sql_query_from_sqo = sqo.get("sql_query")
+            if not sql_query_from_sqo:
+                error_msg = "'direct_sql_query' 操作缺少 'sql_query' 参数。"
+                logger.error(error_msg)
+                return SQOResponse(success=False, error=error_msg)
+            if not _PANDASQL_IMPORTED: # Double-check
+                 logger.critical("PandaSQL is required for 'direct_sql_query' but was not imported.")
+                 return SQOResponse(success=False, error="内部服务器错误：PandaSQL库未能加载。", error_details="PandaSQL is None for direct_sql_query.")
+            pdsql = PandaSQL(persist=False)
+            logger.debug(f"Executing direct_sql_query: {sql_query_from_sqo} on columns: {df.columns.tolist()}")
+            df_for_sql = df.copy()
+            filters_from_sqo_sql = sqo.get("filters")
+            if filters_from_sqo_sql and isinstance(filters_from_sqo_sql, list):
+                df_for_sql = apply_filters_to_dataframe(df_for_sql, filters_from_sqo_sql)
+            query_result_df = pdsql(sql_query_from_sqo, env={'df': df_for_sql})
+            if query_result_df is None: result_data = "SQL查询成功执行，但没有返回数据。"
+            elif query_result_df.empty: result_data = "SQL查询成功执行，但未找到符合条件的数据。"
+            else:
+                result_list_of_dicts = query_result_df.to_dict(orient='records')
+                if len(result_list_of_dicts) == 1:
+                    if len(result_list_of_dicts[0]) == 1: result_data = list(result_list_of_dicts[0].values())[0]
+                    else: result_data = result_list_of_dicts[0]
+                else:
+                    if result_list_of_dicts and len(result_list_of_dicts[0]) == 1:
+                        single_col_name = list(result_list_of_dicts[0].keys())[0]
+                        result_data = [row[single_col_name] for row in result_list_of_dicts]
+                    else: result_data = result_list_of_dicts
+        else:
+            logger.error(f"Unsupported operation_type '{operation_type}' received. SQO: {sqo}") # <--- 添加日志
+            error_msg = f"不支持的操作类型 '{operation_type}'。"
+            logger.error(error_msg + f" Received SQO: {sqo}")
+            return SQOResponse(success=False, error=error_msg, error_details=f"local_agent_app.py 未实现对 operation_type '{operation_type}' 的处理。")
 
-# --- 用于本地直接运行测试此本地代理服务 ---
-if __name__ == "__main__": #
-    import uvicorn #
-    logger.info(f"Starting Local Agent server on http://0.0.0.0:{LOCAL_AGENT_PORT}") #
-    uvicorn.run("local_agent_app:app", host="0.0.0.0", port=LOCAL_AGENT_PORT, reload=True) # 添加 reload=True #
+        logger.info(f"SQO operation '{operation_type}' executed successfully.")
+        return SQOResponse(success=True, result=result_data)
 
+    except FileNotFoundError as e_fnf:
+        logger.error(f"FileNotFoundError during pandas operation for file '{effective_file_path}': {e_fnf}", exc_info=True)
+        return SQOResponse(success=False, error=f"Pandas操作时未找到文件: '{effective_file_path}'. 错误: {str(e_fnf)}", error_details=traceback.format_exc())
+    except ElementTree.ParseError as e_xml:
+        logger.error(f"XML ParseError reading Excel file '{effective_file_path}': {e_xml}", exc_info=True)
+        return SQOResponse(success=False, error=f"读取Excel文件 '{os.path.basename(effective_file_path)}' 失败：文件格式错误或已损坏 (XML解析错误)。", error_details=traceback.format_exc())
+    except pd.errors.EmptyDataError as e_empty:
+        logger.error(f"Pandas EmptyDataError for file {effective_file_path}, sheet {sheet_name_from_sqo}: {e_empty}", exc_info=True)
+        return SQOResponse(success=False, error=f"无法读取Excel文件 '{os.path.basename(effective_file_path)}' (工作表: {sheet_name_from_sqo})，文件可能为空或格式不正确。", error_details=traceback.format_exc())
+    except KeyError as e_key:
+        available_cols_str = df.columns.tolist() if df is not None and isinstance(df, pd.DataFrame) else '未知 (DataFrame未成功加载)'
+        logger.error(f"KeyError during operation '{operation_type}': {e_key}. SQO: {sqo}", exc_info=True)
+        return SQOResponse(success=False, error=f"操作失败：列名 '{str(e_key)}' 可能不存在或不正确。请检查SQO参数和Excel列名。可用列: {available_cols_str}", error_details=traceback.format_exc())
+    except Exception as e:
+        error_message = f"执行SQO操作 '{operation_type}' 时发生内部错误: {type(e).__name__} - {str(e)}"
+        logger.error(error_message, exc_info=True)
+        return SQOResponse(success=False, error=error_message, error_details=traceback.format_exc())
+
+# --- Main execution block ---
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Local Agent server on http://0.0.0.0:{LOCAL_AGENT_PORT}")
+    uvicorn.run("local_agent_app:app", host="0.0.0.0", port=LOCAL_AGENT_PORT, reload=True)
     --- END OF FILE CONTENT ---
 
-  File: local_agent_app.py.txt
-    --- START OF FILE CONTENT ---
-# /home/zhz/zhz_agent/local_agent/local_agent_app.py
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
-import pandas as pd # 用于处理 Excel 数据
-from pandasql import PandaSQL # 用于在 Pandas DataFrame 上执行 SQL 查询
-import os
-import logging # 用于日志记录
-import traceback # 用于更详细的错误信息
-
-# --- [新增] 导入 winotify 用于发送 Windows 桌面通知 ---
-from winotify import Notification #
-
-# --- 配置常量 ---
-LOCAL_AGENT_PORT = 8003 # 本地代理服务监听的端口
-LOG_LEVEL = logging.INFO # 日志级别
-
-# --- 日志配置 ---
-# 配置日志记录器，方便调试和追踪
-logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - LocalAgent - %(message)s') #
-logger = logging.getLogger(__name__) #
-
-# --- FastAPI 应用实例 ---
-app = FastAPI(
-    title="ZhzAI Local Agent", #
-    description="本地代理程序，提供处理本地文件（如Excel）和执行特定本地任务（如桌面通知）的MCP服务。", #
-    version="0.1.1" # 更新版本号以反映添加了通知功能
-)
-
-# --- Pydantic 模型定义 ---
-
-# 用于 Excel SQO (Structured Query Object) 操作的请求体
-class ExecuteSQORequest(BaseModel): #
-    sqo: Dict[str, Any] = Field(description="必需。一个结构化查询对象 (SQO) 的JSON字典，用于描述要对Excel执行的操作。") #
-
-# Excel SQO 操作的通用响应体
-class SQOResponse(BaseModel): #
-    success: bool # 操作是否成功
-    result: Any = None # 成功时的结果数据
-    error: Optional[str] = None # 失败时的简要错误信息
-    error_details: Optional[str] = None # 失败时的详细技术错误信息或堆栈
-
-# 用于桌面通知的请求体
-class NotificationRequest(BaseModel): #
-    title: str = Field(default="任务提醒", description="通知的标题") #
-    message: str = Field(description="通知的主要内容") #
-    app_name: str = Field(default="终端大脑助手", description="显示在通知来源的应用名称") #
-    # icon_path: Optional[str] = Field(None, description="通知图标的绝对路径 (可选)") #
-
-# 桌面通知操作的响应体
-class NotificationResponse(BaseModel): #
-    success: bool # 操作是否成功 #
-    message: str # 返回的消息，成功或失败的说明 #
-
-# --- 核心功能函数 ---
-
-def apply_filters_to_dataframe(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame: #
-    """
-    将一系列过滤器应用于 Pandas DataFrame。
-    这是 Excel SQO 操作的核心辅助函数，用于在执行聚合、查询等操作前筛选数据。
-    """
-    if not filters: #
-        return df #
-
-    df_filtered = df.copy() #
-    for f_obj in filters: #
-        column = f_obj.get("column") #
-        operator = f_obj.get("operator") #
-        value = f_obj.get("value") #
-        is_date = f_obj.get("is_date", False) #
-
-        if not all([column, operator, value is not None]): #
-            logger.warning(f"Skipping invalid filter object: {f_obj}") #
-            continue #
-
-        if column not in df_filtered.columns: #
-            logger.warning(f"Filter column '{column}' not found in DataFrame. Available: {df_filtered.columns.tolist()}. Skipping filter: {f_obj}") #
-            continue #
-
-        try: #
-            series_to_filter = df_filtered[column] # 操作副本以避免 SettingWithCopyWarning #
-            
-            # 尝试转换日期，如果失败则记录警告并可能跳过
-            if is_date: #
-                try: #
-                    series_to_filter = pd.to_datetime(series_to_filter, errors='coerce') #
-                    filter_value_dt = pd.to_datetime(value, errors='coerce') #
-                    # 如果日期转换失败且操作符不是处理列表的类型（列表值在后面处理）
-                    if pd.isna(filter_value_dt) and not (isinstance(value, list) and operator in ["in", "is_in_list", "not in", "is_not_in_list"]): #
-                        logger.warning(f"Cannot convert filter value '{value}' to date for column '{column}'. Skipping filter.") #
-                        continue #
-                    value = filter_value_dt # 更新 value 为日期对象或 NaT #
-                except Exception as e_date: #
-                    logger.warning(f"Error converting column '{column}' or value '{value}' to datetime: {e_date}. Skipping filter.") #
-                    continue #
-            
-            condition = None #
-            # 根据操作符构建筛选条件
-            if operator == "equals" or operator == "==": #
-                condition = (series_to_filter == value) #
-            elif operator == "not_equals" or operator == "!=": #
-                condition = (series_to_filter != value) #
-            elif operator == "greater_than" or operator == ">": #
-                condition = (series_to_filter > value) #
-            elif operator == "greater_than_or_equals" or operator == ">=": #
-                condition = (series_to_filter >= value) #
-            elif operator == "less_than" or operator == "<": #
-                condition = (series_to_filter < value) #
-            elif operator == "less_than_or_equals" or operator == "<=": #
-                condition = (series_to_filter <= value) #
-            elif operator == "contains": #
-                if is_date: #
-                    logger.warning(f"'contains' operator is not directly applicable to date column '{column}'. Skipping filter.") #
-                    continue #
-                condition = (series_to_filter.astype(str).str.contains(str(value), case=False, na=False)) #
-            elif operator == "not_contains": #
-                if is_date: #
-                    logger.warning(f"'not_contains' operator is not directly applicable to date column '{column}'. Skipping filter.") #
-                    continue #
-                condition = (~series_to_filter.astype(str).str.contains(str(value), case=False, na=False)) #
-            elif operator == "is_in_list" or operator == "in": #
-                if not isinstance(value, list): #
-                    logger.warning(f"'is_in_list' operator expects a list value for column '{column}'. Skipping filter.") #
-                    continue #
-                if is_date: #
-                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist() #
-                    if not list_value_dt: #
-                        logger.warning(f"Cannot convert list values to dates for 'is_in_list' on column '{column}'. Skipping filter.") #
-                        continue #
-                    condition = (series_to_filter.isin(list_value_dt)) #
-                else: #
-                    condition = (series_to_filter.isin(value)) #
-            elif operator == "is_not_in_list" or operator == "not in": #
-                if not isinstance(value, list): #
-                    logger.warning(f"'is_not_in_list' operator expects a list value for column '{column}'. Skipping filter.") #
-                    continue #
-                if is_date: #
-                    list_value_dt = pd.to_datetime(value, errors='coerce').dropna().tolist() #
-                    if not list_value_dt: #
-                         logger.warning(f"Cannot convert list values to dates for 'is_not_in_list' on column '{column}'. Skipping filter.") #
-                         continue #
-                    condition = (~series_to_filter.isin(list_value_dt)) #
-                else: #
-                    condition = (~series_to_filter.isin(value)) #
-            elif operator == "between": #
-                if not (isinstance(value, list) and len(value) == 2): #
-                    logger.warning(f"'between' operator expects a list of two values for column '{column}'. Skipping filter.") #
-                    continue #
-                val1, val2 = value #
-                if is_date: #
-                    val1_dt = pd.to_datetime(val1, errors='coerce') #
-                    val2_dt = pd.to_datetime(val2, errors='coerce') #
-                    if pd.isna(val1_dt) or pd.isna(val2_dt): #
-                        logger.warning(f"Cannot convert 'between' values to dates for column '{column}'. Skipping filter.") #
-                        continue #
-                    condition = (series_to_filter.between(min(val1_dt, val2_dt), max(val1_dt, val2_dt))) #
-                else: #
-                    condition = (series_to_filter.between(min(val1, val2), max(val1, val2))) #
-            elif operator == "is_null" or operator == "isnull": #
-                condition = (series_to_filter.isnull()) #
-            elif operator == "is_not_null" or operator == "notnull": #
-                condition = (series_to_filter.notnull()) #
-            else: #
-                logger.warning(f"Unsupported filter operator '{operator}' for column '{column}'. Skipping filter.") #
-                continue # 跳过不支持的操作符 #
-
-            if condition is not None: #
-                 df_filtered = df_filtered[condition] #
-            else: #
-                logger.warning(f"Condition was None for filter {f_obj}. This should not happen if operator is supported.") #
-
-        except Exception as e_filter: #
-            logger.error(f"Error applying filter {f_obj} on column '{column}': {e_filter}", exc_info=True) #
-            # 根据策略，可以选择跳过此过滤器或在此处引发异常/返回错误
-            # 为保持流程继续，我们选择跳过错误的过滤器
-            continue #
-            
-    return df_filtered #
-
-# --- FastAPI 端点 ---
-
-@app.post("/notify", response_model=NotificationResponse) #
-async def send_desktop_notification(req: NotificationRequest): #
-    """
-    接收通知请求并在 Windows 桌面上显示一个通知。
-    """
-    logger.info(f"Received notification request: Title='{req.title}', Message='{req.message}'") #
-    try: #
-        toast = Notification( #
-            app_id=req.app_name, #
-            title=req.title, #
-            msg=req.message, #
-            # duration="long", # 可选 #
-            # icon=req.icon_path if req.icon_path and os.path.exists(req.icon_path) else "" # 可选 #
-        )
-        toast.show() #
-        
-        logger.info(f"Desktop notification successfully shown: '{req.title}'") #
-        return NotificationResponse(success=True, message="Notification successfully shown.") #
-    except Exception as e: #
-        logger.error(f"Failed to show desktop notification: {e}", exc_info=True) #
-        raise HTTPException(status_code=500, detail=f"Failed to show notification: {str(e)}") #
-
-
-@app.post("/excel_sqo_mcp/execute_operation", response_model=SQOResponse) #
-async def execute_excel_sqo_operation(request_data: ExecuteSQORequest): #
-    """
-    执行 Excel 结构化查询对象 (SQO) 操作。
-    这个端点负责根据传入的 SQO 对指定的 Excel 文件进行数据读取、筛选、聚合等操作。
-    """
-    sqo = request_data.sqo #
-    operation_type = sqo.get("operation_type") #
-    file_path = sqo.get("file_path") #
-    sheet_name = sqo.get("sheet_name", 0) # 默认为第一个工作表 #
-
-    logger.info(f"Received SQO request: operation='{operation_type}', file='{file_path}', sheet='{sheet_name}'") #
-    logger.debug(f"Full SQO received: {sqo}") #
-
-    if not file_path or not operation_type: #
-        logger.error("SQO missing 'file_path' or 'operation_type'.") #
-        return SQOResponse(success=False, error="SQO中缺少 'file_path' 或 'operation_type' 参数。") #
-
-    # 安全性提示：在生产环境中，需要对 file_path 进行严格校验，防止路径遍历等安全风险。
-    # 例如，限制只能访问特定目录下的文件。
-    if not os.path.exists(file_path): #
-        logger.error(f"Excel file not found: {file_path}") #
-        return SQOResponse(success=False, error=f"Excel文件未找到 '{file_path}'") #
-
-    try: #
-        # 读取 Excel 文件到 Pandas DataFrame
-        df = pd.read_excel(file_path, sheet_name=sheet_name) #
-        logger.info(f"Successfully loaded DataFrame. Shape: {df.shape}, Columns: {df.columns.tolist()}") #
-
-        result_data = None #
-
-        # --- 根据操作类型执行不同逻辑 ---
-
-        if operation_type == "get_unique_values": #
-            column_name = sqo.get("column_name") #
-            if not column_name or column_name not in df.columns: #
-                error_msg = f"'get_unique_values' 操作缺少有效 'column_name' 或列 '{column_name}' 不存在。可用列: {df.columns.tolist()}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            df_to_process = df.copy() #
-            filters_from_sqo = sqo.get("filters") #
-            if filters_from_sqo and isinstance(filters_from_sqo, list): #
-                logger.info(f"Applying filters for get_unique_values: {filters_from_sqo}") #
-                df_to_process = apply_filters_to_dataframe(df_to_process, filters_from_sqo) #
-                logger.info(f"DataFrame shape after filtering for get_unique_values: {df_to_process.shape}") #
-
-            unique_values_series = df_to_process[column_name].unique() #
-            if sqo.get('options', {}).get('drop_na', False): # 默认为 False #
-                unique_values = pd.Series(unique_values_series).dropna().tolist() #
-            else: #
-                unique_values = unique_values_series.tolist() #
-            result_data = unique_values #
-
-        elif operation_type == "group_by_aggregate": #
-            group_by_cols = sqo.get("group_by_columns") #
-            agg_col = sqo.get("aggregation_column") #
-            agg_func = sqo.get("aggregation_function") #
-            if not (group_by_cols and agg_col and agg_func): #
-                error_msg = "'group_by_aggregate' 操作缺少 'group_by_columns', 'aggregation_column', 或 'aggregation_function' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            columns_to_check = [] #
-            if isinstance(group_by_cols, list): columns_to_check.extend(group_by_cols) #
-            elif isinstance(group_by_cols, str): columns_to_check.append(group_by_cols) #
-            if agg_col: columns_to_check.append(agg_col) #
-            for col in columns_to_check: #
-                if col not in df.columns: #
-                    error_msg = f"列 '{col}' 在Excel中未找到。可用列: {df.columns.tolist()}" #
-                    logger.error(error_msg) #
-                    return SQOResponse(success=False, error=error_msg) #
-            
-            df_to_group = df.copy() #
-            filters_from_sqo = sqo.get("filters") #
-            if filters_from_sqo and isinstance(filters_from_sqo, list): #
-                logger.info(f"Applying filters for group_by_aggregate: {filters_from_sqo}") #
-                df_to_group = apply_filters_to_dataframe(df_to_group, filters_from_sqo) #
-                logger.info(f"DataFrame shape after filtering: {df_to_group.shape}") #
-            elif "filters" in sqo and sqo["filters"]: #
-                 logger.warning(f"SQO中的 'filters' 字段格式不正确（期望列表），将被忽略。Filters: {sqo['filters']}") #
-
-            grouped_data = df_to_group.groupby(group_by_cols)[agg_col].agg(agg_func) #
-            output_col_name = sqo.get('options', {}).get('output_column_name') #
-            if output_col_name: #
-                if isinstance(grouped_data, pd.Series): grouped_data = grouped_data.rename(output_col_name) #
-                elif isinstance(grouped_data, pd.DataFrame) and len(grouped_data.columns)==1: grouped_data.columns = [output_col_name] #
-            result_data = grouped_data.reset_index().to_dict(orient='records') #
-
-        elif operation_type == "find_top_n_rows": #
-            select_columns = sqo.get("select_columns") #
-            condition_col = sqo.get("condition_column") #
-            sort_order_str = sqo.get("sort_order", "descending").lower() #
-            n_rows_param = sqo.get("n_rows", 1) # 使用 n_rows_param 避免与内置名称冲突 #
-            if not (select_columns and condition_col): #
-                error_msg = "'find_top_n_rows' 操作缺少 'select_columns' 或 'condition_column' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            columns_to_check_top_n = [] # 使用不同变量名以避免作用域问题 #
-            if isinstance(select_columns, list): columns_to_check_top_n.extend(select_columns) #
-            elif isinstance(select_columns, str): columns_to_check_top_n.append(select_columns) #
-            if condition_col: columns_to_check_top_n.append(condition_col) #
-            for col_top_n in columns_to_check_top_n: # 使用不同迭代变量 #
-                 if col_top_n not in df.columns: #
-                    error_msg = f"列 '{col_top_n}' 在Excel中未找到。可用列: {df.columns.tolist()}" #
-                    logger.error(error_msg) #
-                    return SQOResponse(success=False, error=error_msg) #
-
-            if sort_order_str not in ['ascending', 'descending']: #
-                error_msg = f"无效的 sort_order: {sort_order_str}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            if not isinstance(n_rows_param, int) or n_rows_param <= 0: #
-                error_msg = f"n_rows 必须是正整数，但收到: {n_rows_param}" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-
-            df_to_sort = df.copy() #
-            filters_from_sqo_top_n = sqo.get("filters") # 使用不同变量名 #
-            if filters_from_sqo_top_n and isinstance(filters_from_sqo_top_n, list): #
-                logger.info(f"Applying filters for find_top_n_rows: {filters_from_sqo_top_n}") #
-                df_to_sort = apply_filters_to_dataframe(df_to_sort, filters_from_sqo_top_n) #
-                logger.info(f"DataFrame shape after filtering: {df_to_sort.shape}") #
-            elif "filters" in sqo and sqo["filters"]: #
-                 logger.warning(f"SQO中的 'filters' 字段格式不正确（期望列表），将被忽略。Filters: {sqo['filters']}") #
-            
-            ascending_order = True if sort_order_str == 'ascending' else False #
-            sorted_df = df_to_sort.sort_values(by=condition_col, ascending=ascending_order) #
-            result_df = sorted_df.head(n_rows_param) # 使用 n_rows_param #
-            result_data = result_df[select_columns].to_dict(orient='records') #
-        
-        elif operation_type == "direct_sql_query": #
-            sql_query_from_sqo = sqo.get("sql_query") #
-            if not sql_query_from_sqo: #
-                error_msg = "'direct_sql_query' 操作缺少 'sql_query' 参数。" #
-                logger.error(error_msg) #
-                return SQOResponse(success=False, error=error_msg) #
-            
-            pdsql = PandaSQL(persist=False) #
-            logger.debug(f"Executing direct_sql_query: {sql_query_from_sqo} on columns: {df.columns.tolist()}") #
-            # 在执行SQL之前，对DataFrame应用过滤器（如果提供了）
-            df_for_sql = df.copy() #
-            filters_for_sql = sqo.get("filters") #
-            if filters_for_sql and isinstance(filters_for_sql, list): #
-                logger.info(f"Applying filters before direct_sql_query: {filters_for_sql}") #
-                df_for_sql = apply_filters_to_dataframe(df_for_sql, filters_for_sql) #
-                logger.info(f"DataFrame shape after filtering for direct_sql_query: {df_for_sql.shape}") #
-
-            query_result_df = pdsql(sql_query_from_sqo, env={'df': df_for_sql}) # 在过滤后的df上执行 #
-            
-            if query_result_df is None: #
-                result_data = "SQL查询成功执行，但没有返回数据。" #
-            elif query_result_df.empty: #
-                result_data = "SQL查询成功执行，但未找到符合条件的数据。" #
-            else: #
-                result_list_of_dicts = query_result_df.to_dict(orient='records') #
-                if len(result_list_of_dicts) == 1: #
-                    if len(result_list_of_dicts[0]) == 1: result_data = list(result_list_of_dicts[0].values())[0] #
-                    else: result_data = result_list_of_dicts[0] #
-                else: #
-                    if result_list_of_dicts and len(result_list_of_dicts[0]) == 1: # 添加检查 result_list_of_dicts 是否为空 #
-                        single_col_name = list(result_list_of_dicts[0].keys())[0] #
-                        result_data = [row[single_col_name] for row in result_list_of_dicts] #
-                    else: result_data = result_list_of_dicts #
-        else: #
-            error_msg = f"不支持的操作类型 '{operation_type}'。" #
-            logger.error(error_msg) #
-            return SQOResponse(success=False, error=error_msg) #
-
-        logger.info(f"SQO operation '{operation_type}' executed successfully.") #
-        return SQOResponse(success=True, result=result_data) #
-
-    except ImportError: #
-        logger.critical("Pandas或PandaSQL未正确安装。") #
-        return SQOResponse(success=False, error="执行Excel查询所需的库 (Pandas/PandaSQL) 未安装。", error_details=traceback.format_exc()) #
-    except FileNotFoundError as e_fnf: # 更具体的异常捕获 #
-        logger.error(f"File not found during operation: {e_fnf}", exc_info=True) #
-        return SQOResponse(success=False, error=str(e_fnf), error_details=traceback.format_exc()) #
-    except pd.errors.EmptyDataError as e_empty: #
-        logger.error(f"Pandas EmptyDataError for file {file_path}, sheet {sheet_name}: {e_empty}", exc_info=True) #
-        return SQOResponse(success=False, error=f"无法读取Excel文件 '{os.path.basename(file_path)}' (工作表: {sheet_name})，文件可能为空或格式不正确。", error_details=traceback.format_exc()) #
-    except KeyError as e_key: # 捕获列名不存在等错误 #
-        logger.error(f"KeyError during operation '{operation_type}': {e_key}. SQO: {sqo}", exc_info=True) #
-        return SQOResponse(success=False, error=f"操作失败：列名 '{str(e_key)}' 可能不存在或不正确。请检查SQO参数和Excel列名。可用列: {df.columns.tolist() if 'df' in locals() else '未知'}", error_details=traceback.format_exc()) #
-    except Exception as e: #
-        error_message = f"执行SQO操作 '{operation_type}' 时发生内部错误: {type(e).__name__} - {str(e)}" #
-        logger.error(error_message, exc_info=True) #
-        return SQOResponse(success=False, error=error_message, error_details=traceback.format_exc()) #
-
-
-# --- 用于本地直接运行测试此本地代理服务 ---
-if __name__ == "__main__": #
-    import uvicorn #
-    logger.info(f"Starting Local Agent server on http://0.0.0.0:{LOCAL_AGENT_PORT}") #
-    uvicorn.run("local_agent_app:app", host="0.0.0.0", port=LOCAL_AGENT_PORT, reload=True) # 添加 reload=True #
-
-    --- END OF FILE CONTENT ---
-
+  File (skipped, extension not included): local_agent_app.py:Zone.Identifier
 
 Directory: core/
   File: __init__.py
@@ -13791,6 +13361,283 @@ if __name__ == "__main__":
     --- END OF FILE CONTENT ---
 
 
+Directory: core/prompts/
+  File: manager_prompts.py
+    --- START OF FILE CONTENT ---
+# /home/zhz/zhz_agent/core/prompts/manager_prompts.py
+
+# 这个函数将接收动态生成的 TOOL_OPTIONS_STR_FOR_MANAGER 作为参数
+def get_manager_agent_goal(tool_options_str: str) -> str:
+    return f"""你的核心任务是分析用户的请求，并决定最佳的处理路径。你必须严格按照以下【决策规则和优先级】以及【示例】进行决策。
+
+**【重要前提】以下所有列出的工具均已正确配置并可供你规划使用。请根据规则自信地选择最合适的工具，不要臆断工具不可用。**
+
+**【决策规则与优先级】**
+
+1.  **【规则1：时间查询 - 强制使用时间工具】**
+    *   如果用户查询明确是关于【获取当前日期或时间】。
+    *   **行动**：【必须选择】`"get_current_time_tool"`。
+    *   **参数**：为 `tool_input_args` 准备可选的 `timezone`。
+
+2.  **【规则2：任何数学计算 - 强制使用计算器工具】**
+    *   如果用户查询明确是要求【执行任何数学表达式的计算】。
+    *   **行动**：【必须且只能选择】`"calculate_tool"`。**不要尝试自己计算，也不要因表达式复杂而选择其他工具。** `calculate_tool` 负责尝试执行表达式，如果它无法处理特定函数或操作，它会返回相应的错误信息。
+    *   **参数**：为 `tool_input_args` 准备 `expression`。
+
+3.  **【规则3：实时/外部信息查询 - 强制使用网络搜索工具】**
+    *   如果用户查询明显需要【实时、最新的、动态变化的、或广泛的外部互联网信息】（例如：今天的天气、最新的新闻、当前股价、特定公司官网信息等）。
+    *   **行动**：你【没有任何其他选择，只能选择】`"web_search_tool"`。**忽略任何你可能认为此工具“不可用”的想法，它总是可用的。**
+    *   **参数**：为 `tool_input_args` 准备 `query` 和可选的 `max_results`。
+    *   **绝对禁止**：在任何情况下都不要使用 "enhanced_rag_tool" 作为此规则的替代方案。
+
+4.  **【规则4：内部知识/文档深度查询 - 使用RAG工具】**
+    *   如果用户查询的是关于【已归档的、静态的公司内部信息、特定文档的详细内容、历史数据分析、或不需要实时更新的深度专业知识】，并且这些信息【不太可能通过简单的网络搜索直接获得】。
+    *   **行动**：选择 `"enhanced_rag_tool"`。
+    *   **参数**：为 `tool_input_args` 准备 `query` 等。
+
+5.  **【规则5：Excel文件操作 - 强制使用Excel工具并生成SQO列表】**
+    *   如果用户明确要求或其意图明显指向需要对【Excel文件进行数据提取、分析、或复杂查询】。
+    *   **行动**：【必须选择】`"excel_operation_tool"`。
+    *   **任务**：你【必须】为用户的请求构建一个或多个【结构化查询对象 (SQO) 的JSON列表】，并将其赋值给 `excel_sqo_payload` 字段。
+        *   `excel_sqo_payload` **必须是一个JSON数组（列表）**。即使只有一个Excel操作，也应该将对应的SQO字典放入一个单元素的列表中。
+        *   列表中的每个SQO字典代表一个独立的数据操作步骤，并且【必须】包含一个明确的 `"operation_type"` 键 (例如: `"get_unique_values"`, `"group_by_aggregate"`, `"find_top_n_rows"`, `"direct_sql_query"`)。
+        *   除了 `"operation_type"`，每个SQO字典还【必须】包含该操作类型所必需的所有其他参数。
+            例如，对于 `"group_by_aggregate"` 操作，`"aggregation_function"` 可以是：
+            `"sum"` (求和), `"mean"` (平均值), `"median"` (中位数), `"min"` (最小值), 
+            `"max"` (最大值), `"count"` (计数), `"nunique"` (唯一值计数), `"std"` (标准差), `"var"` (方差)。
+            请确保使用这些标准的Pandas聚合函数名。
+        *   在生成的SQO操作定义字典中，【绝对不要包含 "file_path" 或 "sheet_name"】这两个键，这些信息将由后续流程处理。
+        *   仔细分析用户请求，判断需要多少个独立的SQO操作来完成用户的全部意图。例如，如果用户要求“先获取A列的唯一值，然后根据这些唯一值筛选B列并求和”，这可能需要两个SQO。
+        *   如果用户请求的是对Excel文件的操作，但你无法为其构建出有效的SQO列表，那么这是一个规划错误，你不应该选择excel_operation_tool，而是应该考虑规则7（无法处理）。
+
+6.  **【规则6：LLM直接回答 - 仅当无工具适用且信息通用时】**
+    *   **适用条件**：
+        *   **首先，判断以上所有工具（规则1-5）是否都不适用。**
+        *   **并且，** 你判断该问题是【普遍常识、简单定义、通用知识、或可以通过你的预训练知识直接、准确、完整地回答】，而【不需要特定、实时、或保存在本地文件/知识库中的信息】。
+    *   **行动**：如果同时满足以上两个条件，则 `selected_tool_names` 设为 `[]`，并在 `direct_answer_content` 提供答案。
+    *   **例子**：用户问“天空为什么是蓝色的？”或“解释一下什么是人工智能？”。
+    *   **注意**：如果问题涉及具体数据、实时信息、或需要精确计算，即使看起来简单，也应优先考虑使用相应工具。
+
+7.  **【规则7：无法处理/需要澄清（最终回退）】**
+    *   如果所有工具规则都不适用，你也无法根据规则6直接回答。
+    *   **行动**：`selected_tool_names` 设为 `[]`。在 `reasoning_for_plan` 中解释为何无法处理，如果合适，在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
+
+**【可用工具的参考描述】：**
+{tool_options_str}
+
+**【决策示例 - 你必须学习并模仿这些示例的决策逻辑和输出格式】**
+<example>
+  <user_query>现在几点了？</user_query>
+  <thought>用户明确询问当前时间。根据规则1，必须使用get_current_time_tool。</thought>
+  <output_json>{{
+    "task_description": "现在几点了？",
+    "reasoning_for_plan": "用户询问当前时间，根据规则1，应使用时间工具。",
+    "selected_tool_names": ["get_current_time_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"timezone": "Asia/Shanghai"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>计算 5 * (10 + 3)</user_query>
+  <thought>用户要求进行数学计算。根据规则2，必须使用calculate_tool。</thought>
+  <output_json>{{
+    "task_description": "计算 5 * (10 + 3)",
+    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具。",
+    "selected_tool_names": ["calculate_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"expression": "5 * (10 + 3)"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>计算 (12 / (2 + 2))^2 + 10%3</user_query>
+  <thought>用户要求进行数学计算，包含括号、除法、幂运算和取模。根据规则2，必须使用calculate_tool。</thought>
+  <output_json>{{
+    "task_description": "计算 (12 / (2 + 2))^2 + 10%3",
+    "reasoning_for_plan": "用户要求数学计算，根据规则2，应使用计算器工具，即使表达式包含多个操作符。",
+    "selected_tool_names": ["calculate_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"expression": "(12 / (2 + 2))^2 + 10%3"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>今天上海的天气怎么样？</user_query>
+  <thought>用户询问“今天”的天气，这是时效性信息。根据规则3，必须使用web_search_tool。</thought>
+  <output_json>{{
+    "task_description": "今天上海的天气怎么样？",
+    "reasoning_for_plan": "查询今日天气，需要实时信息，根据规则3选择网络搜索。",
+    "selected_tool_names": ["web_search_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "今天上海天气"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>最近关于人工智能在教育领域应用的新闻有哪些？</user_query>
+  <thought>用户查询最新的新闻，这需要实时外部信息。根据规则3，必须使用web_search_tool。</thought>
+  <output_json>{{
+    "task_description": "最近关于人工智能在教育领域应用的新闻有哪些？",
+    "reasoning_for_plan": "用户查询需要最新的新闻信息，根据规则3，应使用网络搜索工具。",
+    "selected_tool_names": ["web_search_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "人工智能在教育领域应用的新闻", "max_results": 5}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>我们公司的报销政策是什么？</user_query>
+  <thought>用户查询公司内部政策，属于内部知识库范畴。根据规则4，应使用enhanced_rag_tool。</thought>
+  <output_json>{{
+    "task_description": "我们公司的报销政策是什么？",
+    "reasoning_for_plan": "查询公司内部政策，根据规则4选择RAG工具。",
+    "selected_tool_names": ["enhanced_rag_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": {{"query": "公司报销政策"}},
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>天空为什么是蓝色的？</user_query>
+  <thought>这是一个常见的科学常识问题，我的内部知识足以回答，无需使用工具。根据规则6直接回答。</thought>
+  <output_json>{{
+    "task_description": "天空为什么是蓝色的？",
+    "reasoning_for_plan": "这是一个常见的科学常识问题，可基于已有知识直接回答，无需工具。",
+    "selected_tool_names": [],
+    "direct_answer_content": "天空呈现蓝色是因为瑞利散射效应。当太阳光穿过地球大气层时，空气中的氮气和氧气等微小粒子会将阳光向各个方向散射。蓝光和紫光比其他颜色的光更容易被散射，因为它们的波长较短。因此，我们看到的天空主要是这些被散射的蓝光。",
+    "tool_input_args": null,
+    "excel_sqo_payload": null
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请帮我分析 "sales_report_Q3.xlsx" 文件中 "产品类别" 列的销售额总和，并按 "区域" 进行分组。</user_query>
+  <thought>用户明确要求对Excel文件进行分组聚合操作。根据规则5，必须使用excel_operation_tool，并生成SQO列表。这个请求对应一个SQO操作。</thought>
+  <output_json>{{
+    "task_description": "请帮我分析 \"sales_report_Q3.xlsx\" 文件中 \"产品类别\" 列的销售额总和，并按 \"区域\" 进行分组。",
+    "reasoning_for_plan": "用户要求对Excel进行分组聚合，根据规则5选择Excel工具并生成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["区域", "产品类别"],
+        "aggregation_column": "销售额",
+        "aggregation_function": "sum"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？</user_query>
+  <thought>用户要求获取Excel文件中某一列的唯一值。根据规则5，应选择excel_operation_tool，并生成包含一个get_unique_values操作的SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请告诉我文件 data.xlsx 的 “城市” 列有哪些不同的值？",
+    "reasoning_for_plan": "用户要求获取Excel列的唯一值，根据规则5选择Excel工具并生成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [ 
+      {{
+        "operation_type": "get_unique_values",
+        "column_name": "城市" 
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”；最后，计算所有交易的平均“折扣率”。</user_query>
+  <thought>用户请求对一个Excel文件执行多个分析操作。第一个是分组求和，第二个是查找TopN，第三个是计算全局平均值。根据规则5，应选择excel_operation_tool，并为每个分析点生成一个SQO，组成一个SQO列表。</thought>
+  <output_json>{{
+    "task_description": "请分析 sales_summary.xlsx：首先，计算每个“产品类型”的“总销售额”；其次，找出“利润”最高的两笔交易记录，显示“订单ID”和“利润”；最后，计算所有交易的平均“折扣率”。",
+    "reasoning_for_plan": "用户要求对Excel文件执行多个分析操作（分组求和、TopN查找、全局平均值计算），根据规则5选择Excel工具并为每个操作生成SQO，形成SQO列表。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "group_by_aggregate",
+        "group_by_columns": ["产品类型"],
+        "aggregation_column": "总销售额",
+        "aggregation_function": "sum"
+      }},
+      {{
+        "operation_type": "find_top_n_rows",
+        "select_columns": ["订单ID", "利润"],
+        "condition_column": "利润",
+        "sort_order": "descending",
+        "n_rows": 2
+      }},
+      {{ 
+        "operation_type": "group_by_aggregate", 
+        "group_by_columns": [], 
+        "aggregation_column": "折扣率",
+        "aggregation_function": "mean"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+<example>
+  <user_query>从 sales.xlsx 中筛选出 'Category' 为 'Electronics' 且 'Region' 为 'North' 的所有记录，并显示 'Product Name' 和 'Sales Amount' 列。</user_query>
+  <thought>用户要求根据多个条件筛选Excel数据并选择特定列显示。这是一个适合使用direct_sql_query的场景。我将构建一个SQL查询来实现这个筛选和选择。</thought>
+  <output_json>{{
+    "task_description": "从 sales.xlsx 中筛选出 'Category' 为 'Electronics' 且 'Region' 为 'North' 的所有记录，并显示 'Product Name' 和 'Sales Amount' 列。",
+    "reasoning_for_plan": "用户要求进行多条件筛选和列选择，使用direct_sql_query操作类型生成SQL语句是最直接的方式。",
+    "selected_tool_names": ["excel_operation_tool"],
+    "direct_answer_content": null,
+    "tool_input_args": null,
+    "excel_sqo_payload": [
+      {{
+        "operation_type": "direct_sql_query",
+        "sql_query": "SELECT `Product Name`, `Sales Amount` FROM df WHERE Category = 'Electronics' AND Region = 'North'"
+      }}
+    ]
+  }}</output_json>
+</example>
+
+**【输出格式要求 - 必须严格遵守！】**
+你的唯一输出必须是一个JSON对象，符合 `SubTaskDefinitionForManagerOutput` Pydantic模型，包含：
+*   `task_description`: (字符串) 用户的原始请求。
+*   `reasoning_for_plan`: (字符串) 你做出决策的思考过程，清晰说明你遵循了上述哪条规则和哪个示例。
+*   `selected_tool_names`: (字符串列表) 选定的工具名称列表。
+*   `direct_answer_content`: (可选字符串) 仅在规则6适用时填充。
+*   `tool_input_args`: (可选对象) 仅在规则1, 2, 3, 4适用时，为对应工具填充参数。
+*   `excel_sqo_payload`: (可选SQO列表) 仅在规则5适用时填充。
+
+我【不】自己执行任何工具操作。我的职责是精准规划并输出结构化的任务定义。
+"""
+
+MANAGER_AGENT_BACKSTORY = """我是一位经验丰富且高度智能的AI任务调度官和数据分析规划专家。我的核心使命是精确解读用户的每一个请求，并为其匹配最高效、最准确的处理路径。我会严格遵循被赋予的【决策规则与优先级】和【决策示例】。我清楚所有列出的工具都是可用的。
+
+1.  **【请求深度解析与意图识别】**：我会首先对用户的原始请求进行彻底的语义分析和意图识别。我会判断请求的性质：是简单问答？是需要内部知识检索？是需要实时外部信息？还是需要对特定数据文件（如Excel）进行操作？
+
+2.  **【决策优先级：优先自主解决或使用最适合的工具】**：我会严格按照【决策规则与优先级】进行判断。如果规则指向直接回答，我会直接回答。如果规则指向特定工具，我会选择该工具。
+
+3.  **【工具选择的智慧：精准匹配，而非盲目调用】**：
+    *   **时效性是关键**：对于新闻、天气、实时数据等具有强时效性的查询，我会毫不犹豫地选择【网络搜索工具】(`web_search_tool`)。
+    *   **内部知识优先**：对于公司政策、历史项目资料、特定存档文档等【已归档的、静态的】内部信息查询，我会优先使用【增强型RAG工具】(`enhanced_rag_tool`)。
+    *   **Excel事务专家**：任何涉及Excel文件（.xlsx, .csv）的复杂数据操作，我会委派给【Excel操作工具】(`excel_operation_tool`)，并为其生成SQO列表。
+    *   **基础计算与时间查询**：对于明确的数学表达式计算，我会选择【计算器工具】(`calculate_tool`)；对于获取当前日期时间的需求，我会选择【时间工具】(`get_current_time_tool`)。
+    *   **审慎对待无法处理的请求**：如果用户请求过于宽泛、模糊，或者超出了当前所有可用工具和我的知识范围，并且不符合任何直接回答的条件，我会选择不使用任何工具，并在我的思考过程（`reasoning_for_plan`）中解释原因，或者在 `direct_answer_content` 中礼貌地请求用户提供更多信息或说明无法处理。
+
+4.  **【结构化输出：一切为了清晰执行】**：我的最终输出永远是一个严格符合 `SubTaskDefinitionForManagerOutput` Pydantic模型规范的JSON对象。
+
+我从不亲自执行任务的细节，我的价值在于运筹帷幄，确保每一个用户请求都能被分配到最合适的处理单元，从而实现高效、准确的问题解决。
+"""
+    --- END OF FILE CONTENT ---
+
+
 Directory: core/grammars/
   File (skipped, extension not included): cypher_or_unable_output.gbnf
 
@@ -13806,11 +13653,14 @@ Directory: core/tools/
   File: calculator_tool.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/core/tools/calculator_tool.py
+import logging
+import re
+# --- 添加开始 ---
+import math 
+# --- 添加结束 ---
 from typing import Type, Any
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
-import logging
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -13820,32 +13670,56 @@ class CalculateToolInput(BaseModel):
 class CalculateTool(BaseTool):
     name: str = "calculate_tool"
     description: str = (
-        "【计算器工具】执行数学表达式的计算并返回数值结果。支持常见的算术运算（加、减、乘、除、括号）。"
+        "【计算器工具】执行数学表达式的计算并返回数值结果。支持常见的算术运算（加、减、乘、除、括号、幂运算、取模）以及部分数学函数 (如 sqrt, factorial, sin, cos, tan, log, log10, exp, degrees, radians)。" # <--- 更新描述
     )
     args_schema: Type[BaseModel] = CalculateToolInput
 
     def _run(self, expression: str, **kwargs: Any) -> str:
         logger.info(f"CalculateTool._run called with expression: '{expression}'")
         
-        # 安全性检查：只允许数字、操作符、括号和点
-        # 移除了对字母的允许，以防止执行不安全代码
-        # 允许科学计数法中的 'e' 或 'E'
-        if not re.match(r"^[0-9+\-*/().\sEe]+$", expression):
+        # 安全性检查：允许字母（用于函数名如sqrt, factorial, sin等）
+        # 但仍然需要小心，更安全的做法是解析表达式并只允许白名单中的函数
+        if not re.match(r"^[0-9a-zA-Z_+\-*/().\s%^!]+$", expression):
             logger.error(f"Invalid characters in expression: '{expression}'")
-            return "错误：表达式中包含无效字符。只允许数字、操作符 (+, -, *, /)、括号、小数点和空格。"
+            return "错误：表达式中包含无效字符。"
         
-        # 另一个安全措施：避免非常长的表达式
-        if len(expression) > 100: # 限制表达式长度
+        if len(expression) > 200: # 稍微放宽长度限制
             logger.error(f"Expression too long: '{expression}'")
             return "错误：表达式过长。"
 
         try:
-            # 使用 eval 进行计算，前面已经做了基本的字符过滤
-            # 注意：eval 仍然有潜在风险，如果过滤不完美。
-            # 对于生产环境，强烈建议使用更安全的表达式求值库，如 numexpr 或 ast.literal_eval (但后者功能有限)
-            result = eval(expression, {"__builtins__": {}}, {}) # 限制 eval 的命名空间
-            logger.info(f"Expression '{expression}' evaluated to: {result}")
+            # --- 修改开始：准备安全的命名空间 ---
+            safe_globals = {
+                "__builtins__": {}, # 限制内置函数
+                "sqrt": math.sqrt,
+                "factorial": math.factorial,
+                "sin": math.sin,
+                "cos": math.cos,
+                "tan": math.tan,
+                "log": math.log,
+                "log10": math.log10,
+                "exp": math.exp,
+                "pow": pow, # math.pow 和内置 pow 行为类似，但内置的更通用
+                "pi": math.pi,
+                "e": math.e,
+                "degrees": math.degrees,
+                "radians": math.radians,
+                # 你可以根据需要添加更多 math 模块中的安全函数
+            }
+            # 为了支持 x^y 这样的幂运算，eval本身用 **
+            # 如果用户输入了 ^, 我们可以在这里替换一下，或者告知用户使用 **
+            expression_to_eval = expression.replace('^', '**')
+            # 移除阶乘符号 `!` 后的空格，并替换为 `factorial()`
+            # 注意：这只是一个简单的替换，可能无法处理所有复杂情况，例如 `(5+2)!`
+            expression_to_eval = re.sub(r"(\d+)\s*!", r"factorial(\1)", expression_to_eval)
+
+            result = eval(expression_to_eval, safe_globals, {}) # 使用受限的命名空间
+            # --- 修改结束 ---
+            logger.info(f"Expression '{expression}' (evaluated as '{expression_to_eval}') evaluated to: {result}")
             return f"计算结果: {expression} = {result}"
+        except NameError as e:
+            logger.error(f"Error evaluating expression '{expression}': NameError - {e}")
+            return f"错误：表达式中使用了未定义的函数或变量 (例如 '{e.name}')。支持的函数包括：sqrt, factorial, sin, cos, tan, log, log10, exp。"
         except ZeroDivisionError:
             logger.error(f"Error evaluating expression '{expression}': Division by zero")
             return "错误：表达式中存在除以零的操作。"
@@ -14097,77 +13971,68 @@ class EnhancedRAGTool(BaseTool):
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/core/tools/excel_tool.py
 
-import httpx # 用于直接 HTTP 调用本地代理
+import httpx
 import json
-from typing import Type, Dict, Any, Union, List, Optional
+from typing import Type, Dict, Any, Union, List, Optional # 确保导入了 List
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
-import  os
-
-# --- 日志记录 ---
+import os
 import logging
+import traceback # 确保导入 traceback
+
 logger = logging.getLogger(__name__)
 
-# 本地 Excel 代理服务的地址
-# LOCAL_AGENT_BASE_URL = "http://localhost:8003" # 这个端口需要与 local_agent_app.py 中的一致
-# 为了使其更灵活，从环境变量读取，并提供默认值
-WINDOWS_HOST_IP = os.getenv("WINDOWS_HOST_IP_FOR_WSL", "192.168.3.11") # 确保这个IP正确
+# 从环境变量读取 Windows Host IP 和 Local Agent 端口
+WINDOWS_HOST_IP = os.getenv("WINDOWS_HOST_IP_FOR_WSL", "192.168.3.11") 
 LOCAL_AGENT_PORT = os.getenv("LOCAL_AGENT_PORT", "8003")
 LOCAL_AGENT_EXCEL_SQO_ENDPOINT = f"http://{WINDOWS_HOST_IP}:{LOCAL_AGENT_PORT}/excel_sqo_mcp/execute_operation"
 
 
 class ExcelOperationToolInput(BaseModel):
     # Worker Agent 会迭代 Manager 生成的 SQO 列表，
-    # 每次调用这个工具时，传递一个 SQO 字典，以及 file_path 和 sheet_name
-    sqo_dict: Dict[str, Any] = Field(description="单个结构化查询对象 (SQO) 的JSON字典。")
-    file_path: str = Field(description="目标Excel文件的绝对路径。")
-    sheet_name: Union[str, int] = Field(default=0, description="目标工作表的名称或索引 (0-based)。")
+    # 每次调用这个工具时，传递一个 SQO 字典，以及 file_path 和 sheet_name。
+    # sqo_dict 已经是 Manager 生成的 SQO 操作定义，不包含 file_path 和 sheet_name。
+    # file_path 和 sheet_name 由 Worker Agent 从用户原始请求中提取并传入。
+    
+    sqo_operation_definition: Dict[str, Any] = Field(description="单个SQO操作定义字典，不包含file_path和sheet_name。")
+    target_excel_file_path: str = Field(description="目标Excel文件的绝对路径。")
+    target_excel_sheet_name: Union[str, int] = Field(default=0, description="目标工作表的名称或索引 (0-based)。")
 
 class ExcelOperationTool(BaseTool):
     name: str = "excel_operation_tool"
     description: str = ("【Excel操作工具】通过结构化查询对象(SQO)对Excel文件执行复杂的数据查询、筛选、聚合等操作。"
-                        "此工具接收单个SQO以及文件路径和工作表名，并调用本地代理执行。")
+                        "此工具接收单个SQO操作定义、文件路径和工作表名，并调用在Windows上运行的本地代理来执行实际操作。")
     args_schema: Type[BaseModel] = ExcelOperationToolInput
 
     def _run(
         self,
-        sqo_dict: Dict[str, Any],
-        file_path: str,
-        sheet_name: Union[str, int] = 0,
+        sqo_operation_definition: Dict[str, Any],
+        target_excel_file_path: str,
+        target_excel_sheet_name: Union[str, int] = 0,
         **kwargs: Any
     ) -> str:
-        """
-        同步执行方法，调用本地代理执行单个Excel SQO。
-        """
-        logger.info(f"ExcelOperationTool._run called with file_path: '{file_path}', sheet_name: '{sheet_name}'")
-        logger.debug(f"SQO to execute: {sqo_dict}")
+        logger.info(f"ExcelOperationTool._run called. File: '{target_excel_file_path}', Sheet: '{target_excel_sheet_name}'")
+        logger.debug(f"SQO Operation Definition received: {sqo_operation_definition}")
 
-        if not isinstance(sqo_dict, dict):
-            return "错误：传递给 ExcelOperationTool 的 sqo_dict 参数必须是一个字典。"
-        if not sqo_dict.get("operation_type"):
-            return "错误：SQO字典中缺少 'operation_type' 字段。"
+        if not isinstance(sqo_operation_definition, dict):
+            return "错误：传递给 ExcelOperationTool 的 sqo_operation_definition 参数必须是一个字典。"
+        if not sqo_operation_definition.get("operation_type"):
+            return "错误：SQO操作定义字典中缺少 'operation_type' 字段。"
 
-        # 构造发送给 local_agent_app.py 的请求体
+        # 构造发送给 local_agent_app.py 的完整SQO，补充 file_path 和 sheet_name
+        full_sqo_for_local_agent = sqo_operation_definition.copy()
+        full_sqo_for_local_agent["file_path"] = target_excel_file_path
+        full_sqo_for_local_agent["sheet_name"] = target_excel_sheet_name
+        
         # local_agent_app.py 的 /excel_sqo_mcp/execute_operation 端点期望的请求体是 ExecuteSQORequest 模型，
-        # 它有一个名为 'sqo' 的字段，其值才是我们这里的 sqo_dict (已经包含了 operation_type, file_path, sheet_name)
-        
-        # 我们需要确保传递给本地代理的 SQO 中包含 file_path 和 sheet_name，
-        # 因为 Manager Agent 生成的原始 SQO 列表中的字典不包含它们。
-        # Worker Agent 在调用此工具前，应该已经将它们补充完整。
-        # 但为了工具的健壮性，我们在这里也检查一下，并可以覆盖或添加。
-        
-        sqo_for_local_agent = sqo_dict.copy() # 创建副本以修改
-        sqo_for_local_agent["file_path"] = file_path # 确保或覆盖 file_path
-        sqo_for_local_agent["sheet_name"] = sheet_name # 确保或覆盖 sheet_name
-
-        request_payload_to_local_agent = {"sqo": sqo_for_local_agent}
+        # 它有一个名为 'sqo' 的字段，其值才是我们这里的 full_sqo_for_local_agent
+        request_payload_to_local_agent = {"sqo": full_sqo_for_local_agent}
 
         logger.info(f"Sending request to Local Excel Agent: {LOCAL_AGENT_EXCEL_SQO_ENDPOINT}")
-        logger.debug(f"Payload to Local Excel Agent: {request_payload_to_local_agent}")
+        logger.debug(f"Payload to Local Excel Agent: {json.dumps(request_payload_to_local_agent, ensure_ascii=False)}")
 
         try:
-            # 使用 httpx 进行同步调用
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=120.0) as client: # 增加超时
                 response = client.post(LOCAL_AGENT_EXCEL_SQO_ENDPOINT, json=request_payload_to_local_agent)
             
             logger.info(f"Local Excel Agent response status: {response.status_code}")
@@ -14176,37 +14041,42 @@ class ExcelOperationTool(BaseTool):
             if response.status_code == 200 and response_json.get("success"):
                 result = response_json.get("result")
                 logger.info(f"Excel operation successful. Result type: {type(result)}")
-                # 将结果转换为字符串以便 Agent 处理
                 if isinstance(result, (list, dict)):
                     try:
+                        # 对于列表或字典，以JSON字符串形式返回给Agent通常更易于处理
                         return json.dumps(result, ensure_ascii=False, indent=2)
-                    except TypeError: # 处理无法JSON序列化的类型，例如某些Pandas特殊类型
+                    except TypeError: # 处理无法JSON序列化的类型
                         return str(result)
-                return str(result)
+                return str(result) # 其他类型直接转字符串
             else:
                 error_message = response_json.get("error", "未知错误")
                 error_details = response_json.get("error_details")
                 full_error = f"本地Excel代理错误: {error_message}"
                 if error_details:
-                    full_error += f" | 详情: {str(error_details)[:200]}" # 限制详情长度
-                logger.error(full_error)
+                    full_error += f" | 详情: {str(error_details)[:300]}" # 限制详情长度
+                logger.error(full_error + f" | Full SQO sent: {json.dumps(full_sqo_for_local_agent, ensure_ascii=False)}")
                 return full_error
 
+        except httpx.TimeoutException as e:
+            error_msg = f"调用本地Excel代理超时: {e}"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
+        except httpx.ConnectError as e:
+            error_msg = f"无法连接到本地Excel代理 ({LOCAL_AGENT_EXCEL_SQO_ENDPOINT}): {e}. 请确保Windows端的local_agent_app.py正在运行，并且WSL可以访问到Windows的IP和端口。"
+            logger.error(error_msg, exc_info=True)
+            return error_msg
         except httpx.RequestError as e:
-            error_msg = f"请求本地Excel代理时出错: {e}"
+            error_msg = f"请求本地Excel代理时发生网络错误: {e}"
             logger.error(error_msg, exc_info=True)
             return error_msg
         except json.JSONDecodeError as e:
-            error_msg = f"解析本地Excel代理响应JSON时出错: {e}. 响应文本: {response.text[:200]}"
+            error_msg = f"解析本地Excel代理响应JSON时出错: {e}. 响应文本: {response.text[:300]}"
             logger.error(error_msg, exc_info=True)
             return error_msg
         except Exception as e:
             error_msg = f"执行Excel操作时发生未知错误: {e}"
             logger.error(error_msg, exc_info=True)
-            return error_msg
-
-# 确保 core/tools 目录也有一个 __init__.py 文件
-# touch /home/zhz/zhz_agent/core/tools/__init__.py (如果不存在)
+            return f"{error_msg} | Traceback: {traceback.format_exc()[:500]}"
     --- END OF FILE CONTENT ---
 
   File: search_tool.py
@@ -14291,48 +14161,56 @@ class WebSearchTool(BaseTool):
         
         return self._handle_mcp_result(mcp_response_data)
 
+
     def _handle_mcp_result(self, mcp_response: Dict[str, Any]) -> str:
-        """
-        处理来自 MCP ddgsearch 服务的响应。
-        call_mcpo_tool 会返回一个包含 "success": True/False 和 "data"/"error" 的字典。
-        """
-        logger.info(f"WebSearchTool._handle_mcp_result received: {str(mcp_response)[:500]}...")
+        logger.info(f"WebSearchTool._handle_mcp_result received raw MCP wrapper response: {str(mcp_response)[:1000]}...")
 
         if not isinstance(mcp_response, dict):
-            return f"TOOL_ERROR: {self.name} received invalid response format from MCP call (expected dict, got {type(mcp_response)})."
+            return f"TOOL_ERROR: {self.name} received invalid response format from MCP call wrapper (expected dict, got {type(mcp_response)})."
 
         if mcp_response.get("success") is False:
-            error_msg = mcp_response.get("error", "Unknown error from ddgsearch MCP call.")
-            logger.error(f"WebSearchTool failed via MCP: {error_msg}")
+            error_msg = mcp_response.get("error", "Unknown error from ddgsearch MCP call via wrapper.")
+            error_type = mcp_response.get("error_type", "MCP_CALL_FAILED")
+            logger.error(f"WebSearchTool failed via MCP wrapper. Type: {error_type}, Error: {error_msg}")
             return f"TOOL_ERROR: {self.name} failed: {error_msg}"
 
-        # 如果 success 为 True，则 data 字段包含 ddgsearch 服务的实际输出
         ddg_service_data = mcp_response.get("data")
-        if not isinstance(ddg_service_data, dict):
-            logger.warning(f"WebSearchTool: 'data' field from successful MCP call is not a dict. Raw data: {str(ddg_service_data)[:200]}")
-            return f"TOOL_ERROR: {self.name} received unexpected data format from ddgsearch service."
-
-        # ddgsearch 服务成功时应该返回一个包含搜索结果列表的 JSON 结构
-        # 参考 ddg-search MCP 工具的输出，它通常是 {"results": [{"title": ..., "href": ..., "body": ...}, ...]}
-        search_results = ddg_service_data.get("results")
         
-        if isinstance(search_results, list):
-            if not search_results:
-                return "网络搜索没有找到相关结果。"
-            
-            formatted_results = ["网络搜索结果："]
-            for i, res in enumerate(search_results[:5]): # 最多展示5条给Agent
-                if isinstance(res, dict):
-                    title = res.get("title", "无标题")
-                    link = res.get("href", "#")
-                    snippet = res.get("body", "无摘要")
-                    formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
-                else:
-                    formatted_results.append(f"{i+1}. {str(res)[:200]}...")
-            return "\n".join(formatted_results)
-        else:
-            logger.warning(f"WebSearchTool: 'results' key not found or is not a list in ddgsearch service data. Raw service data: {str(ddg_service_data)[:300]}")
-            return f"网络搜索未能获取到预期的结果列表。原始响应: {json.dumps(ddg_service_data, ensure_ascii=False, indent=2)}"
+        if isinstance(ddg_service_data, dict) and "content" in ddg_service_data:
+            content_list = ddg_service_data.get("content")
+            if isinstance(content_list, list) and content_list:
+                first_content_item = content_list[0]
+                if isinstance(first_content_item, dict) and first_content_item.get("type") == "text":
+                    search_results_text = first_content_item.get("text")
+                    if search_results_text and search_results_text.strip():
+                        logger.info("WebSearchTool: Successfully extracted search results text from MCP 'content' field.")
+                        # --- 修改：直接返回提取到的文本 ---
+                        return search_results_text.strip() 
+                        # --- 修改结束 ---
+                    else:
+                        logger.warning("WebSearchTool: Extracted search results text is empty.")
+                        return "网络搜索没有找到相关结果（返回内容为空）。" # 如果文本为空，也返回这个
+        
+        # 如果上面的分支没有成功返回（例如 ddg_service_data 结构不对），则尝试旧的 "results" 逻辑
+        # if isinstance(ddg_service_data, dict) and "results" in ddg_service_data:
+        #     search_results = ddg_service_data.get("results")
+        #     if isinstance(search_results, list):
+        #         if not search_results:
+        #             return "网络搜索没有找到相关结果。"
+        #         formatted_results = ["网络搜索结果："]
+        #         for i, res in enumerate(search_results[:5]): 
+        #             if isinstance(res, dict):
+        #                 title = res.get("title", "无标题")
+        #                 link = res.get("href", "#")
+        #                 snippet = res.get("body", "无摘要")
+        #                 formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
+        #             else:
+        #                 formatted_results.append(f"{i+1}. {str(res)[:200]}...")
+        #         return "\n".join(formatted_results)
+
+        # 如果所有尝试都失败了
+        logger.warning(f"WebSearchTool: Could not extract 'results' list or 'content' text as expected from ddgsearch service data. Raw service data: {str(ddg_service_data)[:500]}")
+        return f"网络搜索未能获取到预期的结果格式。服务原始响应 (data part): {json.dumps(ddg_service_data, ensure_ascii=False, indent=2) if isinstance(ddg_service_data, dict) else str(ddg_service_data)[:300]}"
     --- END OF FILE CONTENT ---
 
   File: time_tool.py
@@ -14635,6 +14513,39 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
             
         logger.debug(f"  LiteLLM Call Args (cleaned, messages excluded, proxy shown if used): {debug_params_to_print}")
         
+        # --- 添加以下详细日志 ---
+        logger.info("--------------------------------------------------------------------")
+        logger.info(f"DEBUGGING TOOLS PASSED TO LITELLM for model {self.model_name} (Manager Agent call):") # 区分是Manager还是Worker的调用
+
+        effective_tools_to_log = litellm_call_args_cleaned.get("tools")
+
+        if effective_tools_to_log:
+            try:
+                tools_json_str = json.dumps(effective_tools_to_log, indent=2, ensure_ascii=False)
+                logger.info(f"  Tools (Content):\n{tools_json_str}")
+                # 专门检查 web_search_tool 是否存在
+                web_search_tool_found_in_definition = any(
+                    tool.get("function", {}).get("name") == "web_search_tool" 
+                    for tool in effective_tools_to_log if isinstance(tool, dict)
+                )
+                if web_search_tool_found_in_definition:
+                    logger.info("  >>>> web_search_tool IS PRESENT in the tools definition passed to LiteLLM. <<<<")
+                else:
+                    logger.warning("  >>>> web_search_tool IS MISSING from the tools definition passed to LiteLLM! <<<<")
+
+            except Exception as e_log_json:
+                logger.error(f"  Error serializing tools for logging: {e_log_json}")
+                logger.info(f"  Tools (Raw Object, could not serialize): {effective_tools_to_log}")
+        else:
+            logger.info("  Tools: Not present in litellm_call_args_cleaned (effective_tools_to_log is None or empty)")
+            
+        if "tool_choice" in litellm_call_args_cleaned:
+            logger.info(f"  Tool Choice: {litellm_call_args_cleaned['tool_choice']}")
+        else:
+            logger.info("  Tool Choice: Not present in litellm_call_args_cleaned")
+        logger.info("--------------------------------------------------------------------")
+        # --- 详细日志结束 ---
+
         response = None 
         try:
             response = litellm.completion(**litellm_call_args_cleaned) 

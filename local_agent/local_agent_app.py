@@ -265,10 +265,15 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
             group_by_cols = sqo.get("group_by_columns")
             agg_col = sqo.get("aggregation_column")
             agg_func = sqo.get("aggregation_function")
-            if not (group_by_cols and agg_col and agg_func):
-                error_msg = "'group_by_aggregate' 操作缺少 'group_by_columns', 'aggregation_column', 或 'aggregation_function' 参数。"
-                logger.error(error_msg)
+
+            # --- 修改开始：调整参数缺失判断 ---
+            # group_by_cols 允许为空列表 (用于全局聚合)，所以不应该因为它是空列表而报错
+            # 我们主要检查 agg_col 和 agg_func 是否存在
+            if agg_col is None or agg_func is None or group_by_cols is None: # group_by_cols 不应为 None，但可以为空列表
+                error_msg = "'group_by_aggregate' 操作缺少 'group_by_columns' (可以为空列表), 'aggregation_column', 或 'aggregation_function' 参数。"
+                logger.error(error_msg + f" Received: group_by_cols={group_by_cols}, agg_col={agg_col}, agg_func={agg_func}")
                 return SQOResponse(success=False, error=error_msg)
+            # --- 修改结束 ---
             columns_to_check = []
             if isinstance(group_by_cols, list): columns_to_check.extend(group_by_cols)
             elif isinstance(group_by_cols, str): columns_to_check.append(group_by_cols)
@@ -282,12 +287,26 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
             filters_from_sqo_group = sqo.get("filters")
             if filters_from_sqo_group and isinstance(filters_from_sqo_group, list):
                 df_to_group = apply_filters_to_dataframe(df_to_group, filters_from_sqo_group)
-            grouped_data = df_to_group.groupby(group_by_cols)[agg_col].agg(agg_func)
-            output_col_name = sqo.get('options', {}).get('output_column_name')
-            if output_col_name:
-                if isinstance(grouped_data, pd.Series): grouped_data = grouped_data.rename(output_col_name)
-                elif isinstance(grouped_data, pd.DataFrame) and len(grouped_data.columns)==1: grouped_data.columns = [output_col_name]
-            result_data = grouped_data.reset_index().to_dict(orient='records')
+
+            # --- 修改开始：处理全局聚合的情况 ---
+            if not group_by_cols: # 如果 group_by_cols 是空列表，表示全局聚合
+                logger.info(f"Performing global aggregation for column '{agg_col}' with function '{agg_func}'.")
+
+                global_agg_result_scalar = df_to_group[agg_col].agg(agg_func)
+
+                output_col_name_for_global = sqo.get('options', {}).get('output_column_name', agg_func) # 默认使用聚合函数名作为列名
+                result_data = [{output_col_name_for_global: global_agg_result_scalar}]
+            else: # 如果 group_by_cols 不是空列表，正常执行 groupby
+                logger.info(f"Performing groupby aggregation on columns {group_by_cols} for column '{agg_col}' with function '{agg_func}'.")
+                grouped_data = df_to_group.groupby(group_by_cols)[agg_col].agg(agg_func)
+                
+                output_col_name = sqo.get('options', {}).get('output_column_name')
+                if output_col_name:
+                    if isinstance(grouped_data, pd.Series): 
+                        grouped_data = grouped_data.rename(output_col_name)
+                    elif isinstance(grouped_data, pd.DataFrame) and len(grouped_data.columns) == 1: # 如果聚合结果是单列DataFrame
+                        grouped_data.columns = [output_col_name]
+                result_data = grouped_data.reset_index().to_dict(orient='records')
 
         elif operation_type == "find_top_n_rows":
             logger.info(f"Executing 'find_top_n_rows' for SQO: {sqo}")

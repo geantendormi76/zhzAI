@@ -91,40 +91,46 @@ class WebSearchTool(BaseTool):
             logger.error(f"WebSearchTool failed via MCP wrapper. Type: {error_type}, Error: {error_msg}")
             return f"TOOL_ERROR: {self.name} failed: {error_msg}"
 
-        ddg_service_data = mcp_response.get("data")
-        
-        if isinstance(ddg_service_data, dict) and "content" in ddg_service_data:
-            content_list = ddg_service_data.get("content")
+        ddg_service_data_wrapper = mcp_response.get("data")
+
+        if isinstance(ddg_service_data_wrapper, dict) and "content" in ddg_service_data_wrapper:
+            content_list = ddg_service_data_wrapper.get("content")
             if isinstance(content_list, list) and content_list:
                 first_content_item = content_list[0]
                 if isinstance(first_content_item, dict) and first_content_item.get("type") == "text":
                     search_results_text = first_content_item.get("text")
                     if search_results_text and search_results_text.strip():
-                        logger.info("WebSearchTool: Successfully extracted search results text from MCP 'content' field.")
-                        # --- 修改：直接返回提取到的文本 ---
-                        return search_results_text.strip() 
-                        # --- 修改结束 ---
+                        logger.info("WebSearchTool: Successfully extracted search results text from MCP 'data.content' field.")
+                        # 直接返回从ddgsearch获取的原始文本结果，让Worker Agent去理解和总结
+                        return search_results_text.strip()
                     else:
-                        logger.warning("WebSearchTool: Extracted search results text is empty.")
-                        return "网络搜索没有找到相关结果（返回内容为空）。" # 如果文本为空，也返回这个
+                        logger.warning("WebSearchTool: Extracted search results text from 'data.content' is empty.")
+                        return "网络搜索没有找到相关结果（返回内容为空）。"
         
-        # 如果上面的分支没有成功返回（例如 ddg_service_data 结构不对），则尝试旧的 "results" 逻辑
-        # if isinstance(ddg_service_data, dict) and "results" in ddg_service_data:
-        #     search_results = ddg_service_data.get("results")
-        #     if isinstance(search_results, list):
-        #         if not search_results:
-        #             return "网络搜索没有找到相关结果。"
-        #         formatted_results = ["网络搜索结果："]
-        #         for i, res in enumerate(search_results[:5]): 
-        #             if isinstance(res, dict):
-        #                 title = res.get("title", "无标题")
-        #                 link = res.get("href", "#")
-        #                 snippet = res.get("body", "无摘要")
-        #                 formatted_results.append(f"{i+1}. {title}\n   链接: {link}\n   摘要: {snippet[:150]}...\n")
-        #             else:
-        #                 formatted_results.append(f"{i+1}. {str(res)[:200]}...")
-        #         return "\n".join(formatted_results)
+        # 如果上面的新逻辑没有成功提取，尝试旧的直接从 data 字段解析（以防万一 call_mcpo_tool 的行为与预期不完全一致）
+        # 或者 ddgsearch 服务直接返回了 JSON 格式的 results 列表 (虽然目前不是这样)
+        if isinstance(ddg_service_data_wrapper, dict) and "results" in ddg_service_data_wrapper:
+            search_results = ddg_service_data_wrapper.get("results")
+            if isinstance(search_results, list):
+                if not search_results:
+                    return "网络搜索没有找到相关结果。"
+                # 为了简化，我们不再由工具本身进行格式化，而是直接返回JSON字符串或原始文本
+                # 让Worker Agent来处理最终呈现给用户的格式
+                logger.info("WebSearchTool: Found 'results' list in ddg_service_data. Returning as JSON string.")
+                try:
+                    return json.dumps(search_results, ensure_ascii=False, indent=2)
+                except Exception as e_json:
+                    logger.error(f"WebSearchTool: Could not serialize 'results' to JSON: {e_json}")
+                    return f"网络搜索结果无法序列化为JSON: {str(search_results)[:300]}"
 
-        # 如果所有尝试都失败了
-        logger.warning(f"WebSearchTool: Could not extract 'results' list or 'content' text as expected from ddgsearch service data. Raw service data: {str(ddg_service_data)[:500]}")
-        return f"网络搜索未能获取到预期的结果格式。服务原始响应 (data part): {json.dumps(ddg_service_data, ensure_ascii=False, indent=2) if isinstance(ddg_service_data, dict) else str(ddg_service_data)[:300]}"
+        # 如果MCP返回的data本身就是字符串（这符合ddgsearch的当前行为）
+        if isinstance(ddg_service_data_wrapper, str) and ddg_service_data_wrapper.strip():
+            logger.info("WebSearchTool: MCP 'data' field is a non-empty string. Returning it directly.")
+            return ddg_service_data_wrapper.strip()
+        elif isinstance(ddg_service_data_wrapper, str) and not ddg_service_data_wrapper.strip():
+            logger.warning("WebSearchTool: MCP 'data' field is an empty string.")
+            return "网络搜索没有找到相关结果（返回内容为空）。"
+        # --- 修改结束 ---
+        
+        logger.warning(f"WebSearchTool: Could not extract search results as expected. Raw 'data' from MCP: {str(ddg_service_data_wrapper)[:500]}")
+        return f"网络搜索未能获取到预期的结果格式。服务原始响应 (data part): {json.dumps(ddg_service_data_wrapper, ensure_ascii=False, indent=2) if isinstance(ddg_service_data_wrapper, dict) else str(ddg_service_data_wrapper)[:300]}"

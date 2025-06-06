@@ -194,6 +194,15 @@ async def lifespan(app: FastAPI):
         tools=[] 
     )
         print(f"Manager Agent initialized with LLM: {manager_llm.model_name}")
+        # --- 添加的调试日志开始 ---
+        if manager_agent_instance and manager_agent_instance.llm:
+            print(f"DEBUG_LIFESPAN: Manager LLM type: {type(manager_agent_instance.llm)}")
+            print(f"DEBUG_LIFESPAN: Is manager_llm.supports_function_calling callable? {callable(getattr(manager_agent_instance.llm, 'supports_function_calling', None))}")
+            if callable(getattr(manager_agent_instance.llm, 'supports_function_calling', None)):
+                print(f"DEBUG_LIFESPAN: manager_llm.supports_function_calling() returns: {manager_agent_instance.llm.supports_function_calling()}")
+            else:
+                print(f"DEBUG_LIFESPAN: manager_llm.supports_function_calling is NOT callable. Value: {getattr(manager_agent_instance.llm, 'supports_function_calling', 'Attribute not found')}")
+        # --- 添加的调试日志结束 ---
 
     if worker_llm:
         worker_agent_instance = Agent(

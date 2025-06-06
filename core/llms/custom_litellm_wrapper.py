@@ -344,12 +344,11 @@ class CustomLiteLLMWrapper(CrewAIBaseLLM):
             # CrewAI 在某些情况下即使这里返回空列表也能继续，但最好能正确实现
             return []
 
-    # --- 添加这个方法 ---
-    @property
-    def supports_function_calling(self) -> bool:
+
+    def supports_function_calling(self) -> bool: # <--- 删除 @property
         logger.debug(f"CustomLiteLLMWrapper.supports_function_calling() called for model {self.model_name}, returning True.")
         return True
-    # --- 添加结束 ---
+
 
     # CrewAI 可能还会用到的一些属性
     @property
