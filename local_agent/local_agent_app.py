@@ -4,6 +4,7 @@ import os
 import logging
 import traceback
 from typing import Dict, Any, List, Optional, Union
+from xml.etree import ElementTree
 
 # --- Path and DLL setup ---
 print("--- sys.path at the very beginning of local_agent_app.py ---")
@@ -34,7 +35,6 @@ if os.path.exists(dlls_path) and hasattr(os, 'add_dll_directory'):
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from winotify import Notification
-import xml.etree.ElementTree
 
 # Global variables to store import status and library objects
 _PANDAS_IMPORTED = False
@@ -95,7 +95,7 @@ class NotificationResponse(BaseModel):
     message: str
 
 # --- Filter Helper Function ---
-def apply_filters_to_dataframe(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame:
+def apply_filters_to_dataframe(df: 'pd.DataFrame', filters: List[Dict[str, Any]]) -> 'pd.DataFrame':
     if not filters:
         return df
     df_filtered = df.copy()
@@ -196,14 +196,14 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
     sqo = request_data.sqo
     operation_type = sqo.get("operation_type")
     file_path_from_sqo = sqo.get("file_path")
-    sheet_name = sqo.get("sheet_name", 0)
+    sheet_name_from_sqo = sqo.get("sheet_name", 0)
 
     # Check for PandaSQL only when the specific operation requires it
     if operation_type == "direct_sql_query" and not _PANDASQL_IMPORTED:
         logger.critical("PandaSQL was not imported successfully at global scope and is required for 'direct_sql_query' operation.")
         return SQOResponse(success=False, error="内部服务器错误：PandaSQL库未能加载，无法执行direct_sql_query。", error_details="PandaSQL import failed at startup.")
 
-    logger.info(f"Received SQO request: operation='{operation_type}', original_file_path='{file_path_from_sqo}', sheet='{sheet_name}'")
+    logger.info(f"Received SQO request: operation='{operation_type}', original_file_path='{file_path_from_sqo}', sheet='{sheet_name_from_sqo}'")
     logger.debug(f"Full SQO received: {sqo}")
 
     if not file_path_from_sqo or not operation_type:
@@ -226,12 +226,24 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
 
     df = None  # Initialize df
     try:
-        df = pd.read_excel(effective_file_path, sheet_name=sheet_name)
+        # --- 修改开始：明确指定工作表名称 ---
+        # 假设您的第一个工作表名为 "Sheet1" (这是Excel的默认值)
+        # 请根据您实际的Excel文件中的工作表名称进行修改
+        actual_sheet_to_read: Union[str, int] = "Sheet1" 
+        
+        # 如果SQO中明确指定了sheet_name，并且不是默认的0，则优先使用SQO中的
+        if sheet_name_from_sqo != 0: # 0是我们之前的默认值，表示尝试第一个
+            actual_sheet_to_read = sheet_name_from_sqo
+        
+        logger.info(f"Attempting to read Excel sheet: '{actual_sheet_to_read}' from file: '{effective_file_path}'")
+        df = pd.read_excel(effective_file_path, sheet_name=actual_sheet_to_read)
+        # --- 修改结束 ---
         logger.info(f"Successfully loaded DataFrame from '{effective_file_path}'. Shape: {df.shape}, Columns: {df.columns.tolist()}")
         result_data = None
 
         # --- Operation Type Handling ---
         if operation_type == "get_unique_values":
+            logger.info(f"Executing 'get_unique_values' for SQO: {sqo}")
             column_name = sqo.get("column_name")
             if not column_name or column_name not in df.columns:
                 error_msg = f"'get_unique_values' 操作缺少有效 'column_name' 或列 '{column_name}' 不存在。可用列: {df.columns.tolist()}"
@@ -249,6 +261,7 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
             result_data = unique_values
 
         elif operation_type == "group_by_aggregate":
+            logger.info(f"Executing 'group_by_aggregate' for SQO: {sqo}")
             group_by_cols = sqo.get("group_by_columns")
             agg_col = sqo.get("aggregation_column")
             agg_func = sqo.get("aggregation_function")
@@ -277,6 +290,7 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
             result_data = grouped_data.reset_index().to_dict(orient='records')
 
         elif operation_type == "find_top_n_rows":
+            logger.info(f"Executing 'find_top_n_rows' for SQO: {sqo}")
             select_columns = sqo.get("select_columns")
             condition_col = sqo.get("condition_column")
             sort_order_str = sqo.get("sort_order", "descending").lower()
@@ -312,6 +326,7 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
             result_data = result_df[select_columns].to_dict(orient='records')
 
         elif operation_type == "direct_sql_query":
+            logger.info(f"Executing 'direct_sql_query' for SQO: {sqo}")
             sql_query_from_sqo = sqo.get("sql_query")
             if not sql_query_from_sqo:
                 error_msg = "'direct_sql_query' 操作缺少 'sql_query' 参数。"
@@ -340,9 +355,10 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
                         result_data = [row[single_col_name] for row in result_list_of_dicts]
                     else: result_data = result_list_of_dicts
         else:
+            logger.error(f"Unsupported operation_type '{operation_type}' received. SQO: {sqo}") # <--- 添加日志
             error_msg = f"不支持的操作类型 '{operation_type}'。"
-            logger.error(error_msg)
-            return SQOResponse(success=False, error=error_msg)
+            logger.error(error_msg + f" Received SQO: {sqo}")
+            return SQOResponse(success=False, error=error_msg, error_details=f"local_agent_app.py 未实现对 operation_type '{operation_type}' 的处理。")
 
         logger.info(f"SQO operation '{operation_type}' executed successfully.")
         return SQOResponse(success=True, result=result_data)
@@ -350,12 +366,12 @@ async def execute_excel_sqo_operation(request_data: ExecuteSQORequest):
     except FileNotFoundError as e_fnf:
         logger.error(f"FileNotFoundError during pandas operation for file '{effective_file_path}': {e_fnf}", exc_info=True)
         return SQOResponse(success=False, error=f"Pandas操作时未找到文件: '{effective_file_path}'. 错误: {str(e_fnf)}", error_details=traceback.format_exc())
-    except xml.etree.ElementTree.ParseError as e_xml:
+    except ElementTree.ParseError as e_xml:
         logger.error(f"XML ParseError reading Excel file '{effective_file_path}': {e_xml}", exc_info=True)
         return SQOResponse(success=False, error=f"读取Excel文件 '{os.path.basename(effective_file_path)}' 失败：文件格式错误或已损坏 (XML解析错误)。", error_details=traceback.format_exc())
     except pd.errors.EmptyDataError as e_empty:
-        logger.error(f"Pandas EmptyDataError for file {effective_file_path}, sheet {sheet_name}: {e_empty}", exc_info=True)
-        return SQOResponse(success=False, error=f"无法读取Excel文件 '{os.path.basename(effective_file_path)}' (工作表: {sheet_name})，文件可能为空或格式不正确。", error_details=traceback.format_exc())
+        logger.error(f"Pandas EmptyDataError for file {effective_file_path}, sheet {sheet_name_from_sqo}: {e_empty}", exc_info=True)
+        return SQOResponse(success=False, error=f"无法读取Excel文件 '{os.path.basename(effective_file_path)}' (工作表: {sheet_name_from_sqo})，文件可能为空或格式不正确。", error_details=traceback.format_exc())
     except KeyError as e_key:
         available_cols_str = df.columns.tolist() if df is not None and isinstance(df, pd.DataFrame) else '未知 (DataFrame未成功加载)'
         logger.error(f"KeyError during operation '{operation_type}': {e_key}. SQO: {sqo}", exc_info=True)
