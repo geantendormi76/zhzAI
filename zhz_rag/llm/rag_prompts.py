@@ -1,8 +1,9 @@
 # /home/zhz/zhz_rag/llm/rag_prompts.py
 from typing import List, Dict, Any
+from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 
 # 可以将 NO_ANSWER_PHRASE_ANSWER_CLEAN 也移到这里，或者从 constants.py 导入
-NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # 保持与 sglang_wrapper.py 一致
+NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # 保持与 llm_interface.py 一致
 
 def get_answer_generation_messages(user_query: str, context_str: str) -> List[Dict[str, str]]:
     """
@@ -27,6 +28,7 @@ def get_answer_generation_messages(user_query: str, context_str: str) -> List[Di
  *   语言表达应专业、客观、清晰易懂。
  *   如果答案包含多个要点，可以使用简洁的列表格式。
 6.  **【避免重复与冗余】**: 如果多个上下文片段提供了相同的信息，请综合它们并给出不重复的答案。
+/no_think
 
 请严格遵守以上指令，以最高的准确性和忠实度来完成回答。
 """
@@ -41,11 +43,14 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
     构建用于生成澄清问题的LLM输入messages。
     """
     system_prompt_for_clarification = f"""你的【唯一任务】是根据用户提供的【用户原始查询】和【不确定性原因】，生成一个【简洁、明确、友好且直接的澄清问句】。
+    
 
 **【严格的输出要求】**
 *   你的【最终且唯一】的输出【必须】是这个澄清问句本身。
 *   【绝对禁止】输出任何思考过程、解释、前缀、后缀或任何与澄清问句无关的文字。
 *   澄清问句本身不应包含用户的原始查询或不确定性原因的复述。
+/no_think
+
 
 **示例：**
 
@@ -86,6 +91,131 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
 
     messages = [
         {"role": "system", "content": system_prompt_for_clarification},
+        {"role": "user", "content": user_content}
+    ]
+    return messages
+
+# --- 精简的Cypher模板定义 (只保留一个核心模板) ---
+SIMPLIFIED_CYPHER_TEMPLATES = [
+    {
+        "id": "template_find_entity_attributes_by_text_label",
+        "description": "根据提供的实体文本和实体标签，查找该实体的所有基本属性。",
+        "template": "MATCH (n:ExtractedEntity {{text: $entity_text, label: $entity_label}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1",
+        "params_needed": ["entity_text", "entity_label"]
+    }
+]
+
+# --- 精简的Schema描述 (只保留与上述模板最相关的部分) ---
+# 注意：NEW_KG_SCHEMA_DESCRIPTION 本身已经很详细了，这里我们为了测试，
+# 可以考虑创建一个更精简的字符串，或者在prompt中只引用NEW_KG_SCHEMA_DESCRIPTION中与ExtractedEntity相关的部分。
+# 为了简单起见，我们先仍然使用完整的 NEW_KG_SCHEMA_DESCRIPTION，但会在prompt中强调只关注ExtractedEntity。
+# 如果依然太长导致问题，下一步可以尝试动态构建一个更小的schema片段传给LLM。
+
+def get_cypher_generation_messages_with_templates(user_question: str) -> List[Dict[str, str]]: # 函数名保持一致
+    """
+    构建用于（基于【单个指定模板】）生成Cypher查询的LLM输入messages。
+    这个版本用于测试模型对单个模板的参数提取能力。
+    """
+    
+    # 在这个测试版本中，我们假设总是使用第一个（也是唯一一个）模板
+    selected_template = SIMPLIFIED_CYPHER_TEMPLATES[0]
+    
+    template_description_for_prompt = f"""你将使用以下Cypher查询模板：
+Template ID: {selected_template['id']}
+Description: {selected_template['description']}
+Cypher Structure: {selected_template['template']}
+Parameters Needed: {', '.join(selected_template['params_needed'])}
+"""
+
+    system_prompt_for_cypher = f"""你是一个精确的参数提取助手。你的任务是根据用户问题，为下面提供的【唯一Cypher查询模板】提取参数，并构建一个Cypher查询。
+
+**【图谱Schema核心部分参考】**
+(你主要关注 `:ExtractedEntity` 节点及其属性: `text`, `label`, `id_prop`。其中 `label` 的常见值是 "PERSON", "ORGANIZATION", "TASK"。)
+{NEW_KG_SCHEMA_DESCRIPTION} 
+# ^^^ Schema描述已包含输出JSON格式 {{"status": "success/unable_to_generate", "query": "..."}} 的指导，请严格遵循该JSON输出格式。
+
+**【当前需要填充的Cypher查询模板】**
+{template_description_for_prompt}
+
+**【你的任务与输出要求】**
+1.  仔细分析【用户问题】，理解其核心查询意图。
+2.  判断该意图是否与提供的【当前需要填充的Cypher查询模板】描述相符。
+3.  如果相符：
+    a.  从【用户问题】中提取填充该模板所需的所有【Parameters Needed】。确保参数值与Schema中的实体文本和标签格式相符（例如，标签应为大写 "PERSON", "ORGANIZATION", "TASK"）。
+    b.  将提取的参数值替换到模板的Cypher语句中（例如，`$entity_text` 替换为提取到的实体名）。
+    c.  最终输出一个JSON对象，格式为：`{{"status": "success", "query": "填充好参数的Cypher语句"}}`。
+4.  如果不相符（例如，用户问题意图与模板描述不符，或无法从问题中提取到模板所需的所有关键参数）：
+    a.  最终输出一个JSON对象，格式为：`{{"status": "unable_to_generate", "query": "无法生成Cypher查询."}}`。
+5.  【绝对禁止】输出任何除了上述指定JSON对象之外的文本、解释或思考过程。
+
+
+**【处理示例】**
+<example>
+  <user_question>我想知道张三的详细信息。</user_question>
+  <assistant_output_json>{{
+    "status": "success",
+    "query": "MATCH (n:ExtractedEntity {{text: '张三', label: 'PERSON'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
+  }}</assistant_output_json>
+</example>
+<example>
+  <user_question>项目Alpha的文档编写任务是什么？</user_question>
+  <assistant_output_json>{{
+    "status": "success",
+    "query": "MATCH (n:ExtractedEntity {{text: '项目alpha的文档编写任务', label: 'TASK'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
+  }}</assistant_output_json>
+</example>
+<example>
+  <user_question>法国的首都是哪里？</user_question>
+  <assistant_output_json>{{
+    "status": "unable_to_generate",
+    "query": "无法生成Cypher查询."
+  }}</assistant_output_json>
+</example>
+"""
+    user_content = f"用户问题: {user_question}"
+
+    messages = [
+        {"role": "system", "content": system_prompt_for_cypher},
+        {"role": "user", "content": user_content}
+    ]
+    return messages
+
+# --- 新增：实体与关系意图提取的提示词生成函数 ---
+def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str, str]]:
+    """
+    构建用于从用户查询中提取核心实体和关系意图的LLM输入messages。
+    目标是输出一个符合 ExtractedEntitiesAndRelationIntent Pydantic 模型结构的JSON。
+    """
+    # 从 NEW_KG_SCHEMA_DESCRIPTION 中提取允许的实体标签，以便在提示中告知LLM
+    # 这是一个简化的提取，实际应用中可能需要更精确地从Schema中获取
+    # 假设 NEW_KG_SCHEMA_DESCRIPTION 中有类似 "label: STRING (实体类型。允许的值: "PERSON", "ORGANIZATION", "TASK")" 的描述
+    import re
+    match = re.search(r'label\s*:\s*STRING\s*\(实体类型。\s*允许的值\s*:\s*("([^"]+)"(?:,\s*"([^"]+)")*)\)', NEW_KG_SCHEMA_DESCRIPTION)
+    allowed_entity_labels_str = "PERSON, ORGANIZATION, TASK" # 默认值
+    if match:
+        # 提取所有带引号的标签
+        labels_group = match.group(1)
+        extracted_labels = re.findall(r'"([^"]+)"', labels_group)
+        if extracted_labels:
+            allowed_entity_labels_str = ", ".join(extracted_labels)
+    
+    system_prompt_for_entity_extraction = f"""你的任务是仔细分析用户提供的【用户问题】，并识别出其中与知识图谱查询相关的核心信息。
+
+**你需要识别以下内容：**
+1.  **核心实体**：问题中提到的1到2个最关键的实体（人名、组织名、任务名等）。
+2.  **实体类型**：为每个识别出的实体，从以下参考类型中推断其最可能的类型：{allowed_entity_labels_str}。如果无法确定，可以不指定类型。
+3.  **关系意图**：如果用户问题暗示了实体间的特定关系，请用简洁的文本描述这个关系意图（例如 “查询工作地点”, “查找负责人”, “获取销售额”）。如果只是查询单个实体的属性，则关系意图不明确。
+
+请在你的回答中清晰地包含这些分析结果。最终的结构化输出将由系统根据你的分析自动完成。
+你只需要专注于准确地理解和提取这些信息。
+"""
+    # 移除了所有关于JSON输出格式的指令和示例，因为将由response_format处理
+    # 也不再需要 /no_think，因为我们期望约束生成能处理好输出
+
+    user_content = f"用户问题: {user_question}\n\n请分析此问题并提取相关实体和关系意图："
+
+    messages = [
+        {"role": "system", "content": system_prompt_for_entity_extraction},
         {"role": "user", "content": user_content}
     ]
     return messages

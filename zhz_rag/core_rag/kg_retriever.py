@@ -3,38 +3,37 @@ import os
 import json
 import kuzu
 import pandas as pd
-from typing import List, Dict, Any, Optional, Callable, Iterator # 确保 Iterator 已导入
+from typing import List, Dict, Any, Optional, Callable, Iterator
 import logging
 from contextlib import contextmanager
 
-# 导入您的Cypher生成函数和Schema描述
-from zhz_rag.llm.sglang_wrapper import generate_cypher_query # 确保路径正确
-from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # 确保路径正确
+# --- 修改：导入新的实体提取函数和Pydantic模型 ---
+from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, IdentifiedEntity
+# from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # Schema现在主要在prompt中使用
+# --- 结束修改 ---
 
 # 日志配置
-kg_logger = logging.getLogger(__name__) 
-# 确保 kg_logger 的级别和处理器已在 zhz_rag_mcp_service 或其他主入口配置，
-# 或者在这里为它单独配置 handler 和 formatter，例如：
+kg_logger = logging.getLogger(__name__)
 if not kg_logger.hasHandlers():
-    kg_logger.setLevel(logging.DEBUG) # 开发时可以设为 DEBUG
+    kg_logger.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
     ch.setFormatter(formatter)
     kg_logger.addHandler(ch)
-    kg_logger.propagate = False # 避免重复日志（如果根logger也配置了handler）
+    kg_logger.propagate = False
 kg_logger.info("KGRetriever (KuzuDB) logger initialized/reconfirmed.")
 
 
 class KGRetriever:
     KUZU_DB_PATH_ENV = os.getenv("KUZU_DB_PATH", "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db")
 
-    def __init__(self, db_path: Optional[str] = None, llm_cypher_generator_func: Callable = generate_cypher_query):
+    # 移除 llm_cypher_generator_func 参数，因为我们将使用新的实体提取流程
+    def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
-        self.llm_cypher_generator_func = llm_cypher_generator_func
         self._db: Optional[kuzu.Database] = None
-        kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. Attempting to connect to DB path: {self.db_path}")
+        kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. DB path: {self.db_path}")
         self._connect_to_kuzu()
-        # 这条日志现在移到 _connect_to_kuzu 成功之后打印
 
     def _connect_to_kuzu(self):
         kg_logger.info(f"Attempting to load KuzuDB from path: {self.db_path}")
@@ -42,12 +41,10 @@ class KGRetriever:
             if not os.path.exists(self.db_path):
                 kg_logger.error(f"KuzuDB path does not exist: {self.db_path}. KGRetriever cannot connect.")
                 self._db = None
-                return # 明确返回
-            
-            # 对于检索，通常只读即可，除非有特殊写需求
-            # 如果 mcpo 服务可能并发访问，需要考虑 KuzuDB 的并发处理能力和锁机制
-            self._db = kuzu.Database(self.db_path, read_only=True) 
-            kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path}. KGRetriever (KuzuDB) initialized and connected.")
+                return
+            # 考虑是否需要在配置文件中指定 read_only 模式
+            self._db = kuzu.Database(self.db_path, read_only=True)
+            kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path}.")
         except Exception as e:
             kg_logger.error(f"Failed to connect to KuzuDB at {self.db_path}: {e}", exc_info=True)
             self._db = None
@@ -56,133 +53,207 @@ class KGRetriever:
     def _get_connection(self) -> Iterator[kuzu.Connection]:
         if not self._db:
             kg_logger.warning("KuzuDB database object is None in _get_connection. Attempting to reconnect...")
-            self._connect_to_kuzu() # 尝试重新连接
-            if not self._db: # 再次检查
+            self._connect_to_kuzu()
+            if not self._db:
                 kg_logger.error("KuzuDB reconnection failed. Cannot get a connection.")
                 raise ConnectionError("KuzuDB is not connected or failed to reconnect. Cannot get a connection.")
-        
-        conn = None # 初始化 conn
+        conn = None
         try:
             conn = kuzu.Connection(self._db)
             kg_logger.debug("KuzuDB connection obtained.")
             yield conn
-        except Exception as e_conn: # 捕获 kuzu.Connection() 可能的异常
+        except Exception as e_conn:
             kg_logger.error(f"Failed to create KuzuDB connection object: {e_conn}", exc_info=True)
             raise ConnectionError(f"Failed to create KuzuDB connection: {e_conn}")
         finally:
-            # Kuzu Connection 对象没有显式的 close() 方法。
-            # 它通常在其关联的 Database 对象被销毁时或垃圾回收时关闭。
             kg_logger.debug("KuzuDB connection context manager exiting.")
-            pass 
+            pass
 
     def close(self):
         kg_logger.info(f"Closing KuzuDB for retriever using path: {self.db_path}")
         if self._db:
-            # KuzuDB Database 对象在其 __del__ 方法中处理关闭和资源释放。
-            # 显式删除引用有助于触发垃圾回收，但不保证立即关闭。
-            # KuzuDB 没有显式的 db.close() 方法。
             del self._db
             self._db = None
             kg_logger.info("KuzuDB Database object dereferenced (closed).")
 
-    def execute_cypher_query_sync(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _execute_cypher_query_sync(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not self._db:
-            kg_logger.error("KuzuDB not initialized in execute_cypher_query_sync. Cannot execute query.")
+            kg_logger.error("KuzuDB not initialized in _execute_cypher_query_sync. Cannot execute query.")
             return []
-        
-        kg_logger.info(f"--- Executing KuzuDB Cypher ---")
-        kg_logger.info(f"Query: {query}")
-        kg_logger.info(f"Params: {parameters if parameters else 'No parameters'}")
-        
+        kg_logger.info(f"--- Executing KuzuDB Cypher --- Query: {query}, Params: {parameters if parameters else 'No parameters'}")
         results_list: List[Dict[str, Any]] = []
         try:
-            with self._get_connection() as conn: # 使用上下文管理器获取连接
-                prepared_statement = conn.prepare(query)
-                # 注意：KuzuDB 的 execute 方法对参数的处理方式。
-                # 如果 parameters 为 None 或空字典，应传递 None 或 {}。
-                # 如果查询本身不包含参数占位符，传递参数字典可能会导致错误。
-                # 我们需要确保Cypher查询中的参数占位符（如 $param）与parameters字典中的键匹配。
-                
-                actual_params = parameters if parameters else {} # 确保是字典
-                query_result = conn.execute(prepared_statement, **actual_params) # 使用 ** 解包参数
-                
-                df = query_result.get_as_df()
-                results_list = df.to_dict(orient='records')
-                
-                kg_logger.info(f"KuzuDB Cypher executed. Records count: {len(results_list)}")
-                if results_list:
-                    kg_logger.debug(f"First KuzuDB record (sample): {json.dumps(results_list[0], ensure_ascii=False, indent=2, default=str)}")
+            with self._get_connection() as conn:
+                actual_params = parameters if parameters else {}
+            # 直接将查询字符串和参数字典传递给 execute
+                query_result = conn.execute(query, parameters=actual_params)
+                # KuzuDB QueryResult to_df() is deprecated, use get_as_df()
+                if hasattr(query_result, 'get_as_df'):
+                    df = pd.DataFrame(query_result.get_as_df())
+                    results_list = df.to_dict(orient='records')
+                elif isinstance(query_result, list): # 有些简单的执行可能直接返回列表
+                    # 如果是列表，我们需要确定其结构是否是我们期望的 List[Dict]
+                    # 为简单起见，如果不是DataFrame兼容的，我们先认为没有结构化结果返回用于进一步处理
+                    kg_logger.info("KuzuDB query did not return a DataFrame-convertible result, result is a list.")
+                    # 根据实际情况处理列表结果，或将其置空
+                    # results_list = query_result # 如果列表内已经是dict
                 else:
-                    kg_logger.debug("KuzuDB query returned no records.")
-        except RuntimeError as kuzu_runtime_error: # KuzuDB Python API 通常抛出 RuntimeError
+                    kg_logger.info(f"KuzuDB query did not return a DataFrame-convertible result. Type: {type(query_result)}")
+
+                kg_logger.info(f"KuzuDB Cypher executed. Records count (from DataFrame): {len(results_list)}")
+                if results_list: 
+                    kg_logger.debug(f"First KuzuDB record (from DataFrame): {str(results_list[0])[:200]}")
+                elif not hasattr(query_result, 'get_as_df'):
+                     kg_logger.debug(f"KuzuDB query result (raw, not DataFrame): {str(query_result)[:200]}")
+
+
+        except RuntimeError as kuzu_runtime_error:
              kg_logger.error(f"KuzuDB RuntimeError during Cypher execution: '{query}' with params: {parameters}. Error: {kuzu_runtime_error}", exc_info=True)
-             # 可以考虑将 KuzuDB 的错误信息包装后向上抛出或返回
-             # return [{"error": f"KuzuDB execution error: {kuzu_runtime_error}"}] 
         except ConnectionError as conn_err: # 如果 _get_connection 内部抛出
              kg_logger.error(f"KuzuDB ConnectionError during Cypher execution: {conn_err}", exc_info=True)
+        except TypeError as e_type: # 捕获可能的TypeError，以便更详细地调试
+            kg_logger.error(f"TypeError during KuzuDB Cypher execution: '{query}' with params: {parameters}. Error: {e_type}", exc_info=True)
         except Exception as e:
             kg_logger.error(f"Unexpected error executing KuzuDB Cypher query: '{query}' with params: {parameters}. Error: {e}", exc_info=True)
         return results_list
 
-    # ... ( _format_kuzu_record_for_retrieval 和 retrieve_with_llm_cypher 保持不变，
-    # 但 retrieve_with_llm_cypher 内部对 execute_cypher_query_sync 的调用现在会经过新的错误处理) ...
-    def _format_kuzu_record_for_retrieval(self, record_data: Dict[str, Any]) -> str:
-        # ... (保持不变)
-        parts = []
-        for key, value in record_data.items():
-            if isinstance(value, dict): 
-                if 'label' in value and 'text' in value: 
-                    parts.append(f"{key}({value['text']}:{value['label']})")
-                elif '_label' in value and '_src' in value and '_dst' in value: 
-                     parts.append(f"{key}(TYPE={value['_label']})")
-                else:
-                    value_str = json.dumps(value, ensure_ascii=False, default=str) 
-                    if len(value_str) > 100: value_str = value_str[:100] + "..."
-                    parts.append(f"{key}: {value_str}")
-            elif value is not None:
-                parts.append(f"{key}: {str(value)}")
-        return " | ".join(parts) if parts else "No specific details found in this KuzuDB record."
+    def _format_kuzu_records_for_retrieval(self, records: List[Dict[str, Any]], query_context: str = "") -> List[Dict[str, Any]]:
+        formatted_docs = []
+        if not records:
+            return formatted_docs
 
-
-    async def retrieve_with_llm_cypher(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        kg_logger.info(f"Starting KG retrieval (KuzuDB) with LLM-generated Cypher for query: '{query}', top_k: {top_k}")
-        
-        kg_logger.info(f"Calling LLM to generate Cypher query for KuzuDB...")
-        # 将接收结果的变量名统一为 cypher_query_or_unable_msg
-        cypher_query_or_unable_msg = await self.llm_cypher_generator_func(
-            user_question=query,
-            kg_schema_description=NEW_KG_SCHEMA_DESCRIPTION 
-        )
-        kg_logger.info(f"LLM generated Cypher query/message for KuzuDB:\n---\n{cypher_query_or_unable_msg}\n---")
-
-        # --- [使用正确的变量名进行检查] ---
-        if not cypher_query_or_unable_msg or cypher_query_or_unable_msg == "无法生成Cypher查询.":
-            kg_logger.warning("LLM could not generate a valid Cypher query for KuzuDB or returned 'unable to generate' message.")
-            return [] # 直接返回空列表
-
-        # 如果是有效的 Cypher 查询，则继续
-        cypher_to_execute = cypher_query_or_unable_msg # <--- 使用正确的变量名
-        
-        cypher_query_with_limit: str # 明确类型
-        if "LIMIT" not in cypher_to_execute.upper(): # 保持大小写不敏感的检查
-            cypher_query_with_limit = f"{cypher_to_execute} LIMIT {top_k}"
-        else: 
-            cypher_query_with_limit = cypher_to_execute
-            kg_logger.info(f"Query already contains LIMIT, using as is: {cypher_query_with_limit}")
-
-        results_from_kuzu = self.execute_cypher_query_sync(cypher_query_with_limit)
-        
-        retrieved_docs_for_rag: List[Dict[str, Any]] = []
-        for record_dict in results_from_kuzu:
-            content_str = self._format_kuzu_record_for_retrieval(record_dict)
+        for record_data in records:
+            parts = []
+            primary_info_keys = ['text', 'label', 'id_prop', 'name', 'related_text', 'related_label', 'relationship']
+            for key in primary_info_keys:
+                if key in record_data and record_data[key] is not None:
+                    parts.append(f"{key.replace('_', ' ').capitalize()}: {record_data[key]}")
+            
+            for key, value in record_data.items():
+                if key not in primary_info_keys and value is not None:
+                    if isinstance(value, dict):
+                        if '_label' in value and '_src' in value and '_dst' in value: 
+                             parts.append(f"Relation Type: {value['_label']}")
+                        else:
+                             value_str = json.dumps(value, ensure_ascii=False, default=str)
+                             if len(value_str) > 70: value_str = value_str[:70] + "..."
+                             parts.append(f"{key}: {value_str}")
+                    else:
+                        parts.append(f"{key}: {str(value)}")
+            
+            content_str = " | ".join(parts) if parts else "Retrieved graph data node/relation."
+            
             doc_data = {
                 "source_type": "knowledge_graph_kuzu",
                 "content": content_str,
-                "score": 1.0, 
-                # 使用 cypher_to_execute (即原始的、未加 LIMIT 的 Cypher) 进行记录
-                "metadata": {"cypher_query": cypher_to_execute, "original_query": query, "raw_kuzu_record": record_dict}
+                "score": record_data.get('_score', 0.85), # Default score if not from vector search
+                "metadata": {
+                    "original_user_query_for_kg": query_context,
+                    "retrieved_kuzu_record_preview": {k: record_data[k] for k in primary_info_keys if k in record_data}
+                }
             }
-            retrieved_docs_for_rag.append(doc_data)
+            formatted_docs.append(doc_data)
+        return formatted_docs
 
-        kg_logger.info(f"Retrieved {len(retrieved_docs_for_rag)} documents from KuzuDB using LLM-generated Cypher.")
-        return retrieved_docs_for_rag
+    async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]: # Renamed main retrieval method
+        kg_logger.info(f"Starting KG retrieval with LLM-extracted entities for query: '{user_query}', top_k: {top_k}")
+
+        extracted_info: Optional[ExtractedEntitiesAndRelationIntent] = await extract_entities_for_kg_query(user_query)
+
+        if not extracted_info or not extracted_info.entities:
+            kg_logger.warning(f"LLM did not extract any entities for query: '{user_query}'. KG retrieval cannot proceed.")
+            return []
+        
+        kg_logger.info(f"LLM extracted: Entities: {[e.model_dump() for e in extracted_info.entities]}, Relation Hint: {extracted_info.relation_hint}")
+
+        all_kuzu_records: List[Dict[str, Any]] = []
+
+        for entity_info in extracted_info.entities:
+            if not entity_info.text:
+                continue
+
+            # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
+            # TODO: Implement KuzuDB vector search logic here.
+            # This requires:
+            # 1. An embedding function (e.g., from SentenceTransformer) to convert entity_info.text to a vector.
+            # 2. Knowing the name of your vector index in KuzuDB.
+            # 3. Executing a KuzuDB CALL db.idx.lookup(...) query.
+            # Example (conceptual):
+            # query_vector = self.embedding_function(entity_info.text)
+            # vector_search_query = "CALL db.idx.lookup('your_node_vector_index', $query_vec, $k) YIELD node, score RETURN node.text, node.label, node.id_prop, score"
+            # params = {"query_vec": query_vector, "k": top_k}
+            # vector_results = self._execute_cypher_query_sync(vector_search_query, params)
+            # if vector_results:
+            #     all_kuzu_records.extend(vector_results)
+            #     kg_logger.info(f"Retrieved {len(vector_results)} records via vector search for entity: '{entity_info.text}'")
+            
+            # --- Strategy 2: Template-based Cypher (if entity label is known, or as fallback) ---
+            # This part uses simple Cypher based on extracted entity text and label.
+            if entity_info.label: # Only proceed if LLM provided a label
+                # Template 1: Get attributes of the identified entity
+                attr_query = "MATCH (n:ExtractedEntity {text: $text, label: $label}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop, 1.0 AS _score LIMIT 1"
+                attr_params = {"text": entity_info.text, "label": entity_info.label.upper()}
+                kg_logger.info(f"Executing attribute query for: {entity_info.text} ({entity_info.label})")
+                attr_results = self._execute_cypher_query_sync(attr_query, attr_params)
+                if attr_results:
+                    all_kuzu_records.extend(attr_results)
+
+                # Template 2: If a relation_hint exists, try to find 1-hop neighbors
+                if extracted_info.relation_hint:
+                    # This mapping from relation_hint to actual Cypher relation type needs to be robust
+                    # For MVP, we can try a generic neighbor search or map common hints
+                    # Example: if relation_hint is "工作" and entity_info.label is "PERSON", map to "WORKS_AT"
+                    mapped_rel_type = None
+                    if "工作" in extracted_info.relation_hint and entity_info.label == "PERSON":
+                        mapped_rel_type = "WorksAt"
+                    elif "分配" in extracted_info.relation_hint and entity_info.label == "TASK":
+                        mapped_rel_type = "AssignedTo"
+                    
+                    if mapped_rel_type:
+                        neighbor_query = f"""
+                            MATCH (src:ExtractedEntity {{text: $text, label: $label}})
+                                  -[r:{mapped_rel_type}]->
+                                  (tgt:ExtractedEntity)
+                            RETURN tgt.text AS related_text, tgt.label AS related_label, label(r) as relationship, 0.9 AS _score 
+                            LIMIT {top_k}
+                        """
+                        neighbor_params = {"text": entity_info.text, "label": entity_info.label.upper()}
+                        kg_logger.info(f"Executing neighbor query for: {entity_info.text} via relation {mapped_rel_type}")
+                        neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
+                        if neighbor_results:
+                            all_kuzu_records.extend(neighbor_results)
+            else:
+                kg_logger.info(f"Skipping template-based Cypher for entity '{entity_info.text}' as label was not provided by LLM.")
+
+
+        if not all_kuzu_records:
+            kg_logger.info(f"No records retrieved from KuzuDB for query: '{user_query}' after all strategies.")
+            return []
+
+        # Deduplicate records (e.g., if vector search and template search return same nodes)
+        # A simple way is to convert to DataFrame and drop duplicates based on id_prop or text+label
+        if all_kuzu_records:
+            try:
+                df_records = pd.DataFrame(all_kuzu_records)
+                # Assuming 'id_prop' is a unique identifier for nodes, or use a combination of text and label
+                # We need to handle cases where 'id_prop' might not be present in all results (e.g., from neighbor queries)
+                # For simplicity, let's try to deduplicate based on the 'content' we will generate
+                
+                # First, generate content for all, then deduplicate based on content
+                temp_formatted_for_dedup = self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)
+                unique_contents = {}
+                deduplicated_records_formatted = []
+                for doc_dict in temp_formatted_for_dedup:
+                    if doc_dict["content"] not in unique_contents:
+                        unique_contents[doc_dict["content"]] = True
+                        deduplicated_records_formatted.append(doc_dict)
+                
+                kg_logger.info(f"Deduplicated KuzuDB results from {len(all_kuzu_records)} to {len(deduplicated_records_formatted)} records.")
+                return deduplicated_records_formatted[:top_k] # Apply top_k after deduplication
+            except Exception as e_dedup:
+                kg_logger.error(f"Error during deduplication of KuzuDB results: {e_dedup}", exc_info=True)
+                # Fallback to returning raw (potentially duplicated) records if deduplication fails
+                return self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)[:top_k]
+
+
+        return self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)[:top_k]

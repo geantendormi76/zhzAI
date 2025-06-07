@@ -1,10 +1,10 @@
 # /home/zhz/zhz_agent/zhz_rag/llm/__init__.py
 
-from .sglang_wrapper import call_llm_via_openai_api_local_only # 导入新函数
+from .llm_interface import call_llm_via_openai_api_local_only # 导入新函数
 
 call_sglang_llm = call_llm_via_openai_api_local_only # 别名指向新函数
 
-from .sglang_wrapper import (
+from .llm_interface import (
     generate_answer_from_context,
     generate_cypher_query,
     generate_expanded_queries,

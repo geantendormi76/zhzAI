@@ -1,5 +1,5 @@
-# zhz_agent/llm.py (renamed to sglang_wrapper.py as per typical module naming)
-# or more accurately, this is the content for sglang_wrapper.py based on the inputs
+# zhz_agent/llm.py (renamed to llm_interface.py as per typical module naming)
+# or more accurately, this is the content for llm_interface.py based on the inputs
 
 import os
 import httpx  # 用于异步HTTP请求
@@ -12,12 +12,14 @@ import traceback  # Ensure traceback is imported
 from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
-
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
 # 提示词导入
 from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
-    get_clarification_question_messages) # <--- 添加导入
-
+    get_clarification_question_messages,
+    get_entity_relation_extraction_messages, # <--- 添加导入
+    # get_cypher_generation_messages_with_templates # 这个可以暂时保留或注释掉
+)
 
 
 import logging
@@ -125,8 +127,6 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 
 LLM_API_URL = os.getenv("SGLANG_API_URL", "http://localhost:8088/v1/chat/completions")
 
-# 添加回这个函数，但它现在只被 generate_answer_from_context, generate_cypher_query 等调用
-# 并且目标是本地的 OpenAI 兼容服务
 async def call_llm_via_openai_api_local_only( # 改个名字以示区分
     prompt: Union[str, List[Dict[str, str]]], # prompt 可以是字符串或消息列表
     temperature: float = 0.2,
@@ -189,8 +189,8 @@ async def call_llm_via_openai_api_local_only( # 改个名字以示区分
                 raw_llm_output_text = response_json["choices"][0]["message"].get("content", "")
             else:
                 raw_llm_output_text = "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE_LOCAL]]"
-            llm_py_logger.info(f"Local LLM Raw Output: {str(raw_llm_output_text)[:200]}...")
-    # ... (省略错误处理和日志记录，与您之前的 call_llm_via_openai_api 类似) ...
+            llm_py_logger.info(f"FULL Local LLM Raw Output for task '{task_type}': >>>{raw_llm_output_text}<<<")
+
     except Exception as e:
         llm_py_logger.error(f"Error calling local LLM service: {e}", exc_info=True)
         error_info = str(e)
@@ -219,64 +219,51 @@ async def call_llm_via_openai_api_local_only( # 改个名字以示区分
     await log_interaction_data(log_success_data)
     return raw_llm_output_text
 
-async def generate_cypher_query(user_question: str, kg_schema_description: str = NEW_KG_SCHEMA_DESCRIPTION) -> Optional[str]:
-    llm_py_logger.info(f"Attempting to generate Cypher query for: '{user_question}' via local service with GBNF + post-processing.")
-    
-    system_prompt_for_json_cypher = kg_schema_description 
-    messages_for_llm = [
-        {"role": "system", "content": system_prompt_for_json_cypher},
-        {"role": "user", "content": f"用户问题: {user_question}"} 
-    ]
-    cypher_stop_sequences = ['<|im_end|>', '无法生成Cypher查询.', '```'] # 添加 '```' 以防模型生成 Markdown 后想继续
+async def generate_cypher_query(user_question: str) -> Optional[str]: # kg_schema_description 参数可以移除了，因为它已包含在新的prompt函数中
+    llm_py_logger.info(f"Attempting to generate Cypher query (template-based) for: '{user_question}' via local service.")
+
+    messages_for_llm = get_cypher_generation_messages_with_templates(user_question)
+
+    cypher_stop_sequences = ['<|im_end|>', '```'] # 如果输出包含markdown的json块
 
     llm_response_json_str = await call_llm_via_openai_api_local_only( 
         prompt=messages_for_llm,
-        temperature=0.0, 
-        max_new_tokens=1024, 
-        stop_sequences=cypher_stop_sequences, # <--- 使用定义的 stop_sequences
-        task_type="cypher_generation_final_attempt_local_service",
+        temperature=0.0, # 对于精确的JSON和Cypher生成，温度设为0
+        max_new_tokens=1024, # 允许足够的空间输出JSON和Cypher
+        stop_sequences=cypher_stop_sequences,
+        task_type="cypher_generation_template_based_local_service",
         user_query_for_log=user_question,
-        model_name_for_log="qwen3_gguf_cypher_final_local"
+        model_name_for_log="qwen3_gguf_cypher_template_local"
     )
 
     if not llm_response_json_str:
-        llm_py_logger.warning(f"LLM call for Cypher (local_final) returned None or empty. User question: '{user_question}'")
-        return "无法生成Cypher查询."
+        llm_py_logger.warning(f"LLM call for Cypher (template-based) returned None or empty. User question: '{user_question}'")
+        return json.dumps({"status": "unable_to_generate", "query": "无法生成Cypher查询."}) # 始终返回JSON字符串
+
+    cleaned_json_str = llm_response_json_str.strip()
+    if cleaned_json_str.startswith("```json"):
+        cleaned_json_str = cleaned_json_str[len("```json"):].strip()
+    if cleaned_json_str.endswith("```"):
+        cleaned_json_str = cleaned_json_str[:-len("```")].strip()
 
     try:
-        parsed_response = json.loads(llm_response_json_str)
-        
-        status = parsed_response.get("status")
-        query_content = parsed_response.get("query")
 
-        # Log the received JSON from local_llm_service
-        log_data_received = {
-            "interaction_id": str(uuid.uuid4()),
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "cypher_json_received_from_local_service",
-            "user_query_for_task": user_question,
-            "raw_json_from_local_service": llm_response_json_str,
-            "parsed_status_from_local_service": status,
-            "parsed_query_from_local_service": query_content
-        }
-        await log_interaction_data(log_data_received)
-
-        if status == "success" and isinstance(query_content, str) and query_content.strip():
-            llm_py_logger.info(f"Successfully extracted Cypher from local service JSON: {query_content}")
-            return query_content.strip()
-        elif status == "unable_to_generate" and query_content == "无法生成Cypher查询.":
-            llm_py_logger.info(f"Local service indicated 'unable_to_generate' for: '{user_question}'")
-            return "无法生成Cypher查询."
-        else: # Should not happen if local_llm_service.py works as designed
-            llm_py_logger.warning(f"Unexpected JSON structure from local_llm_service. Status: {status}, Query: {query_content}. Defaulting to 'unable'.")
-            return "无法生成Cypher查询."
-            
+        parsed_for_validation = json.loads(cleaned_json_str)
+        if isinstance(parsed_for_validation, dict) and \
+           "status" in parsed_for_validation and \
+           "query" in parsed_for_validation:
+            llm_py_logger.info(f"LLM returned valid JSON for Cypher (template-based): {cleaned_json_str}")
+            return cleaned_json_str
+        else:
+            llm_py_logger.warning(f"LLM output for Cypher (template-based) was JSON but not expected structure: {cleaned_json_str}")
+            return json.dumps({"status": "unable_to_generate", "query": "LLM输出JSON结构错误."})
     except json.JSONDecodeError:
-        llm_py_logger.error(f"Failed to parse JSON response from local_llm_service: '{llm_response_json_str}'", exc_info=True)
-        return "无法生成Cypher查询."
-    except Exception as e:
-        llm_py_logger.error(f"Error processing response from local_llm_service: {e}", exc_info=True)
-        return "无法生成Cypher查询."
+        llm_py_logger.error(f"Failed to parse JSON response for Cypher (template-based): '{cleaned_json_str}'", exc_info=True)
+        # 如果不是有效的JSON，但包含"MATCH"，可能LLM直接输出了Cypher，尝试包装它
+        if "MATCH" in cleaned_json_str.upper() or "RETURN" in cleaned_json_str.upper():
+             llm_py_logger.warning("LLM output for Cypher (template-based) was not JSON but looks like Cypher, wrapping it.")
+             return json.dumps({"status": "success", "query": cleaned_json_str})
+        return json.dumps({"status": "unable_to_generate", "query": "LLM输出非JSON格式."})
 
 async def generate_answer_from_context(user_query: str, context_str: str) -> Optional[str]: # context 参数名改为 context_str
     llm_py_logger.info(f"Generating answer for query: '{user_query[:100]}...' using provided context.")
@@ -296,7 +283,7 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
        raw_answer.strip() != "[[CONTENT_NOT_FOUND]]":
         
         final_answer = raw_answer.strip()
-        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN: # NO_ANSWER_PHRASE_ANSWER_CLEAN 可以从 rag_prompts.py 导入或在 sglang_wrapper.py 中也定义
+        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN: # NO_ANSWER_PHRASE_ANSWER_CLEAN 可以从 rag_prompts.py 导入或在 llm_interface.py 中也定义
             llm_py_logger.info("LLM indicated unable to answer from context.")
         return final_answer
     else:
@@ -676,3 +663,45 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
     
     llm_py_logger.warning(f"Gemini failed to generate valid intent classification, defaulting to no clarification needed. Error: {error_info_intent or 'Unknown reason'}")
     return {"clarification_needed": False, "reason": f"Intent classification by Gemini failed: {error_info_intent or 'Unknown reason'}"}
+
+# --- 新增：用于提取实体和关系意图的函数 ---
+async def extract_entities_for_kg_query(user_question: str) -> Optional[ExtractedEntitiesAndRelationIntent]:
+    """
+    调用LLM从用户查询中提取核心实体和关系意图，并返回一个结构化的Pydantic对象。
+    """
+    llm_py_logger.info(f"Attempting to extract entities and relation intent for KG query from: '{user_question}'")
+
+    messages_for_llm = get_entity_relation_extraction_messages(user_question)
+
+    llm_response_json_str = await call_llm_via_openai_api_local_only(
+        prompt=messages_for_llm,
+        temperature=0.1, # 较低的温度
+        max_new_tokens=512, # 应该足够输出期望的JSON
+        stop_sequences=['<|im_end|>', '```'], # 尝试在代码块结束时停止
+        task_type="kg_entity_relation_extraction",
+        user_query_for_log=user_question,
+        model_name_for_log="qwen3_gguf_kg_entity_extraction"
+    )
+
+    if not llm_response_json_str:
+        llm_py_logger.warning(f"LLM call for KG entity/relation extraction returned None or empty. User question: '{user_question}'")
+        return None
+
+    cleaned_json_str = llm_response_json_str.strip()
+
+    # --- 修改/添加这一行 ---
+    llm_py_logger.info(f"FULL Cleaned JSON string from LLM for entity extraction: >>>{cleaned_json_str}<<<")
+    # --- 修改/添加结束 ---
+
+    try:
+        parsed_data = json.loads(cleaned_json_str)
+        # 使用Pydantic模型进行验证和转换
+        extracted_info = ExtractedEntitiesAndRelationIntent(**parsed_data)
+        llm_py_logger.info(f"Successfully parsed Pydantic model from LLM output: {extracted_info.model_dump_json(indent=2)}")
+        return extracted_info
+    except json.JSONDecodeError as e_json:
+        llm_py_logger.error(f"Failed to decode JSON from LLM for entity extraction: '{cleaned_json_str}'. Error: {e_json}", exc_info=True)
+        return None
+    except Exception as e_pydantic: # Catch Pydantic validation errors or other issues
+        llm_py_logger.error(f"Failed to validate or parse Pydantic model from LLM JSON for entity extraction: '{cleaned_json_str}'. Error: {e_pydantic}", exc_info=True)
+        return None

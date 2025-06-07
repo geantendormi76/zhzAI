@@ -17,7 +17,7 @@ try:
     from zhz_rag.config.pydantic_models import RetrievedDocument
     # NO_ANSWER_PHRASE_ANSWER_CLEAN 将从 llm.py 导入，或者在constants.py中定义
     # 我们需要与 llm.py -> generate_answer_from_context 一致的 "无法回答" 短语
-    from zhz_rag.llm.sglang_wrapper import NO_ANSWER_PHRASE_ANSWER_CLEAN 
+    from zhz_rag.llm.llm_interface import NO_ANSWER_PHRASE_ANSWER_CLEAN 
 except ImportError as e:
     print(f"ERROR: Could not import necessary modules for refine_answer_finetune_data: {e}")
     exit(1)

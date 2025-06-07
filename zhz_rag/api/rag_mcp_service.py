@@ -40,7 +40,7 @@ except Exception as e:
 
 # --- 从项目内部导入所有 RAG 模块 ---
 from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
-from zhz_rag.llm.sglang_wrapper import (
+from zhz_rag.llm.llm_interface import (
     generate_answer_from_context,
     generate_expanded_queries,
     generate_cypher_query,

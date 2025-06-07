@@ -14,7 +14,7 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from zhz_rag.core_rag.kg_retriever import KGRetriever
-    from zhz_rag.llm.sglang_wrapper import generate_cypher_query # KGRetriever 依赖它
+    from zhz_rag.llm.llm_interface import generate_cypher_query # KGRetriever 依赖它
     from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # generate_cypher_query 依赖它
 except ImportError as e:
     print(f"Error importing necessary modules: {e}")

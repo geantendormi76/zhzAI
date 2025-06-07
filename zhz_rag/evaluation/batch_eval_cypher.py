@@ -204,7 +204,7 @@ if __name__ == "__main__":
         app_version_tag_env += "_simulated"
 
     # --- 配置目标 task_type 和字段映射 ---
-    # sglang_wrapper.py 中的 generate_cypher_query 记录的 task_type 是 "cypher_generation_final_attempt_local_service"
+    # llm_interface.py 中的 generate_cypher_query 记录的 task_type 是 "cypher_generation_final_attempt_local_service"
     # 其 "raw_llm_output" 字段包含的是 local_llm_service 返回的 JSON 字符串: {"status": ..., "query": ...}
     cypher_gen_task_types = ["cypher_generation_final_attempt_local_service", "cypher_generation"] # 包含旧的以防万一
     cypher_gen_field_map = {

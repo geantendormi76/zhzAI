@@ -33,8 +33,8 @@ REFACTOR_RULES = [
     ("from zhz_agent.fusion import", "from zhz_rag.core_rag.fusion_engine import", True), # fusion.py became fusion_engine.py
 
     # 4. LLM related
-    ("from zhz_agent.llm import", "from zhz_rag.llm.sglang_wrapper import", True), # llm.py became sglang_wrapper.py
-    ("import zhz_agent.llm", "import zhz_rag.llm.sglang_wrapper", True),
+    ("from zhz_agent.llm import", "from zhz_rag.llm.llm_interface import", True), # llm.py became llm_interface.py
+    ("import zhz_agent.llm", "import zhz_rag.llm.llm_interface", True),
     ("from zhz_agent.custom_llm import", "from zhz_rag.llm.custom_crewai_llms import", True), # custom_llm.py became custom_crewai_llms.py
 
     # 5. Evaluation related

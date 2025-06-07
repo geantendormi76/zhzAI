@@ -1,5 +1,5 @@
 # /home/zhz/zhz_agent/zhz_rag/config/pydantic_models.py
-from pydantic import BaseModel, Field, root_validator # 使用 root_validator 替代 model_validator
+from pydantic import BaseModel, Field, root_validator
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime
@@ -16,15 +16,8 @@ class QueryRequest(BaseModel):
     @classmethod
     def remove_internal_params(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(values, dict):
-            # print(f"Pydantic DEBUG (QueryRequest before validation): Received data for validation: {str(values)[:500]}") # 可以取消注释以进行调试
-            removed_security_context = values.pop('security_context', None)
-            if removed_security_context:
-                # print(f"Pydantic INFO (QueryRequest before validation): Removed 'security_context': {str(removed_security_context)[:100]}")
-                pass
-            removed_agent_fingerprint = values.pop('agent_fingerprint', None)
-            if removed_agent_fingerprint:
-                # print(f"Pydantic INFO (QueryRequest before validation): Removed 'agent_fingerprint': {str(removed_agent_fingerprint)[:100]}")
-                pass
+            values.pop('security_context', None)
+            values.pop('agent_fingerprint', None)
         return values
 
     class Config:
@@ -75,7 +68,14 @@ class TaskModel(BaseModel):
 
     class Config:
         use_enum_values = True
-        orm_mode = True # Pydantic V1 中使用 orm_mode = True 替代 from_attributes
+        # Pydantic V2 uses model_config, or just rely on default behavior if orm_mode was for SQLAlchemy V1 style
+        # For Pydantic V2, if you need ORM mode (e.g. for SQLAlchemy integration):
+        # model_config = {"from_attributes": True} 
+        # However, if you are not directly using it with an ORM that way, orm_mode=True might be a V1 relic.
+        # For now, I will keep it as orm_mode = True as per your original file,
+        # but be aware it might need adjustment if you are on Pydantic V2 and using its ORM features.
+        orm_mode = True
+
 
 class CreateTaskRequest(BaseModel):
     title: str
@@ -105,3 +105,12 @@ class UpdateTaskRequest(BaseModel):
 
     class Config:
         extra = 'forbid'
+
+
+class IdentifiedEntity(BaseModel):
+    text: str = Field(description="识别出的实体文本。")
+    label: Optional[str] = Field(None, description="推断的实体类型 (例如 PERSON, ORGANIZATION, TASK)。")
+
+class ExtractedEntitiesAndRelationIntent(BaseModel):
+    entities: List[IdentifiedEntity] = Field(default_factory=list, description="从用户查询中识别出的核心实体列表（通常1-2个）。")
+    relation_hint: Optional[str] = Field(None, description="如果用户查询暗示了实体间的特定关系，这里是关系的文本描述或关键词（例如 “工作于”, “负责”, “销售额”）。")

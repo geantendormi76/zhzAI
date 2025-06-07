@@ -7,6 +7,10 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional, Union
 import json
 
+
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
+
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import JSONResponse
@@ -185,6 +189,20 @@ def post_process_llm_output(content: Optional[str], finish_reason: Optional[str]
 async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: ChatCompletionRequest):
     global llama_model, model_path_global, logit_bias_for_failure_phrase
     
+    # --- 添加调试日志 ---
+    print("\n--- local_llm_service: Received /v1/chat/completions request ---")
+    try:
+        print(f"Request Body (raw): {await fastapi_req.body()}") # 打印原始请求体
+        print(f"Request Model: {request.model}")
+        print(f"Request Messages (count): {len(request.messages) if request.messages else 0}")
+        print(f"Request Temperature: {request.temperature}")
+        print(f"Request Max Tokens: {request.max_tokens}")
+        print(f"Request Stop: {request.stop}")
+    except Exception as e_req_log:
+        print(f"Error logging request details: {e_req_log}")
+    # --- 调试日志结束 ---
+
+
     loaded_cypher_path_grammar: Optional[LlamaGrammar] = getattr(fastapi_req.app.state, 'cypher_path_grammar', None)
     
     if llama_model is None:
@@ -224,6 +242,21 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
             "stop": request.stop,
         }
 
+            # --- 新增：根据模型名称判断是否启用JSON模式 ---
+        # 假设模型名称中包含 "kg_entity_extraction" 表示我们期望JSON输出
+        if "kg_entity_extraction" in request.model.lower():
+            try:
+                json_schema_for_extraction = ExtractedEntitiesAndRelationIntent.model_json_schema()
+                completion_params["response_format"] = {
+                    "type": "json_object",
+                    "schema": json_schema_for_extraction
+                }
+                print(f"DEBUG_FastAPI: Enabled JSON mode with schema for model {request.model}")
+                # print(f"DEBUG_FastAPI: JSON Schema: {json.dumps(json_schema_for_extraction, indent=2)}") # 可选打印
+            except Exception as e_schema:
+                print(f"ERROR_FastAPI: Failed to generate JSON schema for ExtractedEntitiesAndRelationIntent: {e_schema}")
+        # --- 结束新增 ---
+
         is_cypher_gen_task = False
         if dict_messages and dict_messages[0]["role"] == "system":
             system_content_for_check = dict_messages[0]["content"]
@@ -254,10 +287,17 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         else:
             print("DEBUG_FastAPI: Not a Cypher task. No grammar or specific logit_bias applied.")
         
-        print(f"DEBUG_FastAPI: Calling llama_model.create_chat_completion with params (excluding messages, grammar, logit_bias objects): "
-              f"{ {k:v for k,v in completion_params.items() if k not in ['messages', 'grammar', 'logit_bias']} }")
-        
+        print(f"DEBUG_FastAPI: Calling llama_model.create_chat_completion with params (preview): "
+          f"model={request.model}, temp={completion_params['temperature']}, "
+          f"max_tokens={completion_params['max_tokens']}, stop={completion_params['stop']}, "
+          f"json_mode_enabled={'response_format' in completion_params}")
+    
         completion = llama_model.create_chat_completion(**completion_params)
+
+        # --- 添加调试日志 ---
+        print(f"DEBUG_FastAPI: Raw completion object from llama_model.create_chat_completion: {completion}")
+        # --- 调试日志结束 ---
+
         response_content_raw = completion['choices'][0]['message']['content']
         prompt_tokens = completion['usage']['prompt_tokens']
         completion_tokens = completion['usage']['completion_tokens']
