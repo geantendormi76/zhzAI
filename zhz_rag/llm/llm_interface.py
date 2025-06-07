@@ -8,9 +8,18 @@ import asyncio  # 用于 asyncio.to_thread
 from typing import List, Dict, Any, Optional, Union # Added Union
 from dotenv import load_dotenv
 import traceback  # Ensure traceback is imported
+
 from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
+
+# 提示词导入
+from zhz_rag.llm.rag_prompts import (
+    get_answer_generation_messages, 
+    get_clarification_question_messages) # <--- 添加导入
+
+
+
 import logging
 import re
 import uuid  # 用于生成 interaction_id
@@ -271,36 +280,12 @@ async def generate_cypher_query(user_question: str, kg_schema_description: str =
 
 async def generate_answer_from_context(user_query: str, context_str: str) -> Optional[str]: # context 参数名改为 context_str
     llm_py_logger.info(f"Generating answer for query: '{user_query[:100]}...' using provided context.")
-    
-    system_prompt_for_answer = f"""
-你是一个非常严谨的AI问答助手。你的任务是根据【上下文信息】回答【用户问题】。
-
-**核心指令：**
-
-1.  **严格基于上下文：** 你的回答【必须只能】使用【上下文信息】中明确提供的文字。禁止进行任何形式的推断、联想、猜测或引入外部知识。
-2.  **逐句核对：** 对于用户问题中的每一个信息点或子问题，你都必须在上下文中找到【直接对应的证据】才能回答。
-3.  **明确关联性：** 如果用户问题试图关联上下文中的不同信息片段（例如，A是否与B有关），你必须在上下文中找到【明确陈述这种关联性的直接证据】。如果上下文中分别提到了A和B，但没有明确说明它们之间的关系，则视为无法关联。
-4.  **处理无法回答的部分：**
-    *   如果【上下文信息】完全不包含回答【用户问题】的任何相关信息，或者无法找到任何直接证据，请【只回答】：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
-    *   如果【用户问题】包含多个子问题，而【上下文信息】只能回答其中的一部分：
-        *   请只回答你能找到直接证据的部分。
-        *   对于上下文中没有直接证据支持的其他子问题，请明确指出：“关于[某子问题]，上下文中未提供明确信息。”
-        *   不要对未提供信息的部分进行猜测或尝试回答。
-5.  **简洁明了：** 回答要直接、简洁。
-
-请严格遵守以上指令。
-"""
-    # 构造 messages 列表
-    messages_for_llm = [
-        {"role": "system", "content": system_prompt_for_answer},
-        {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
-    ]
-
+    messages_for_llm = get_answer_generation_messages(user_query, context_str)
     raw_answer = await call_llm_via_openai_api_local_only(
-        prompt=messages_for_llm, # <--- 传递 messages 列表
+        prompt=messages_for_llm, 
         temperature=0.05,
         max_new_tokens=1024, 
-        stop_sequences=['<|im_end|>', UNIQUE_STOP_TOKEN], # 可以保留，以防万一
+        stop_sequences=['<|im_end|>', UNIQUE_STOP_TOKEN],
         task_type="answer_generation_from_context",
         user_query_for_log=user_query,
         model_name_for_log="qwen3_gguf_answer_gen"
@@ -310,17 +295,13 @@ async def generate_answer_from_context(user_query: str, context_str: str) -> Opt
        raw_answer.strip() != "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE]]" and \
        raw_answer.strip() != "[[CONTENT_NOT_FOUND]]":
         
-        # local_llm_service.py 中的 post_process_llm_output 应该已经处理了 <think>
-        # 但如果模型仍然可能输出 "根据目前提供的资料..." 之外的内容，
-        # 而我们期望严格匹配，这里可以再加一层检查。
-        # 对于答案生成，通常不需要像Cypher那样严格的后处理。
         final_answer = raw_answer.strip()
-        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
+        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN: # NO_ANSWER_PHRASE_ANSWER_CLEAN 可以从 rag_prompts.py 导入或在 sglang_wrapper.py 中也定义
             llm_py_logger.info("LLM indicated unable to answer from context.")
         return final_answer
     else:
         llm_py_logger.warning(f"Answer generation returned None, empty, or placeholder. Query: {user_query}")
-        return NO_ANSWER_PHRASE_ANSWER_CLEAN # Fallback
+        return NO_ANSWER_PHRASE_ANSWER_CLEAN
 
 async def generate_simulated_kg_query_response(user_query: str, kg_schema_description: str, kg_data_summary_for_prompt: str) -> Optional[str]:
     prompt_str = f"""<|im_start|>system
@@ -405,33 +386,79 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
 
 
 async def generate_clarification_question(original_query: str, uncertainty_reason: str) -> Optional[str]:
-    prompt_str = f"""<|im_start|>system
-你是一个智能助手，擅长在理解用户查询时识别歧义并请求澄清。
-你的任务是根据用户原始查询和系统检测到的不确定性原因，生成一个简洁、明确的澄清问题。
-澄清问题应该帮助用户选择正确的意图，或者提供更多必要的信息。
-只输出澄清问题，不要包含任何额外解释、对话标记或代码块。<|im_end|>
-<|im_start|>user
-用户原始查询: {original_query}
-不确定性原因: {uncertainty_reason}
+    llm_py_logger.info(f"调用LLM API生成澄清问题。原始查询: '{original_query}', 原因: '{uncertainty_reason}'")
+    messages_for_llm = get_clarification_question_messages(original_query, uncertainty_reason)
 
-请生成一个澄清问题:<|im_end|>
-<|im_start|>assistant
-"""
-    stop_sequences = ["<|im_end|>"]
-    llm_py_logger.info(f"调用LLM API生成澄清问题 (Prompt长度: {len(prompt_str)} 字符)...")
-    clarification_question = await call_llm_via_openai_api_local_only(
-        prompt=prompt_str,
+    clarification_question_raw = await call_llm_via_openai_api_local_only(
+        prompt=messages_for_llm,
         temperature=0.5,
         max_new_tokens=128,
-        stop_sequences=stop_sequences,
+        stop_sequences=['<|im_end|>'], # 对于Qwen系列，<|im_end|> 是一个常见的结束标记
         task_type="clarification_question_generation",
         user_query_for_log=original_query
     )
-    if not clarification_question or clarification_question.strip() == "":
+    
+    if not clarification_question_raw or not clarification_question_raw.strip():
         llm_py_logger.warning("LLM未能生成澄清问题，返回默认提示。")
-        return "抱歉，我不太理解您的意思，请您再具体说明一下。"
-    llm_py_logger.info(f"LLM成功生成澄清问题: {clarification_question.strip()}")
-    return clarification_question.strip()
+        return "抱歉，我不太理解您的意思，请您再具体说明一下。"  
+    cleaned_question_from_llm = clarification_question_raw.strip()
+    llm_py_logger.debug(f"LLM原始澄清输出 (清理后): '{cleaned_question_from_llm}'")
+    potential_lines = cleaned_question_from_llm.splitlines()
+    
+    final_extracted_question = None
+
+    for line in reversed(potential_lines):
+        line_stripped = line.strip()
+        if not line_stripped: # 跳过空行
+            continue
+        if line_stripped.endswith("？") or line_stripped.endswith("?"):
+            if not (line_stripped.startswith("好的，") or \
+                    line_stripped.startswith("首先，") or \
+                    line_stripped.startswith("因此，") or \
+                    line_stripped.startswith("所以，") or \
+                    line_stripped.startswith("根据这个原因，") or \
+                    "我需要生成一个" in line_stripped or \
+                    "可能的澄清问题是" in line_stripped or \
+                    "澄清问题应该是" in line_stripped or \
+                    "接下来，" in line_stripped):
+                final_extracted_question = line_stripped
+                llm_py_logger.info(f"通过行分割和问号结尾提取到澄清问题: '{final_extracted_question}'")
+                break 
+        elif any(line_stripped.startswith(prefix) for prefix in ["请问您", "您对", "您具体指的是"]):
+            final_extracted_question = line_stripped
+            llm_py_logger.info(f"通过行分割和特定前缀提取到澄清问题: '{final_extracted_question}'")
+            break
+
+    if final_extracted_question:
+        llm_py_logger.info(f"LLM成功生成并提取到最终澄清问题: {final_extracted_question}")
+        return final_extracted_question
+    else:
+        potential_sentences = re.split(r'(?<=[。？！?])\s*', cleaned_question_from_llm)
+        for sentence in reversed(potential_sentences):
+            sentence_stripped = sentence.strip()
+            if not sentence_stripped:
+                continue
+            if sentence_stripped.endswith("？") or sentence_stripped.endswith("?") or \
+               any(sentence_stripped.startswith(prefix) for prefix in ["请问您", "您是想", "您具体指的是", "关于您提到的"]):
+                if not (sentence_stripped.startswith("好的，") or \
+                        sentence_stripped.startswith("首先，") or \
+                        "我需要生成一个" in sentence_stripped or \
+                        "可能的澄清问题是" in sentence_stripped): # 避免选择思考过程
+                    final_extracted_question = sentence_stripped
+                    llm_py_logger.info(f"通过句子分割和启发式规则提取到澄清问题: '{final_extracted_question}'")
+                    break
+        
+        if final_extracted_question:
+            llm_py_logger.info(f"LLM成功生成并提取到最终澄清问题 (后备逻辑): {final_extracted_question}")
+            return final_extracted_question
+        else:
+            llm_py_logger.warning(f"未能通过所有启发式规则从LLM输出中提取明确的澄清问句。原始输出为: '{cleaned_question_from_llm}'。将返回默认澄清。")
+
+            if len(cleaned_question_from_llm) < 70 and (cleaned_question_from_llm.endswith("？") or cleaned_question_from_llm.endswith("?")): # 70是个经验值
+                 llm_py_logger.info(f"原始输出较短且以问号结尾，将其作为澄清问题返回: '{cleaned_question_from_llm}'")
+                 return cleaned_question_from_llm
+            return "抱歉，我不太理解您的意思，请您再具体说明一下。"
+
 
 async def generate_clarification_options(original_query: str, uncertainty_reason: str) -> List[str]:
     prompt_str = f"""<|im_start|>system
