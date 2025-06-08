@@ -5,6 +5,7 @@ import sys
 import logging
 import json # 确保导入
 from typing import List, Dict, Any, Optional, Callable, Iterator
+from sentence_transformers import SentenceTransformer
 
 # --- 配置项目根目录到 sys.path ---
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -85,12 +86,23 @@ async def run_tests():
         logger.info(f"SGLANG_API_URL not set, defaulting to: {os.environ['SGLANG_API_URL']}")
 
     kg_retriever: Optional[KGRetriever] = None
+    embedder_for_test: Optional[SentenceTransformer] = None # 新增
     successful_tests = 0
     failed_tests = 0
     
     try:
-        kg_retriever = KGRetriever()
-        logger.info("KGRetriever instance created.")
+        # --- 新增：初始化嵌入器 ---
+        embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH", "/home/zhz/models/bge-small-zh-v1.5") # 从环境变量或默认值获取
+        if os.path.exists(embedding_model_path):
+            embedder_for_test = SentenceTransformer(embedding_model_path)
+            logger.info(f"Test script: SentenceTransformer embedder initialized from {embedding_model_path}.")
+        else:
+            logger.error(f"Test script: Embedding model path '{embedding_model_path}' not found. KGRetriever vector search will fail.")
+        # --- 结束新增 ---
+
+        # --- 修改：传递嵌入器给 KGRetriever ---
+        kg_retriever = KGRetriever(embedder=embedder_for_test) # <--- 修改这里
+        logger.info("KGRetriever instance created with embedder.")
 
         for i, case in enumerate(test_cases):
             logger.info(f"\n--- Test Case {i+1}: {case['name']} ---")

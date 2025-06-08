@@ -3,20 +3,20 @@ import os
 import json
 import kuzu
 import pandas as pd
+from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional, Callable, Iterator
 import logging
 from contextlib import contextmanager
+import hashlib # 确保导入 hashlib
 
-# --- 修改：导入新的实体提取函数和Pydantic模型 ---
+# --- 从项目中导入必要的模块 ---
 from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, IdentifiedEntity
-# from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # Schema现在主要在prompt中使用
-# --- 结束修改 ---
 
 # 日志配置
 kg_logger = logging.getLogger(__name__)
 if not kg_logger.hasHandlers():
-    kg_logger.setLevel(logging.DEBUG)
+    kg_logger.setLevel(logging.DEBUG) # 可以设置为 INFO 或 DEBUG
     ch = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
     ch.setFormatter(formatter)
@@ -28,11 +28,15 @@ kg_logger.info("KGRetriever (KuzuDB) logger initialized/reconfirmed.")
 class KGRetriever:
     KUZU_DB_PATH_ENV = os.getenv("KUZU_DB_PATH", "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db")
 
-    # 移除 llm_cypher_generator_func 参数，因为我们将使用新的实体提取流程
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, embedder: Optional[SentenceTransformer] = None):
         self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
         self._db: Optional[kuzu.Database] = None
+        self._embedder = embedder
         kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. DB path: {self.db_path}")
+        if self._embedder:
+            kg_logger.info(f"KGRetriever initialized with embedder: {type(self._embedder)}")
+        else:
+            kg_logger.warning("KGRetriever initialized WITHOUT an embedder. Vector search will not be available.")
         self._connect_to_kuzu()
 
     def _connect_to_kuzu(self):
@@ -42,9 +46,20 @@ class KGRetriever:
                 kg_logger.error(f"KuzuDB path does not exist: {self.db_path}. KGRetriever cannot connect.")
                 self._db = None
                 return
-            # 考虑是否需要在配置文件中指定 read_only 模式
+            
             self._db = kuzu.Database(self.db_path, read_only=True)
             kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path}.")
+
+            # --- 添加开始：为 KGRetriever 的连接加载 VECTOR 扩展 ---
+            try:
+                kg_logger.info("KGRetriever: Attempting to LOAD VECTOR extension for this session...")
+                with self._get_connection() as conn:
+                    conn.execute("LOAD VECTOR;")
+                kg_logger.info("KGRetriever: VECTOR extension loaded successfully for this retriever instance.")
+            except Exception as e_load:
+                kg_logger.error(f"KGRetriever: CRITICAL - Failed to LOAD VECTOR extension during initialization: {e_load}", exc_info=True)
+                raise ConnectionError(f"Failed to load KuzuDB VECTOR extension for KGRetriever: {e_load}") from e_load
+
         except Exception as e:
             kg_logger.error(f"Failed to connect to KuzuDB at {self.db_path}: {e}", exc_info=True)
             self._db = None
@@ -67,12 +82,12 @@ class KGRetriever:
             raise ConnectionError(f"Failed to create KuzuDB connection: {e_conn}")
         finally:
             kg_logger.debug("KuzuDB connection context manager exiting.")
-            pass
+            pass # KuzuDB Connection 对象没有显式的 close() 方法，依赖其 __del__
 
     def close(self):
         kg_logger.info(f"Closing KuzuDB for retriever using path: {self.db_path}")
         if self._db:
-            del self._db
+            del self._db # 依赖 KuzuDB Database 的 __del__ 方法进行清理和锁释放
             self._db = None
             kg_logger.info("KuzuDB Database object dereferenced (closed).")
 
@@ -85,17 +100,12 @@ class KGRetriever:
         try:
             with self._get_connection() as conn:
                 actual_params = parameters if parameters else {}
-            # 直接将查询字符串和参数字典传递给 execute
                 query_result = conn.execute(query, parameters=actual_params)
-                # KuzuDB QueryResult to_df() is deprecated, use get_as_df()
                 if hasattr(query_result, 'get_as_df'):
                     df = pd.DataFrame(query_result.get_as_df())
                     results_list = df.to_dict(orient='records')
-                elif isinstance(query_result, list): # 有些简单的执行可能直接返回列表
-                    # 如果是列表，我们需要确定其结构是否是我们期望的 List[Dict]
-                    # 为简单起见，如果不是DataFrame兼容的，我们先认为没有结构化结果返回用于进一步处理
+                elif isinstance(query_result, list):
                     kg_logger.info("KuzuDB query did not return a DataFrame-convertible result, result is a list.")
-                    # 根据实际情况处理列表结果，或将其置空
                     # results_list = query_result # 如果列表内已经是dict
                 else:
                     kg_logger.info(f"KuzuDB query did not return a DataFrame-convertible result. Type: {type(query_result)}")
@@ -105,13 +115,11 @@ class KGRetriever:
                     kg_logger.debug(f"First KuzuDB record (from DataFrame): {str(results_list[0])[:200]}")
                 elif not hasattr(query_result, 'get_as_df'):
                      kg_logger.debug(f"KuzuDB query result (raw, not DataFrame): {str(query_result)[:200]}")
-
-
         except RuntimeError as kuzu_runtime_error:
              kg_logger.error(f"KuzuDB RuntimeError during Cypher execution: '{query}' with params: {parameters}. Error: {kuzu_runtime_error}", exc_info=True)
-        except ConnectionError as conn_err: # 如果 _get_connection 内部抛出
+        except ConnectionError as conn_err:
              kg_logger.error(f"KuzuDB ConnectionError during Cypher execution: {conn_err}", exc_info=True)
-        except TypeError as e_type: # 捕获可能的TypeError，以便更详细地调试
+        except TypeError as e_type:
             kg_logger.error(f"TypeError during KuzuDB Cypher execution: '{query}' with params: {parameters}. Error: {e_type}", exc_info=True)
         except Exception as e:
             kg_logger.error(f"Unexpected error executing KuzuDB Cypher query: '{query}' with params: {parameters}. Error: {e}", exc_info=True)
@@ -124,136 +132,192 @@ class KGRetriever:
 
         for record_data in records:
             parts = []
-            primary_info_keys = ['text', 'label', 'id_prop', 'name', 'related_text', 'related_label', 'relationship']
+            # 优先展示的、信息量大的key
+            primary_info_keys = ['text', 'label', 'id_prop', 'name', 'related_text', 'related_label', 'relationship_type', 'source_node_text', '_score']
+            
             for key in primary_info_keys:
                 if key in record_data and record_data[key] is not None:
-                    parts.append(f"{key.replace('_', ' ').capitalize()}: {record_data[key]}")
+                    if key == '_score' and isinstance(record_data[key], float):
+                        parts.append(f"Similarity Score: {record_data[key]:.4f}")
+                    else:
+                        parts.append(f"{key.replace('_', ' ').capitalize()}: {record_data[key]}")
             
+            # 其他非核心但有用的信息
+            additional_info_parts = []
             for key, value in record_data.items():
                 if key not in primary_info_keys and value is not None:
-                    if isinstance(value, dict):
-                        if '_label' in value and '_src' in value and '_dst' in value: 
-                             parts.append(f"Relation Type: {value['_label']}")
-                        else:
-                             value_str = json.dumps(value, ensure_ascii=False, default=str)
-                             if len(value_str) > 70: value_str = value_str[:70] + "..."
-                             parts.append(f"{key}: {value_str}")
+                    if isinstance(value, dict): # 例如 KuzuDB 返回的复杂节点/关系对象
+                        value_str = json.dumps(value, ensure_ascii=False, default=str)
+                        if len(value_str) > 70: value_str = value_str[:70] + "..."
+                        additional_info_parts.append(f"{key}: {value_str}")
                     else:
-                        parts.append(f"{key}: {str(value)}")
+                        additional_info_parts.append(f"{key}: {str(value)}")
+            
+            if additional_info_parts:
+                parts.append("Other Info: " + " | ".join(additional_info_parts))
             
             content_str = " | ".join(parts) if parts else "Retrieved graph data node/relation."
             
+            # 确保元数据中也包含关键信息，方便调试和后续处理
+            doc_metadata = {
+                "original_user_query_for_kg": query_context,
+                "kuzu_retrieved_id_prop": record_data.get("id_prop"),
+                "kuzu_retrieved_text": record_data.get("text") or record_data.get("related_text"),
+                "kuzu_retrieved_label": record_data.get("label") or record_data.get("related_label"),
+                "kuzu_retrieved_relationship": record_data.get("relationship_type"),
+                "kuzu_retrieved_score": record_data.get("_score")
+            }
+            # 清理元数据中的None值
+            doc_metadata = {k: v for k, v in doc_metadata.items() if v is not None}
+
             doc_data = {
                 "source_type": "knowledge_graph_kuzu",
                 "content": content_str,
-                "score": record_data.get('_score', 0.85), # Default score if not from vector search
-                "metadata": {
-                    "original_user_query_for_kg": query_context,
-                    "retrieved_kuzu_record_preview": {k: record_data[k] for k in primary_info_keys if k in record_data}
-                }
+                "score": record_data.get('_score', 0.0), # 使用记录中的_score，如果没有则为0
+                "metadata": doc_metadata
             }
             formatted_docs.append(doc_data)
         return formatted_docs
 
-    async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]: # Renamed main retrieval method
-        kg_logger.info(f"Starting KG retrieval with LLM-extracted entities for query: '{user_query}', top_k: {top_k}")
+    async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        kg_logger.info(f"Starting KG retrieval for query: '{user_query}', top_k: {top_k}")
 
         extracted_info: Optional[ExtractedEntitiesAndRelationIntent] = await extract_entities_for_kg_query(user_query)
 
-        if not extracted_info or not extracted_info.entities:
-            kg_logger.warning(f"LLM did not extract any entities for query: '{user_query}'. KG retrieval cannot proceed.")
-            return []
-        
-        kg_logger.info(f"LLM extracted: Entities: {[e.model_dump() for e in extracted_info.entities]}, Relation Hint: {extracted_info.relation_hint}")
+        search_text_for_vector: str
+        if extracted_info and extracted_info.entities and extracted_info.entities[0].text:
+            primary_entity_text = extracted_info.entities[0].text
+            search_text_for_vector = primary_entity_text
+            kg_logger.info(f"LLM extracted: Entities: {[e.model_dump() for e in extracted_info.entities]}, Relation Hint: {extracted_info.relation_hint}")
+            kg_logger.info(f"Using primary extracted entity text for vector search: '{search_text_for_vector}'")
+        else:
+            search_text_for_vector = user_query
+            kg_logger.info(f"No primary entities extracted or entity text is empty. Using original user query for vector search: '{user_query}'")
 
         all_kuzu_records: List[Dict[str, Any]] = []
+        
+        # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
+        if self._embedder:
+            try:
+                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}'")
+                query_vector_np = self._embedder.encode(search_text_for_vector, normalize_embeddings=True)
+                query_vector_list = query_vector_np.tolist()
+                
+                # --- 修改：根据研究报告更新 KuzuDB 向量查询 ---
+                # 假设索引名为 'entity_embedding_idx'，建立在 ExtractedEntity 表的 'embedding' (FLOAT[]) 列上
+                vector_search_query = """
+                    CALL QUERY_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', $query_vector, $top_k_param)
+                    YIELD node, distance
+                    RETURN node.id_prop AS id_prop, node.text AS text, node.label AS label, distance AS _score
+                """
+                vector_params = {"query_vector": query_vector_list, "top_k_param": top_k} 
+                # --- 修改结束 ---
+                
+                kg_logger.info(f"Executing KuzuDB vector search. Table: 'ExtractedEntity', Index: 'entity_embedding_idx', Top K: {top_k}")
+                # kg_logger.debug(f"Vector search query: {vector_search_query.strip()}")
+                # kg_logger.debug(f"Vector search params (vector preview): {{'query_vector': {str(query_vector_list)[:100]}..., 'top_k_param': {top_k}}}")
 
-        for entity_info in extracted_info.entities:
-            if not entity_info.text:
-                continue
+                vector_results = self._execute_cypher_query_sync(vector_search_query, vector_params)
+                
+                if vector_results:
+                    # 注意：返回的 _score 是 distance，越小越相似
+                    all_kuzu_records.extend(vector_results)
+                    kg_logger.info(f"Retrieved {len(vector_results)} records via KuzuDB vector search for text: '{search_text_for_vector}'")
+                else:
+                    kg_logger.info(f"No results from KuzuDB vector search for text: '{search_text_for_vector}'")
 
-            # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
-            # TODO: Implement KuzuDB vector search logic here.
-            # This requires:
-            # 1. An embedding function (e.g., from SentenceTransformer) to convert entity_info.text to a vector.
-            # 2. Knowing the name of your vector index in KuzuDB.
-            # 3. Executing a KuzuDB CALL db.idx.lookup(...) query.
-            # Example (conceptual):
-            # query_vector = self.embedding_function(entity_info.text)
-            # vector_search_query = "CALL db.idx.lookup('your_node_vector_index', $query_vec, $k) YIELD node, score RETURN node.text, node.label, node.id_prop, score"
-            # params = {"query_vec": query_vector, "k": top_k}
-            # vector_results = self._execute_cypher_query_sync(vector_search_query, params)
-            # if vector_results:
-            #     all_kuzu_records.extend(vector_results)
-            #     kg_logger.info(f"Retrieved {len(vector_results)} records via vector search for entity: '{entity_info.text}'")
-            
-            # --- Strategy 2: Template-based Cypher (if entity label is known, or as fallback) ---
-            # This part uses simple Cypher based on extracted entity text and label.
-            if entity_info.label: # Only proceed if LLM provided a label
-                # Template 1: Get attributes of the identified entity
-                attr_query = "MATCH (n:ExtractedEntity {text: $text, label: $label}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop, 1.0 AS _score LIMIT 1"
-                attr_params = {"text": entity_info.text, "label": entity_info.label.upper()}
-                kg_logger.info(f"Executing attribute query for: {entity_info.text} ({entity_info.label})")
-                attr_results = self._execute_cypher_query_sync(attr_query, attr_params)
-                if attr_results:
-                    all_kuzu_records.extend(attr_results)
+            except Exception as e_vector_search:
+                kg_logger.error(f"Error during KuzuDB vector search: {e_vector_search}", exc_info=True)
+        else:
+            kg_logger.warning("Embedder not available in KGRetriever, skipping KuzuDB vector search.")
 
-                # Template 2: If a relation_hint exists, try to find 1-hop neighbors
-                if extracted_info.relation_hint:
-                    # This mapping from relation_hint to actual Cypher relation type needs to be robust
-                    # For MVP, we can try a generic neighbor search or map common hints
-                    # Example: if relation_hint is "工作" and entity_info.label is "PERSON", map to "WORKS_AT"
-                    mapped_rel_type = None
-                    if "工作" in extracted_info.relation_hint and entity_info.label == "PERSON":
-                        mapped_rel_type = "WorksAt"
-                    elif "分配" in extracted_info.relation_hint and entity_info.label == "TASK":
-                        mapped_rel_type = "AssignedTo"
-                    
-                    if mapped_rel_type:
-                        neighbor_query = f"""
-                            MATCH (src:ExtractedEntity {{text: $text, label: $label}})
-                                  -[r:{mapped_rel_type}]->
-                                  (tgt:ExtractedEntity)
-                            RETURN tgt.text AS related_text, tgt.label AS related_label, label(r) as relationship, 0.9 AS _score 
-                            LIMIT {top_k}
-                        """
-                        neighbor_params = {"text": entity_info.text, "label": entity_info.label.upper()}
-                        kg_logger.info(f"Executing neighbor query for: {entity_info.text} via relation {mapped_rel_type}")
-                        neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
-                        if neighbor_results:
-                            all_kuzu_records.extend(neighbor_results)
-            else:
-                kg_logger.info(f"Skipping template-based Cypher for entity '{entity_info.text}' as label was not provided by LLM.")
+        # --- Strategy 2: Template-based Cypher (逻辑保持不变) ---
+        # (这部分代码与您上一轮修改后的一致，此处省略以便聚焦向量检索部分) ...
+        # 确保这里的 _score 也是越小越好，或者与向量搜索的 score 含义一致，或者在融合时能区分
+        # 为了简化，我们之前给模板查询的 _score 是固定的正值，表示一个“置信度”而非距离
+        # 这意味着在排序时需要特别处理，或者统一 score 的含义。
+        # 暂时保持模板查询的 _score 为固定值，代表其“非向量搜索”的来源。
+        if extracted_info and extracted_info.entities:
+            for entity_info in extracted_info.entities:
+                if not entity_info.text:
+                    continue
+                if entity_info.label: 
+                    attr_query = """
+                        MATCH (n:ExtractedEntity {text: $text, label: $label}) 
+                        RETURN n.id_prop AS id_prop, n.text AS text, n.label AS label, 0.85 AS _score_template 
+                        LIMIT 1 
+                    """ # 将模板查询的score命名为_score_template以区分
+                    attr_params = {"text": entity_info.text, "label": entity_info.label.upper()}
+                    # ... (后续模板查询逻辑不变) ...
+                    kg_logger.info(f"Executing template attribute query for: '{entity_info.text}' (Label: {entity_info.label.upper()})")
+                    attr_results = self._execute_cypher_query_sync(attr_query, attr_params)
+                    if attr_results:
+                         # 将 _score_template 转换为 _score，并赋予一个表示“非距离”的值，例如负值或很大的正值
+                         # 或者，我们可以在排序时单独处理。简单起见，我们先让它有一个不同的键名。
+                         # 更新：为了统一排序，我们将模板结果的“分数”也视为“距离”，但赋予一个较大的固定值
+                         # 以便向量搜索结果（距离小）能排在前面。
+                        for res in attr_results: res['_score'] = res.pop('_score_template', 100.0) # 假设100是很大的距离
+                        all_kuzu_records.extend(attr_results)
 
+                    if extracted_info.relation_hint:
+                        mapped_rel_type = None
+                        if "工作" in extracted_info.relation_hint and entity_info.label.upper() == "PERSON":
+                            mapped_rel_type = "WorksAt"
+                        elif "分配" in extracted_info.relation_hint and entity_info.label.upper() == "TASK":
+                            mapped_rel_type = "AssignedTo"
+                        
+                        if mapped_rel_type:
+                            neighbor_query = f"""
+                                MATCH (src:ExtractedEntity {{text: $text, label: $label}})
+                                      -[r:{mapped_rel_type}]->
+                                      (tgt:ExtractedEntity)
+                                RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
+                                       label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score 
+                                LIMIT {top_k} 
+                            """ # 邻居查询的距离更大
+                            neighbor_params = {"text": entity_info.text, "label": entity_info.label.upper()}
+                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}'")
+                            neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
+                            if neighbor_results:
+                                all_kuzu_records.extend(neighbor_results)
+                else:
+                    kg_logger.info(f"Skipping template-based Cypher for entity '{entity_info.text}' as LLM did not provide a label for it.")
 
         if not all_kuzu_records:
             kg_logger.info(f"No records retrieved from KuzuDB for query: '{user_query}' after all strategies.")
             return []
 
-        # Deduplicate records (e.g., if vector search and template search return same nodes)
-        # A simple way is to convert to DataFrame and drop duplicates based on id_prop or text+label
-        if all_kuzu_records:
-            try:
-                df_records = pd.DataFrame(all_kuzu_records)
-                # Assuming 'id_prop' is a unique identifier for nodes, or use a combination of text and label
-                # We need to handle cases where 'id_prop' might not be present in all results (e.g., from neighbor queries)
-                # For simplicity, let's try to deduplicate based on the 'content' we will generate
-                
-                # First, generate content for all, then deduplicate based on content
-                temp_formatted_for_dedup = self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)
-                unique_contents = {}
-                deduplicated_records_formatted = []
-                for doc_dict in temp_formatted_for_dedup:
-                    if doc_dict["content"] not in unique_contents:
-                        unique_contents[doc_dict["content"]] = True
-                        deduplicated_records_formatted.append(doc_dict)
-                
-                kg_logger.info(f"Deduplicated KuzuDB results from {len(all_kuzu_records)} to {len(deduplicated_records_formatted)} records.")
-                return deduplicated_records_formatted[:top_k] # Apply top_k after deduplication
-            except Exception as e_dedup:
-                kg_logger.error(f"Error during deduplication of KuzuDB results: {e_dedup}", exc_info=True)
-                # Fallback to returning raw (potentially duplicated) records if deduplication fails
-                return self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)[:top_k]
+        # --- Deduplication and Formatting ---
+        # 确保所有记录都有 _score，且含义一致（越小越好）
+        for rec in all_kuzu_records:
+            rec.setdefault("_score", 200.0) # 给没有分数的记录一个非常大的距离值
 
+        # 排序：按 _score 升序 (距离越小越好)
+        sorted_kuzu_records = sorted(all_kuzu_records, key=lambda x: x.get('_score', 200.0), reverse=False)
+        
+        formatted_docs = self._format_kuzu_records_for_retrieval(sorted_kuzu_records, user_query)
 
-        return self._format_kuzu_records_for_retrieval(all_kuzu_records, user_query)[:top_k]
+        final_unique_docs_map: Dict[str, Dict[str, Any]] = {}
+        for doc_dict in formatted_docs:
+            content_key = doc_dict.get("content", "")
+            current_score = doc_dict.get("score", 200.0) # score 仍然是距离
+
+            if content_key not in final_unique_docs_map:
+                final_unique_docs_map[content_key] = doc_dict
+            else:
+                # 如果内容已存在，保留距离更小的（分数更优的）
+                existing_score = final_unique_docs_map[content_key].get("score", 200.0)
+                if current_score < existing_score:
+                    final_unique_docs_map[content_key] = doc_dict
+        
+        final_results_list = list(final_unique_docs_map.values())
+        # 再次根据score（距离）排序，因为字典转列表后顺序可能打乱
+        final_results_sorted_by_score = sorted(final_results_list, key=lambda x: x.get('score', 200.0), reverse=False)
+
+        kg_logger.info(f"Total {len(all_kuzu_records)} records initially retrieved, "
+                       f"{len(sorted_kuzu_records)} after initial sort by distance, "
+                       f"{len(formatted_docs)} after formatting, "
+                       f"{len(final_results_sorted_by_score)} after final content deduplication & re-sort. "
+                       f"Returning top {min(top_k, len(final_results_sorted_by_score))} docs.")
+        
+        return final_results_sorted_by_score[:top_k]

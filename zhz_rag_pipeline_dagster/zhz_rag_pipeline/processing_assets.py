@@ -17,7 +17,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     SentenceTransformerResource,
     ChromaDBResource,
-    SGLangAPIResource,
+    LocalLLMAPIResource, 
     KuzuDBReadWriteResource,
     KuzuDBReadOnlyResource
 )
@@ -26,6 +26,7 @@ import bm25s
 import pickle
 import numpy as np
 import os
+import time
 
 class TextChunkerConfig(dg.Config):
     chunk_size: int = 500
@@ -36,23 +37,18 @@ class TextChunkerConfig(dg.Config):
     name="text_chunks",
     description="Cleans and chunks parsed documents into smaller text segments.",
     group_name="processing", # 属于处理组
-    # deps=["parsed_documents"] # <--- 删除或注释掉这一行
+    deps=["parsed_documents"] # <--- 删除或注释掉这一行
 )
 def clean_chunk_text_asset(
     context: dg.AssetExecutionContext,
     config: TextChunkerConfig,
-    parsed_documents: List[ParsedDocumentOutput] 
-) -> List[ChunkOutput]: 
-    
+    parsed_documents: List[ParsedDocumentOutput]
+) -> List[ChunkOutput]:
     all_chunks: List[ChunkOutput] = []
     context.log.info(f"Received {len(parsed_documents)} parsed documents to clean and chunk.")
-
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
-        # length_function=len, # 默认
-        # add_start_index=True, # 如果需要块的起始索引
-        # separators=config.separators if config.separators else None # 使用配置的分隔符
     )
 
     for parsed_doc in parsed_documents:
@@ -413,8 +409,8 @@ async def kg_extraction_asset(
     context: dg.AssetExecutionContext,
     text_chunks: List[ChunkOutput], 
     config: KGExtractionConfig,     
-    sglang_api: SGLangAPIResource
-) -> List[KGTripleSetOutput]: # 确保返回类型注解正确
+    sglang_api: LocalLLMAPIResource 
+) -> List[KGTripleSetOutput]:
     
     all_kg_outputs: List[KGTripleSetOutput] = []
     context.log.info(f"Received {len(text_chunks)} text chunks for KG extraction.")
@@ -436,28 +432,20 @@ async def kg_extraction_asset(
                 prompt=prompt,
                 json_schema=DEFAULT_KG_EXTRACTION_SCHEMA 
             )
-            context.log.debug(f"SGLang structured response for chunk {chunk.chunk_id}: {structured_response}")
-
+             # --- 核心修改：在这一步就进行规范化 ---
             entities_data = structured_response.get("entities", [])
             extracted_entities_list: List[ExtractedEntity] = []
             if isinstance(entities_data, list):
                 for entity_dict in entities_data:
                     if isinstance(entity_dict, dict) and "text" in entity_dict and "label" in entity_dict:
-                        # --- 规范化实体文本和标签 ---
-                        normalized_entity_text = normalize_text_for_id(entity_dict["text"])
-                        # 标签通常已经是大写或特定枚举值，但如果LLM可能返回不同大小写，也应规范化
-                        normalized_entity_label = entity_dict["label"].upper() # 保持标签大写
+                        # 对 LLM 返回的文本和标签立即进行规范化
+                        normalized_text = normalize_text_for_id(entity_dict["text"])
+                        normalized_label = entity_dict["label"].upper()
                         extracted_entities_list.append(ExtractedEntity(
-                            text=normalized_entity_text, # <--- 使用规范化后的文本
-                            label=normalized_entity_label  # <--- 使用规范化/统一后的标签
+                            text=normalized_text, 
+                            label=normalized_label
                         ))
-                    else:
-                        context.log.warning(f"Skipping malformed entity data in chunk {chunk.chunk_id}: {entity_dict}")
-            else:
-                context.log.warning(f"'entities' field in SGLang response for chunk {chunk.chunk_id} is not a list: {entities_data}")
             
-            total_entities_count += len(extracted_entities_list)
-
             relations_data = structured_response.get("relations", [])
             extracted_relations_list: List[ExtractedRelation] = []
             if isinstance(relations_data, list):
@@ -465,27 +453,18 @@ async def kg_extraction_asset(
                     if (isinstance(rel_dict, dict) and
                         all(key in rel_dict for key in ["head_entity_text", "head_entity_label", 
                                                         "relation_type", "tail_entity_text", "tail_entity_label"])):
-                        # --- 规范化关系中的实体文本和标签 ---
-                        normalized_head_text = normalize_text_for_id(rel_dict["head_entity_text"])
-                        normalized_head_label = rel_dict["head_entity_label"].upper()
-                        normalized_tail_text = normalize_text_for_id(rel_dict["tail_entity_text"])
-                        normalized_tail_label = rel_dict["tail_entity_label"].upper()
-                        # 关系类型通常也应该是规范的
-                        normalized_relation_type = rel_dict["relation_type"].upper()
+                        # 对关系中的所有文本和标签也进行规范化
                         extracted_relations_list.append(ExtractedRelation(
-                            head_entity_text=normalized_head_text,
-                            head_entity_label=normalized_head_label,
-                            relation_type=normalized_relation_type,
-                            tail_entity_text=normalized_tail_text,
-                            tail_entity_label=normalized_tail_label
+                            head_entity_text=normalize_text_for_id(rel_dict["head_entity_text"]),
+                            head_entity_label=rel_dict["head_entity_label"].upper(),
+                            relation_type=rel_dict["relation_type"].upper(),
+                            tail_entity_text=normalize_text_for_id(rel_dict["tail_entity_text"]),
+                            tail_entity_label=rel_dict["tail_entity_label"].upper()
                         ))
-                    else:
-                        context.log.warning(f"Skipping malformed relation data in chunk {chunk.chunk_id}: {rel_dict}")
-            else:
-                context.log.warning(f"'relations' field in SGLang response for chunk {chunk.chunk_id} is not a list: {relations_data}")
-            
+            # --- 修改结束 --- 
+            total_entities_count += len(extracted_entities_list)
             total_relations_count += len(extracted_relations_list)
-            
+
             kg_output = KGTripleSetOutput(
                 chunk_id=chunk.chunk_id,
                 extracted_entities=extracted_entities_list,
@@ -513,307 +492,132 @@ async def kg_extraction_asset(
     )
     return all_kg_outputs
 
-# KuzuDB Concurrency Key (as suggested in the new strategy text file for write assets)
 KUZU_WRITE_CONCURRENCY_KEY = "kuzu_write_access"
 
-@dg.asset(
-    name="kuzu_schema_initialized",
-    description="Ensures KuzuDB is initialized and schema (tables) are ready, and performs DDL/Checkpoint.",
-    group_name="kg_building",
-    # deps=[], # 依赖通过参数自动推断，或者如果资源不作为参数传入，则不需要显式 deps
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "300"} # KUZU_WRITE_CONCURRENCY_KEY 在 in_process 作业中意义不大
-)
-def kuzu_schema_initialized_asset(
-    context: dg.AssetExecutionContext,
-    kuzu_readwrite_db: KuzuDBReadWriteResource # 注入资源
-) -> dg.Output[str]:
-    db_path_used = kuzu_readwrite_db._resolved_db_path # 可以从资源获取路径信息
-    context.log.info(f"Using KuzuDB at: {db_path_used}.")
-    
-    conn = kuzu_readwrite_db.get_connection() # <--- 从资源获取连接
-
-    try:
-        context.log.info("Executing DDL statements for schema creation...")
-        schema_ddl_queries = [
-            "CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, PRIMARY KEY (id_prop))",
-            "CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)",
-            "CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)"
-        ]
-        for ddl_query in schema_ddl_queries:
-            context.log.debug(f"Executing DDL: {ddl_query}")
-            conn.execute(ddl_query)
-        context.log.info("DDL statements execution completed.")
-        
-        context.log.info("Executing manual CHECKPOINT.")
-        conn.execute("CHECKPOINT;")
-        context.log.info("Manual CHECKPOINT completed.")
-
-        context.log.info("Verifying table existence after schema initialization...")
-        node_table_names = conn._get_node_table_names()
-        rel_tables_info = conn._get_rel_table_names()
-        rel_table_names = [info['name'] for info in rel_tables_info]
-        all_defined_tables = node_table_names + rel_table_names
-        context.log.info(f"All defined tables in KuzuDB: {all_defined_tables}")
-        
-        required_tables = ["ExtractedEntity", "WorksAt", "AssignedTo"]
-        all_found = True
-        missing_tables = []
-        for tbl in required_tables:
-            if tbl not in all_defined_tables:
-                all_found = False
-                missing_tables.append(tbl)
-        
-        if all_found:
-            context.log.info("Verification SUCCESS: All required tables found in KuzuDB.")
-        else:
-            raise dg.Failure(f"Schema verification failed. Missing tables: {', '.join(missing_tables)}")
-
-    except Exception as e:
-        context.log.error(f"Failed during KuzuDB schema DDL/CHECKPOINT/Verification: {e}", exc_info=True)
-        raise dg.Failure(f"KuzuDB schema initialization/verification failed: {e}")
-        
-    return dg.Output("KuzuDB schema ensured, checkpointed, and verified.", metadata={"db_path": db_path_used, "defined_tables": all_defined_tables})
 
 @dg.asset(
-    name="kuzu_entity_nodes",
-    description="Stores extracted entities as nodes in KuzuDB knowledge graph.",
+    name="kuzu_graph_construction",
+    description="Creates schema, loads data, and creates vector index in KuzuDB.",
     group_name="kg_building",
-    # deps=[kuzu_schema_initialized_asset], # 通过参数推断
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600"}
+    op_tags={"dagster/concurrency_key": "kuzu_write_pool"},
+    deps=[kg_extraction_asset],
+    tags={dg.MAX_RUNTIME_SECONDS_TAG: "900"}
 )
-def kuzu_entity_nodes_asset(
+def kuzu_graph_construction_asset(
     context: dg.AssetExecutionContext,
     kg_extractions: List[KGTripleSetOutput],
-    kuzu_schema_initialized: str, # 依赖上游资产的输出
-    kuzu_readwrite_db: KuzuDBReadWriteResource # 注入资源
-) -> None:
-    context.log.info(f"Received {len(kg_extractions)} KG extraction sets to store entities in KuzuDB.")
-    context.log.info(f"Upstream kuzu_schema_initialized_asset reported: {kuzu_schema_initialized}")
-
+    kuzu_readwrite_db: KuzuDBReadWriteResource,
+    embedder: SentenceTransformerResource
+):
+    context.log.info("--- Starting Unified KuzuDB Graph Construction Asset (UNWIND/MERGE Strategy) ---")
     if not kg_extractions:
-        context.log.warning("No KG extractions received, nothing to store in KuzuDB.")
-        context.add_output_metadata(metadata={"nodes_created_or_merged": 0, "status": "No data"})
+        context.log.warning("No KG extractions received. Skipping.")
         return
-        
-    dml_statements: List[tuple[str, Dict[str, Any]]] = []
-    total_nodes_processed = 0
 
-    for kg_output_set in kg_extractions:
-        for entity in kg_output_set.extracted_entities:
-            # 假设 entity.text 和 entity.label 已经是规范化过的
-            text_for_id = entity.text 
-            label_for_id = entity.label # 假设已经是大写
-            id_prop_input_string = text_for_id + label_for_id # <--- 用于生成哈希的字符串
-            entity_id_prop = hashlib.md5(id_prop_input_string.encode('utf-8')).hexdigest()  
-            context.log.info(f"NODE CREATION: text='{entity.text}', label='{entity.label}', "
-                             f"id_prop_input='{id_prop_input_string}', generated_id_prop='{entity_id_prop}'")
-            query = """
-                MERGE (e:ExtractedEntity {id_prop: $id_prop})
-                ON CREATE SET e.text = $text, e.label = $label 
-            """
-            params = {
-                "id_prop": entity_id_prop,
-                "text": entity.text, 
-                "label": entity.label
-            }
-            dml_statements.append((query, params))
+    with kuzu_readwrite_db.get_connection() as conn:
+        try:
+            # 步骤 1: 创建 Schema (逻辑不变)
+            context.log.info("Step 1: Creating Schema...")
+            EMBEDDING_DIM = embedder.get_embedding_dimension()
+            conn.execute(
+                f"CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, embedding FLOAT[{EMBEDDING_DIM}], PRIMARY KEY (id_prop))"
+            )
+            conn.execute("CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)")
+            conn.execute("CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)")
+            context.log.info("Schema DDL commands executed.")
 
-    if not dml_statements:
-        context.log.info("No valid entities found to store in KuzuDB after processing extractions.")
-        context.add_output_metadata(metadata={"nodes_created_or_merged": 0, "status": "No entities to store"})
-        return
-    
-    conn = kuzu_readwrite_db.get_connection() # <--- 从资源获取连接
-    try:
-        context.log.info(f"Executing {len(dml_statements)} MERGE operations for entities in KuzuDB...")
-        executed_count = 0
-        for query, params in dml_statements:
-            context.log.debug(f"Executing DML: {query} with params: {params}")
-            conn.execute(query, parameters=params)
-            executed_count +=1
-        context.log.info(f"Executed {executed_count} DML statements successfully for entities.")
-        
-        context.add_output_metadata(
-            metadata={
-                "nodes_created_or_merged": executed_count, # 使用实际执行数量
-                "status": "Success"
-            }
-        )
-    except Exception as e:
-        context.log.error(f"Failed to store entities in KuzuDB: {e}", exc_info=True)
-        raise dg.Failure(description=f"Failed to store entities in KuzuDB: {str(e)}")
-
-@dg.asset(
-    name="kuzu_entity_relations",
-    description="Creates relationships in KuzuDB based on extracted KG data.",
-    group_name="kg_building",
-    deps=[kuzu_entity_nodes_asset.key], # 显式声明对 kuzu_entity_nodes_asset 的依赖
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "600"}
-)
-
-def kuzu_entity_relations_asset(
-    context: dg.AssetExecutionContext,
-    kg_extractions: List[KGTripleSetOutput],
-    kuzu_schema_initialized: str, # 依赖 kuzu_schema_initialized_asset 的输出
-    kuzu_readwrite_db: KuzuDBReadWriteResource
-) -> None:
-    context.log.info(f"Received {len(kg_extractions)} KG extraction sets to create relations in KuzuDB.")
-    context.log.info(f"Upstream kuzu_schema_initialized_asset reported: {kuzu_schema_initialized}")
-
-    conn = kuzu_readwrite_db.get_connection()
-
-    # --- Schema验证日志 ---
-    try:
-        context.log.info("Verifying table existence at the START of kuzu_entity_relations_asset...")
-        node_tables_at_start = conn._get_node_table_names()
-        rel_tables_info_at_start = conn._get_rel_table_names()
-        rel_tables_at_start = [info['name'] for info in rel_tables_info_at_start]
-        all_tables_at_start_actual_case = node_tables_at_start + rel_tables_at_start
-        
-        # 我们期望的表名（在DDL中定义的大小写）
-        expected_relation_tables_in_schema = ["AssignedTo", "WorksAt"] 
-
-        context.log.info(f"Node tables at start of relations asset: {node_tables_at_start}")
-        context.log.info(f"Rel tables at start of relations asset (actual case): {rel_tables_at_start}")
-        context.log.info(f"All tables at start of relations asset (actual case): {all_tables_at_start_actual_case}")
-
-        for expected_table in expected_relation_tables_in_schema:
-            # 检查时，我们将从数据库获取的表名与期望的表名进行比较
-            # KuzuDB 返回的表名是区分大小写的，与 DDL 一致
-            if expected_table not in all_tables_at_start_actual_case:
-                context.log.error(f"CRITICAL: Expected table '{expected_table}' NOT FOUND at the very start of kuzu_entity_relations_asset on the shared connection!")
+            # 步骤 2: 加载节点数据 (逻辑不变)
+            context.log.info("Step 2: Preparing and loading node data...")
+            unique_nodes = {}
+            for kg_set in kg_extractions:
+                for entity in kg_set.extracted_entities:
+                    node_key = (normalize_text_for_id(entity.text), entity.label.upper())
+                    if node_key not in unique_nodes:
+                        unique_nodes[node_key] = {
+                            "id_prop": hashlib.md5(f"{node_key[0]}_{node_key[1]}".encode('utf-8')).hexdigest(),
+                            "text": node_key[0],
+                            "label": node_key[1],
+                            "embedding": embedder.encode([node_key[0]])[0]
+                        }
+            node_data = list(unique_nodes.values())
+            if node_data:
+                nodes_df = pd.DataFrame(node_data)
+                context.log.info(f"Copying {len(nodes_df)} unique nodes into ExtractedEntity table...")
+                conn.execute("COPY ExtractedEntity FROM nodes_df;")
+                context.log.info(f"Successfully copied nodes.")
             else:
-                context.log.info(f"Expected table '{expected_table}' IS PRESENT at the start of kuzu_entity_relations_asset.")
-    except Exception as e_verify_start:
-        context.log.error(f"Error verifying tables at start of kuzu_entity_relations_asset: {e_verify_start}")
-    # --- Schema验证日志结束 ---
+                context.log.warning("No unique nodes found in extractions to load.")
 
-    if not kg_extractions:
-        context.log.warning("No KG extractions received, nothing to store for relations.")
-        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No data"})
-        return
-
-    relations_to_create_params: List[Dict[str, Any]] = []
-    relation_type_for_cypher_map: List[str] = [] # 用于存储 Cypher 查询中实际使用的关系表名
-
-    for kg_output_set in kg_extractions:
-        for rel_idx, rel in enumerate(kg_output_set.extracted_relations):
-            context.log.info(f"Processing relation {rel_idx+1} from chunk {kg_output_set.chunk_id}: "
-                             f"{rel.head_entity_text} -[{rel.relation_type}]-> {rel.tail_entity_text}")
-
-            head_text_for_id = rel.head_entity_text
-            head_label_for_id = rel.head_entity_label 
-            tail_text_for_id = rel.tail_entity_text
-            tail_label_for_id = rel.tail_entity_label
-
-            head_id_prop_input_string = head_text_for_id + head_label_for_id
-            head_entity_id_prop = hashlib.md5(head_id_prop_input_string.encode('utf-8')).hexdigest()
-            
-            tail_id_prop_input_string = tail_text_for_id + tail_label_for_id
-            tail_entity_id_prop = hashlib.md5(tail_id_prop_input_string.encode('utf-8')).hexdigest()
-            
-            context.log.info(f"  Attempting to match Head: text='{rel.head_entity_text}', label='{rel.head_entity_label}', "
-                             f"id_prop_input='{head_id_prop_input_string}', generated_head_id_prop='{head_entity_id_prop}'")
-            context.log.info(f"  Attempting to match Tail: text='{rel.tail_entity_text}', label='{rel.tail_entity_label}', "
-                             f"id_prop_input='{tail_id_prop_input_string}', generated_tail_id_prop='{tail_entity_id_prop}'")
-
-            head_found = False
-            tail_found = False
-            try:
-                head_check_result = conn.execute("MATCH (n:ExtractedEntity {id_prop: $id}) RETURN n.text, n.label", {"id": head_entity_id_prop})
-                if head_check_result.has_next():
-                    head_data = head_check_result.get_next()
-                    context.log.info(f"    VERIFIED Head Node: id_prop='{head_entity_id_prop}', text='{head_data[0]}', label='{head_data[1]}'")
-                    head_found = True
-                else:
-                    context.log.error(f"    VERIFICATION FAILED: Head Node with id_prop='{head_entity_id_prop}' (from text='{rel.head_entity_text}') NOT FOUND.")
-                head_check_result.close()
-
-                tail_check_result = conn.execute("MATCH (n:ExtractedEntity {id_prop: $id}) RETURN n.text, n.label", {"id": tail_entity_id_prop})
-                if tail_check_result.has_next():
-                    tail_data = tail_check_result.get_next()
-                    context.log.info(f"    VERIFIED Tail Node: id_prop='{tail_entity_id_prop}', text='{tail_data[0]}', label='{tail_data[1]}'")
-                    tail_found = True
-                else:
-                    context.log.error(f"    VERIFICATION FAILED: Tail Node with id_prop='{tail_entity_id_prop}' (from text='{rel.tail_entity_text}') NOT FOUND.")
-                tail_check_result.close()
-            except Exception as e_verify:
-                context.log.error(f"    Error during node verification for relation: {e_verify}")
-
-            if head_found and tail_found:
-                # rel.relation_type 应该是从 kg_extraction_asset 传来的全大写形式，例如 "ASSIGNED_TO"
-                relation_type_from_extraction = rel.relation_type 
-                
-                # 将其映射到 DDL 中定义的实际表名（首字母大写）
-                actual_cypher_table_name = ""
-                if relation_type_from_extraction == "ASSIGNED_TO":
-                    actual_cypher_table_name = "AssignedTo"
-                elif relation_type_from_extraction == "WORKS_AT":
-                    actual_cypher_table_name = "WorksAt"
-                
-                if actual_cypher_table_name: # 如果是我们支持的关系类型
-                    relations_to_create_params.append({
-                        "head_id_prop": head_entity_id_prop,
-                        "tail_id_prop": tail_entity_id_prop,
+            # 步骤 3: 使用 UNWIND...MERGE... 加载关系数据
+            context.log.info("Step 3: Preparing and loading relation data using UNWIND...MERGE...")
+            relation_data = []
+            for kg_set in kg_extractions:
+                for rel in kg_set.extracted_relations:
+                    head_text_norm = normalize_text_for_id(rel.head_entity_text)
+                    head_label_norm = rel.head_entity_label.upper()
+                    tail_text_norm = normalize_text_for_id(rel.tail_entity_text)
+                    tail_label_norm = rel.tail_entity_label.upper()
+                    relation_data.append({
+                        "from_id": hashlib.md5(f"{head_text_norm}_{head_label_norm}".encode('utf-8')).hexdigest(),
+                        "to_id": hashlib.md5(f"{tail_text_norm}_{tail_label_norm}".encode('utf-8')).hexdigest(),
+                        "relation_type": rel.relation_type.upper()
                     })
-                    relation_type_for_cypher_map.append(actual_cypher_table_name)
-                else:
-                    context.log.warning(f"  Skipping relation due to unmapped original type: '{relation_type_from_extraction}'")
+
+            if relation_data:
+                all_rels_df = pd.DataFrame(relation_data)
+                for rel_type in all_rels_df['relation_type'].unique():
+                    rels_df_for_merge = all_rels_df[all_rels_df['relation_type'] == rel_type]
+                    batch_params = rels_df_for_merge.to_dict(orient='records')
+                    
+                    if not batch_params:
+                        continue
+                        
+                    context.log.info(f"Attempting to MERGE {len(batch_params)} relations of type '{rel_type}'...")
+                    
+                    merge_query = f"""
+                        UNWIND $batch AS rel_item
+                        MATCH (from_node:ExtractedEntity {{id_prop: rel_item.from_id}})
+                        MATCH (to_node:ExtractedEntity {{id_prop: rel_item.to_id}})
+                        MERGE (from_node)-[:`{rel_type}`]->(to_node)
+                    """
+                    context.log.debug(f"Executing relation merge query: {merge_query.strip()}")
+                    
+                    # --- [核心修复] ---
+                    # 根据 TypeError，KuzuDB的execute方法期望参数
+                    # 以一个字典的形式作为第二个位置参数传入，而不是作为关键字参数。
+                    conn.execute(merge_query, {"batch": batch_params})
+                    # --- [修复结束] ---
+
+                    context.log.info(f"Successfully merged relations of type '{rel_type}'.")
             else:
-                context.log.warning(f"  Skipping relation creation for '{rel.head_entity_text} -[{rel.relation_type}]-> {rel.tail_entity_text}' because one or both nodes were not found with generated id_props.")
-            
-    if not relations_to_create_params:
-        context.log.info("No valid relations to create after node verification and type mapping.")
-        context.add_output_metadata(metadata={"relations_created_or_merged": 0, "status": "No valid relations after node/type check"})
-        return
-            
-    executed_count = 0
-    try:
-        context.log.info(f"Attempting to execute {len(relations_to_create_params)} CREATE operations for relations in KuzuDB...")
-        for i, params in enumerate(relations_to_create_params):
-            rel_table_for_cypher = relation_type_for_cypher_map[i]
-            query = f"""
-                MATCH (h:ExtractedEntity {{id_prop: $head_id_prop}}), (t:ExtractedEntity {{id_prop: $tail_id_prop}})
-                CREATE (h)-[r:{rel_table_for_cypher}]->(t)
-            """
-            context.log.debug(f"Executing DML for relation type '{rel_table_for_cypher}': {query} with params: {params}")
-            conn.execute(query, parameters=params)
-            executed_count += 1
-        context.log.info(f"Successfully submitted {executed_count} DML statements for relations.")
-        
-        context.log.info("Final verification of relation counts after DML execution...")
-        final_rel_counts = {}
-        unique_relation_types_attempted = set(relation_type_for_cypher_map)
-        for rel_type_to_check_in_cypher in unique_relation_types_attempted:
+                context.log.warning("No relation data found in extractions to load.")
+
+            # 步骤 4: CHECKPOINT (逻辑不变)
+            context.log.info("Step 4: Executing CHECKPOINT to persist all changes...")
+            conn.execute("CHECKPOINT;")
+            context.log.info("CHECKPOINT successful.")
+
+            # 步骤 5: 创建向量索引 (逻辑不变)
+            context.log.info("Step 5: Creating Vector Index (if not exists)...")
             try:
-                count_query_result = conn.execute(f"MATCH ()-[r:{rel_type_to_check_in_cypher}]->() RETURN count(r) AS count")
-                count_df = pd.DataFrame(count_query_result.get_as_df())
-                actual_count_in_db_raw = count_df['count'].iloc[0] if not count_df.empty else 0
-                actual_count_in_db = int(actual_count_in_db_raw) # <--- 修改这里：转换为Python int
-                final_rel_counts[rel_type_to_check_in_cypher] = actual_count_in_db
-                context.log.info(f"  Relation table '{rel_type_to_check_in_cypher}' final count in DB: {actual_count_in_db}")
-            except Exception as e_count_final:
-                context.log.error(f"  Error during final count for relation table '{rel_type_to_check_in_cypher}': {e_count_final}")
-        context.add_output_metadata(
-            metadata={
-                "relations_attempted_creation": len(relations_to_create_params),
-                "relations_dml_submitted_and_executed_by_kuzu": executed_count, # 更准确的描述
-                "final_relation_counts_in_db": final_rel_counts,
-                "status": "Success" if executed_count == len(relations_to_create_params) and executed_count > 0 else "Partial Success or Issues" if executed_count > 0 else "No relations created"
-            }
-        )
-    except Exception as e:
-        context.log.error(f"Failed during DML execution for relations: {e}", exc_info=True)
-        raise dg.Failure(description=f"Failed to create relations in KuzuDB: {str(e)}")
-    
-# 确保 all_processing_assets 列表正确
+                conn.execute("LOAD VECTOR;")
+                context.log.info("VECTOR extension loaded for index creation.")
+            except Exception as e_load_vec:
+                context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded): {e_load_vec}")
+            conn.execute("CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')")
+            context.log.info("Vector index creation command successfully executed.")
+
+        except Exception as e:
+            raise dg.Failure(f"An error occurred within the KuzuDB asset: {e}") from e
+
+    context.log.info("--- KuzuDB Graph Construction Asset Finished Successfully ---")
+
+# (这个列表定义保持不变)
 all_processing_assets = [
     clean_chunk_text_asset,
     generate_embeddings_asset,
     vector_storage_asset,
     keyword_index_asset,
     kg_extraction_asset,
-    kuzu_schema_initialized_asset,
-    kuzu_entity_nodes_asset,
-    kuzu_entity_relations_asset
+    kuzu_graph_construction_asset
 ]

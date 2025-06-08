@@ -2,6 +2,7 @@
 from typing import List, Dict, Any
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 
+
 # 可以将 NO_ANSWER_PHRASE_ANSWER_CLEAN 也移到这里，或者从 constants.py 导入
 NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # 保持与 llm_interface.py 一致
 

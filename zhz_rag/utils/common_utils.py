@@ -111,22 +111,23 @@ async def log_interaction_data(
          interaction_data["interaction_id"] = str(uuid.uuid4())
 
     try:
-        # --- 新增 DEBUG 日志 ---
-        print(f"COMMON_UTILS_LOG_DATA: Preparing to dump JSON. Keys in interaction_data: {list(interaction_data.keys())}")
-        if "final_context_docs_full" in interaction_data:
-            print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' IS PRESENT before dumps.")
-            if interaction_data["final_context_docs_full"]:
-                 print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' is NOT EMPTY before dumps. Length: {len(interaction_data['final_context_docs_full'])}")
-                 try:
-                    first_content = interaction_data["final_context_docs_full"][0].get("content", "CONTENT_KEY_MISSING")
-                    print(f"COMMON_UTILS_LOG_DATA: First content in final_context_docs_full: {str(first_content)[:50]}...")
-                 except:
-                    pass # 简单忽略打印错误
-            else:
-                print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' IS EMPTY LIST before dumps.")
-        else:
-            print(f"COMMON_UTILS_LOG_DATA: 'final_context_docs_full' KEY IS MISSING before dumps!")
-        # --- 结束新增 DEBUG 日志 ---
+        data_to_log = interaction_data.copy()
+        if 'llm_input_messages' in data_to_log and isinstance(data_to_log['llm_input_messages'], list):
+            processed_messages = []
+            for msg in data_to_log['llm_input_messages']:
+                if isinstance(msg, dict) and msg.get('role') == 'system':
+                    processed_msg = msg.copy() # 复制消息字典
+                    original_content = processed_msg.get('content', '')
+                    processed_msg['content'] = f"System Prompt (length: {len(original_content)}, starts with: {original_content[:70]}...)"
+                    processed_messages.append(processed_msg)
+                else:
+                    processed_messages.append(msg)
+            data_to_log['llm_input_messages'] = processed_messages # 用处理过的消息列表替换原来的
+        if 'llm_input_original_prompt_if_string' in data_to_log and isinstance(data_to_log['llm_input_original_prompt_if_string'], str):
+            original_prompt_str = data_to_log['llm_input_original_prompt_if_string']
+            if len(original_prompt_str) > 500: # 如果原始prompt字符串太长
+                data_to_log['llm_input_original_prompt_if_string'] = f"Original Prompt String (length: {len(original_prompt_str)}, starts with: {original_prompt_str[:200]}...)"
+        # --- 添加结束 ---
 
         def _write_sync():
             log_file_dir = os.path.dirname(filepath)
@@ -141,18 +142,9 @@ async def log_interaction_data(
                     return 
 
             with open(filepath, 'a', encoding='utf-8') as f:
-                json_string_to_write = json.dumps(interaction_data, ensure_ascii=False, default=str)
-
-                # --- 新增 DEBUG 日志 ---
-                print(f"COMMON_UTILS_LOG_DATA: JSON string to write (first 300 chars): {json_string_to_write[:300]}...")
-                if "\"final_context_docs_full\"" not in json_string_to_write: # 检查序列化后的字符串
-                    print(f"COMMON_UTILS_LOG_DATA: CRITICAL! 'final_context_docs_full' NOT IN JSON string after dumps!")
-                # --- 结束新增 DEBUG 日志 ---
-                
-                f.write(json_string_to_write + "\n")
-        
+                json_string_to_write = json.dumps(data_to_log, ensure_ascii=False, default=str)
+                f.write(json_string_to_write + "\n") 
         await asyncio.to_thread(_write_sync)
-        # utils_logger.debug(f"Successfully logged data (type: {interaction_data.get('task_type', 'N/A')}) to {filepath}")
     except Exception as e:
         utils_logger.error(f"Failed to log interaction data to {filepath}: {e}", exc_info=True)
 

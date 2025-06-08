@@ -3,7 +3,7 @@ import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator
+from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator,Tuple
 import logging
 import httpx
 import asyncio
@@ -53,6 +53,13 @@ class SentenceTransformerResource(dg.ConfigurableResource):
             normalize_embeddings=normalize_embeddings
         )
         return [emb.tolist() for emb in embeddings_np]
+    
+    # --- [添加开始] ---
+    def get_embedding_dimension(self) -> int:
+        """返回嵌入模型的维度大小。"""
+        if self._model and hasattr(self._model, 'get_sentence_embedding_dimension'):
+            return self._model.get_sentence_embedding_dimension()
+        return 512
 
 # --- ChromaDBResource ---
 class ChromaDBResourceConfig(dg.Config):
@@ -109,13 +116,14 @@ class ChromaDBResource(dg.ConfigurableResource):
         logger_instance.debug(f"Querying ChromaDB collection '{self.collection_name}' with {len(query_embeddings)} vectors, n_results={n_results}.")
         return self._collection.query(query_embeddings=query_embeddings, n_results=n_results)
 
-# --- SGLangAPIResource ---
-class SGLangAPIResourceConfig(dg.Config):
-    api_url: str = "http://127.0.0.1:30000/generate"
+# --- LocalLLMAPIResource ---
+class LocalLLMAPIResourceConfig(dg.Config):
+    api_url: str = "http://127.0.0.1:8088/v1/chat/completions" # <--- 修改
     default_temperature: float = 0.1
-    default_max_new_tokens: int = 512
+    default_max_new_tokens: int = 2048
 
-class SGLangAPIResource(dg.ConfigurableResource):
+class LocalLLMAPIResource(dg.ConfigurableResource):
+    # 我们将 SGLangAPIResource 重命名为 LocalLLMAPIResource
     api_url: str
     default_temperature: float
     default_max_new_tokens: int
@@ -123,8 +131,9 @@ class SGLangAPIResource(dg.ConfigurableResource):
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"SGLangAPIResource configured with API URL: {self.api_url}")
+        self._logger.info(f"LocalLLMAPIResource configured with API URL: {self.api_url}") # <--- 修改日志信息
 
+    # generate_structured_output 方法的逻辑需要调整以适配 OpenAI 兼容的 API
     async def generate_structured_output(
         self, prompt: str, json_schema: Dict[str, Any],
         temperature: Optional[float] = None, max_new_tokens: Optional[int] = None
@@ -132,37 +141,47 @@ class SGLangAPIResource(dg.ConfigurableResource):
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         temp_to_use = temperature if temperature is not None else self.default_temperature
         tokens_to_use = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
+
+        messages = [{"role": "user", "content": prompt}] # 简化处理
+
         payload = {
-            "text": prompt,
-            "sampling_params": {
-                "temperature": temp_to_use,
-                "max_new_tokens": tokens_to_use,
-                "stop": ["<|im_end|>"],
-                "json_schema": json.dumps(json_schema)
+            "model": "local_kg_extraction_model", # 模型名对于本地服务不重要，但需要有
+            "messages": messages,
+            "temperature": temp_to_use,
+            "max_tokens": tokens_to_use,
+            "response_format": { # 我们的 local_llm_service.py 支持这个
+                "type": "json_object",
+                "schema": json_schema
             }
         }
-        logger_instance.debug(f"Sending request to SGLang. Prompt (start): {prompt[:100]}... Schema: {json.dumps(json_schema)}")
+        logger_instance.debug(f"Sending request to Local LLM Service. Prompt (start): {prompt[:100]}...")
+
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(self.api_url, json=payload)
+                response = await client.post(self.api_url, json=payload) # 使用 self.api_url
                 response.raise_for_status()
                 response_json = response.json()
-                generated_text = response_json.get("text", "").strip()
-                logger_instance.debug(f"SGLang raw response text: {generated_text}")
-                try:
-                    parsed_output = json.loads(generated_text)
-                    return parsed_output
-                except json.JSONDecodeError as e:
-                    logger_instance.error(f"Failed to decode SGLang JSON output: {generated_text}. Error: {e}", exc_info=True)
-                    raise ValueError(f"SGLang output was not valid JSON: {generated_text}") from e
+                
+                # OpenAI 兼容 API 的响应格式是 {"choices": [{"message": {"content": "..."}}]}
+                if response_json.get("choices") and response_json["choices"][0].get("message"):
+                    generated_text = response_json["choices"][0]["message"].get("content", "")
+                    logger_instance.debug(f"Local LLM raw response text: {generated_text}")
+                    try:
+                        parsed_output = json.loads(generated_text)
+                        return parsed_output
+                    except json.JSONDecodeError as e:
+                        logger_instance.error(f"Failed to decode JSON from Local LLM output: {generated_text}. Error: {e}", exc_info=True)
+                        raise ValueError(f"Local LLM output was not valid JSON: {generated_text}") from e
+                else:
+                    raise ValueError(f"Local LLM response format is incorrect: {response_json}")
         except httpx.HTTPStatusError as e:
-            logger_instance.error(f"SGLang API HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
+            logger_instance.error(f"Local LLM API HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
             raise
         except httpx.RequestError as e:
-            logger_instance.error(f"SGLang API request error: {e}", exc_info=True)
+            logger_instance.error(f"Local LLM API request error: {e}", exc_info=True)
             raise
         except Exception as e:
-            logger_instance.error(f"Unexpected error during SGLang call: {e}", exc_info=True)
+            logger_instance.error(f"Unexpected error during Local LLM call: {e}", exc_info=True)
             raise
 
 # --- GeminiAPIResource ---
@@ -223,82 +242,74 @@ class GeminiAPIResource(dg.ConfigurableResource):
             logger_instance.error(f"Error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
         return raw_output_text
 
-# --- KuzuDB Resources (New Strategy Applied) ---
+
 class KuzuDBReadWriteResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
         default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
-        description=(
-            "Path to the KuzuDB database directory. "
-            "Can be relative to the project root (if not starting with '/') or absolute."
-        )
-    )
-    clear_on_startup_for_testing: bool = PydanticField(
-        default=False, # 生产中通常为 False，测试时可设为 True
-        description="If true, delete and re-initialize the DB when the resource is first set up. USE WITH CAUTION."
+        description="Path to the KuzuDB database directory."
     )
 
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
     _resolved_db_path: str = PrivateAttr()
-    _db: Optional[kuzu.Database] = PrivateAttr(default=None) # <--- 持有 Database 实例
-    _conn: Optional[kuzu.Connection] = PrivateAttr(default=None) # <--- 持有 Connection 实例
+    _db: Optional[kuzu.Database] = PrivateAttr(default=None) # 这个 db 对象将在整个作业运行期间保持
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        """
+        在作业开始时被调用一次。创建并持有 kuzu.Database 对象。
+        """
         self._logger = context.log
-        if os.path.isabs(self.db_path_str):
-            self._resolved_db_path = self.db_path_str
-        else:
-            self._resolved_db_path = os.path.abspath(self.db_path_str)
+        project_root = os.environ.get("DAGSTER_PROJECT_ROOT", os.getcwd())
+        self._resolved_db_path = os.path.join(project_root, self.db_path_str)
         
         self._logger.info(
-            f"KuzuDBReadWriteResource setup: resolved_path='{self._resolved_db_path}', "
-            f"clear_on_startup_for_testing={self.clear_on_startup_for_testing}"
+            f"KuzuDBReadWriteResource setup: DB path is '{self._resolved_db_path}'."
         )
-
-        if self.clear_on_startup_for_testing:
-            if os.path.exists(self._resolved_db_path):
-                self._logger.warning(f"Clearing KuzuDB directory: {self._resolved_db_path}")
-                try:
-                    shutil.rmtree(self._resolved_db_path)
-                    self._logger.info(f"Successfully removed KuzuDB directory.")
-                except OSError as e:
-                    self._logger.error(f"Failed to remove KuzuDB directory {self._resolved_db_path}: {e}", exc_info=True)
-                    raise
         
+        # 清理旧数据库，确保从干净状态开始
+        if os.path.exists(self._resolved_db_path):
+            shutil.rmtree(self._resolved_db_path)
+            self._logger.info(f"Cleaned up existing database directory: {self._resolved_db_path}")
+
         try:
             os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
-            self._db = kuzu.Database(self._resolved_db_path, read_only=False)
-            self._conn = kuzu.Connection(self._db)
-            self._logger.info(f"KuzuDB Database and Connection initialized successfully at {self._resolved_db_path}.")
+            self._db = kuzu.Database(self._resolved_db_path)
+            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the run.")
         except Exception as e:
-            self._logger.error(f"Failed to initialize KuzuDB: {e}", exc_info=True)
+            self._logger.error(f"Failed to initialize shared kuzu.Database object: {e}", exc_info=True)
             raise
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger.info(f"Tearing down KuzuDBReadWriteResource for {self._resolved_db_path}...")
-        if self._conn is not None:
-            # 可以在这里选择性地执行最后的 CHECKPOINT，但通常 KuzuDB 关闭时会处理
-            # try:
-            #     self._logger.info("Executing final CHECKPOINT on KuzuDB connection before teardown.")
-            #     self._conn.execute("CHECKPOINT;")
-            #     self._logger.info("Final CHECKPOINT successful.")
-            # except Exception as e_chk:
-            #     self._logger.error(f"Error during final CHECKPOINT: {e_chk}")
-            del self._conn # Kuzu Connection 没有 close()
-            self._conn = None
+        """
+        在作业结束时被调用一次。销毁 kuzu.Database 对象以释放所有资源。
+        """
+        self._logger.info(f"Tearing down KuzuDBReadWriteResource...")
         if self._db is not None:
-            del self._db # 依赖 KuzuDB Database 的 __del__ 方法进行清理和锁释放
+            del self._db 
             self._db = None
+            self._logger.info("Shared kuzu.Database object destroyed, releasing file lock.")
         self._logger.info("KuzuDBReadWriteResource teardown complete.")
 
-    def get_connection(self) -> kuzu.Connection:
-        """Returns the managed KuzuDB connection."""
-        if self._conn is None:
-            # 这种错误不应该在 in_process_executor 下发生，因为 setup_for_execution 会先运行
-            self._logger.error("KuzuDB connection not available. Resource might not have been set up correctly.")
-            raise Exception("KuzuDB connection not available. Resource might not have been set up correctly.")
-        return self._conn
-            
-# KuzuDBReadOnlyResource 定义保持不变
+    @contextmanager
+    def get_connection(self) -> Iterator[kuzu.Connection]:
+        """
+        一个上下文管理器，从共享的 DB 对象获取一个新连接。
+        """
+        if self._db is None:
+            raise ConnectionError("Shared KuzuDB Database object is not initialized.")
+        
+        conn = None
+        try:
+            # --- [最终修复] 使用正确的语法创建连接 ---
+            conn = kuzu.Connection(self._db) 
+            # --- [最终修复] ---
+            self._logger.debug("New kuzu.Connection obtained from shared Database object.")
+            yield conn
+        finally:
+            if conn is not None:
+                del conn
+                self._logger.debug("kuzu.Connection object destroyed.")
+
+
 class KuzuDBReadOnlyResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
         default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
