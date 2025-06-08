@@ -258,22 +258,25 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
         在作业开始时被调用一次。创建并持有 kuzu.Database 对象。
         """
         self._logger = context.log
+        # 使用 context.instance.storage_directory() 可能更稳健，但我们先用之前的逻辑
         project_root = os.environ.get("DAGSTER_PROJECT_ROOT", os.getcwd())
         self._resolved_db_path = os.path.join(project_root, self.db_path_str)
         
         self._logger.info(
-            f"KuzuDBReadWriteResource setup: DB path is '{self._resolved_db_path}'."
+            f"KuzuDBReadWriteResource setup for run: DB path is '{self._resolved_db_path}'."
         )
         
-        # 清理旧数据库，确保从干净状态开始
+        # 在每次作业运行开始时，清理旧数据库，确保从干净状态开始
         if os.path.exists(self._resolved_db_path):
             shutil.rmtree(self._resolved_db_path)
             self._logger.info(f"Cleaned up existing database directory: {self._resolved_db_path}")
 
         try:
+            # 确保父目录存在
             os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
+            # 创建数据库实例，并将其保存在 self._db 中，供整个作业生命周期使用
             self._db = kuzu.Database(self._resolved_db_path)
-            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the run.")
+            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the entire run.")
         except Exception as e:
             self._logger.error(f"Failed to initialize shared kuzu.Database object: {e}", exc_info=True)
             raise
@@ -282,9 +285,9 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
         """
         在作业结束时被调用一次。销毁 kuzu.Database 对象以释放所有资源。
         """
-        self._logger.info(f"Tearing down KuzuDBReadWriteResource...")
+        self._logger.info(f"Tearing down KuzuDBReadWriteResource for run...")
         if self._db is not None:
-            del self._db 
+            # del self._db 是依赖析构函数，为了更明确，我们直接设为 None
             self._db = None
             self._logger.info("Shared kuzu.Database object destroyed, releasing file lock.")
         self._logger.info("KuzuDBReadWriteResource teardown complete.")
@@ -292,23 +295,22 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
     @contextmanager
     def get_connection(self) -> Iterator[kuzu.Connection]:
         """
-        一个上下文管理器，从共享的 DB 对象获取一个新连接。
+        一个上下文管理器，从【共享的】DB 对象获取一个新连接。
+        这确保了所有资产操作都在同一个数据库实例上。
         """
         if self._db is None:
-            raise ConnectionError("Shared KuzuDB Database object is not initialized.")
+            raise ConnectionError("Shared KuzuDB Database object is not initialized. This should not happen if setup_for_execution was successful.")
         
         conn = None
         try:
-            # --- [最终修复] 使用正确的语法创建连接 ---
-            conn = kuzu.Connection(self._db) 
-            # --- [最终修复] ---
+            # 从保存在 self._db 中的共享数据库实例创建连接
+            conn = kuzu.Connection(self._db)
             self._logger.debug("New kuzu.Connection obtained from shared Database object.")
             yield conn
         finally:
             if conn is not None:
-                del conn
-                self._logger.debug("kuzu.Connection object destroyed.")
-
+                # 连接对象在使用后会被垃圾回收，无需显式关闭
+                self._logger.debug("kuzu.Connection from shared DB object is going out of scope.")
 
 class KuzuDBReadOnlyResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
