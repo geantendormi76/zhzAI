@@ -11,6 +11,7 @@ class QueryRequest(BaseModel):
     top_k_vector: int = Field(description="期望检索的向量搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_kg: int = Field(description="期望检索的知识图谱结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_bm25: int = Field(description="期望检索的 BM25 关键词搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
+    top_k_final: int = Field(default=3, description="最终融合后返回的文档数量。") 
 
     @root_validator(pre=True)
     @classmethod

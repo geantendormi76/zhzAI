@@ -2,7 +2,7 @@ from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import chromadb
 import logging
-
+from .embedding_functions import LlamaCppEmbeddingFunction
 
 # 配置ChromaDBRetriever的日志记录器
 logger = logging.getLogger(__name__)
@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 class ChromaDBRetriever:
     def __init__(
         self,
-        collection_name: str = "rag_documents",
-        persist_directory: str = "/home/zhz/dagster_home/chroma_data",
-        embedding_model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5",
+        collection_name: str, # 改为必需参数
+        persist_directory: str, # 改为必需参数
+        embedding_function: LlamaCppEmbeddingFunction # <--- 新增参数
     ):
         """
         初始化ChromaDBRetriever。
@@ -21,41 +21,37 @@ class ChromaDBRetriever:
         Args:
             collection_name (str): 要查询的ChromaDB集合名称。
             persist_directory (str): ChromaDB数据持久化的目录。
-            embedding_model_name_or_path (str): 用于查询向量化的SentenceTransformer模型名称或路径。
-            device (str): 模型运行的设备 (例如 "cpu", "cuda")。
+            embedding_function (LlamaCppEmbeddingFunction): 用于生成嵌入的函数实例。
         """
         self.collection_name = collection_name
         self.persist_directory = persist_directory
-        self.embedding_model_name_or_path = embedding_model_name_or_path
+        self._embedding_function = embedding_function # <--- 使用新参数
         self._client: Optional[chromadb.Client] = None
         self._collection: Optional[chromadb.Collection] = None
-        self._embedding_model: Optional[SentenceTransformer] = None
 
         self._initialize_retriever()
 
     def _initialize_retriever(self):
         """
-        初始化ChromaDB客户端、集合和嵌入模型。
+        初始化ChromaDB客户端和集合。嵌入模型由传入的 embedding_function 处理。
         """
         try:
             logger.info(f"Initializing ChromaDB client from path: {self.persist_directory}")
             self._client = chromadb.PersistentClient(path=self.persist_directory)
-            logger.info(f"Getting ChromaDB collection: {self.collection_name}")
-            self._collection = self._client.get_collection(name=self.collection_name)
+            
+            logger.info(f"Getting or creating ChromaDB collection: {self.collection_name} using provided embedding function.")
+            self._collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=self._embedding_function # <--- 传递嵌入函数
+
+            )
+
             if self._collection.count() == 0:
                 logger.warning(f"ChromaDB collection '{self.collection_name}' is empty!")
             else:
                 logger.info(f"ChromaDB collection '{self.collection_name}' loaded. Item count: {self._collection.count()}")
         except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB client or collection: {e}")
-            raise
-
-        try:
-            logger.info(f"Loading SentenceTransformer model: {self.embedding_model_name_or_path}")
-            self._embedding_model = SentenceTransformer(self.embedding_model_name_or_path)
-            logger.info("SentenceTransformer model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load SentenceTransformer model: {e}")
+            logger.error(f"Failed to initialize ChromaDB client or collection: {e}", exc_info=True)
             raise
             
     def retrieve(self, query_text: str, n_results: int = 5, include_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -78,27 +74,27 @@ class ChromaDBRetriever:
                                    'distance' (相似度距离，越小越相似)
                                    具体结构取决于ChromaDB的返回和我们的处理。
         """
-        if self._collection is None or self._embedding_model is None:
-            logger.error("Retriever is not properly initialized.")
+        if self._collection is None or self._embedding_function is None:
+            logger.error("Retriever is not properly initialized (collection or embedding_function is None).")
             # 尝试重新初始化，或者直接返回错误/空列表
             try:
                 self._initialize_retriever()
-                if self._collection is None or self._embedding_model is None: # 再次检查
+                if self._collection is None or self._embedding_function is None: # 再次检查
                     return []
-            except Exception as e:
-                logger.error(f"Failed to re-initialize retriever during retrieve call: {e}")
+            except Exception as e_reinit:
+                logger.error(f"Failed to re-initialize retriever during retrieve call: {e_reinit}")
                 return []
 
         logger.info(f"Retrieving documents for query: '{query_text[:100]}...' with n_results={n_results}")
         
         try:
-            # 1. 将查询文本向量化并归一化
-            query_embedding_np = self._embedding_model.encode(
-                query_text, 
-                convert_to_tensor=False, 
-                normalize_embeddings=True # <--- 关键：归一化查询嵌入
-            )
-            query_embedding = query_embedding_np.tolist()
+            # 1. 将查询文本向量化 (现在通过 LlamaCppEmbeddingFunction)
+            logger.debug(f"Calling _embedding_function.embed_query with query: '{query_text[:50]}...'")
+            query_embedding = self._embedding_function.embed_query(query_text) # <--- 确认这里有 (query_text)
+            
+            if not query_embedding: 
+                logger.error(f"Failed to generate embedding for query: {query_text[:100]}")
+                return [] # 如果嵌入失败，直接返回空列表
             
             # 2. 在ChromaDB中查询 (include_fields_query 的逻辑不变)
             if include_fields is None:
@@ -151,6 +147,63 @@ class ChromaDBRetriever:
         except Exception as e:
             logger.error(f"Error during ChromaDB retrieval: {e}")
             return []
+        
+    def get_texts_by_ids(self, ids: List[str]) -> Dict[str, str]:
+        """
+        根据提供的ID列表从ChromaDB集合中获取文档的文本内容。
+
+        Args:
+            ids (List[str]): 要获取文本的文档ID列表。
+
+        Returns:
+            Dict[str, str]: 一个字典，键是文档ID，值是对应的文本内容。
+                            如果某个ID未找到或其元数据中没有文本，则对应的值可能不存在或为特定提示。
+        """
+        if not self._collection:
+            logger.error("ChromaDBRetriever: Collection is not initialized. Cannot get texts by IDs.")
+            return {id_val: "[Error: Collection not initialized]" for id_val in ids}
+        
+        if not ids:
+            return {}
+            
+        logger.info(f"ChromaDBRetriever: Getting texts for {len(ids)} IDs.")
+        
+        texts_map: Dict[str, str] = {}
+        try:
+            # ChromaDB的get方法可以接收ids列表，并指定包含哪些部分
+            # 我们需要元数据中的 'chunk_text'
+            results = self._collection.get(
+                ids=ids,
+                include=["metadatas"] # 我们只需要元数据来提取 chunk_text
+            )
+            
+            retrieved_ids = results.get("ids", [])
+            retrieved_metadatas = results.get("metadatas", [])
+            
+            if retrieved_ids and retrieved_metadatas and len(retrieved_ids) == len(retrieved_metadatas):
+                for i in range(len(retrieved_ids)):
+                    doc_id = retrieved_ids[i]
+                    metadata = retrieved_metadatas[i]
+                    if metadata and "chunk_text" in metadata:
+                        texts_map[doc_id] = metadata["chunk_text"]
+                    else:
+                        texts_map[doc_id] = f"[Content for chunk_id {doc_id} not found in metadata]"
+                        logger.warning(f"ChromaDBRetriever: Metadata or 'chunk_text' not found for ID: {doc_id}")
+            else:
+                logger.warning(f"ChromaDBRetriever: Mismatch in lengths or empty results from _collection.get(). IDs asked: {len(ids)}, IDs got: {len(retrieved_ids)}")
+                # 为所有请求的ID设置一个未找到的默认值
+                for id_val in ids:
+                    if id_val not in texts_map: # 避免覆盖已可能通过其他方式找到的
+                         texts_map[id_val] = f"[Content for chunk_id {id_val} not found after ChromaDB get()]"
+
+        except Exception as e:
+            logger.error(f"ChromaDBRetriever: Error during get_texts_by_ids: {e}", exc_info=True)
+            # 出错时，为所有请求的ID设置错误提示
+            for id_val in ids:
+                 texts_map[id_val] = f"[Error retrieving content for ID {id_val}]"
+        
+        logger.info(f"ChromaDBRetriever: Returning texts_map with {len(texts_map)} entries.")
+        return texts_map
 
 if __name__ == '__main__':
     # 简单的测试代码

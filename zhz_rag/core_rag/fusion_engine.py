@@ -12,16 +12,14 @@ import os
 from zhz_rag.config.pydantic_models import RetrievedDocument
 
 class FusionEngine:
-    _current_script_path = os.path.abspath(__file__)
-    _script_directory = os.path.dirname(_current_script_path)
-
-    # 确保您的模型路径指向正确的位置，如果不在 local_models/bge-reranker-base
-    LOCAL_RERANKER_MODEL_PATH = os.getenv(
-        "RERANKER_MODEL_PATH", 
-        "/home/zhz/models/bge-reranker-base" # <--- 直接指定新的、统一管理后的模型路径
-    )
-
     def __init__(self, logger: Optional[logging.Logger] = None):
+
+        self.reranker_model_path_from_env = os.getenv("RERANKER_MODEL_PATH")
+        if not self.reranker_model_path_from_env:
+            default_fallback_path = "/home/zhz/models/Qwen3-Reranker-0.6B-seq-cls" 
+            logging.error(f"RERANKER_MODEL_PATH not found in environment variables! Falling back to default: {default_fallback_path}")
+            self.reranker_model_path_from_env = default_fallback_path
+
         if logger:
             self.logger = logger
         else:
@@ -38,10 +36,9 @@ class FusionEngine:
         self._load_reranker_model()
 
     def _load_reranker_model(self):
-        self.logger.info(f"FusionEngine: Loading reranker model from: {self.LOCAL_RERANKER_MODEL_PATH} to {self.reranker_device}...")
-        
-        if not os.path.isdir(self.LOCAL_RERANKER_MODEL_PATH): # 检查是否是目录
-            _error_msg_model_path = f"Error: Reranker model local path does not exist or is not a directory: {self.LOCAL_RERANKER_MODEL_PATH}."
+        self.logger.info(f"FusionEngine: Loading reranker model from: {self.reranker_model_path_from_env} to {self.reranker_device}...")
+        if not os.path.isdir(self.reranker_model_path_from_env):
+            _error_msg_model_path = f"Error: Reranker model local path does not exist or is not a directory: {self.reranker_model_path_from_env}."
             self.logger.error(_error_msg_model_path)
             # 在实际应用中，这里可能应该抛出异常，或者让服务无法启动
             # 为了测试，我们先允许模型为空，后续调用会检查
@@ -50,8 +47,8 @@ class FusionEngine:
             return # 提前返回
 
         try:
-            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.LOCAL_RERANKER_MODEL_PATH)
-            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.LOCAL_RERANKER_MODEL_PATH)
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_path_from_env, trust_remote_code=True) # <--- 添加参数
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_path_from_env, trust_remote_code=True) # <--- 也为模型添加
             self.reranker_model.to(self.reranker_device)
 
             if self.reranker_device == 'cuda' and hasattr(self.reranker_model, 'half'): # 检查是否有half方法

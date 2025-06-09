@@ -4,7 +4,7 @@ import json
 import kuzu
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional, Callable, Iterator
+from typing import List, Dict, Any, Optional, Callable, Iterator, TYPE_CHECKING
 import logging
 from contextlib import contextmanager
 import hashlib # 确保导入 hashlib
@@ -12,6 +12,9 @@ import hashlib # 确保导入 hashlib
 # --- 从项目中导入必要的模块 ---
 from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, IdentifiedEntity
+if TYPE_CHECKING:
+    from zhz_rag.llm.local_model_handler import LocalModelHandler
+
 
 # 日志配置
 kg_logger = logging.getLogger(__name__)
@@ -28,10 +31,10 @@ kg_logger.info("KGRetriever (KuzuDB) logger initialized/reconfirmed.")
 class KGRetriever:
     KUZU_DB_PATH_ENV = os.getenv("KUZU_DB_PATH", "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db")
 
-    def __init__(self, db_path: Optional[str] = None, embedder: Optional[SentenceTransformer] = None):
+    def __init__(self, db_path: Optional[str] = None, embedder: Optional['LocalModelHandler'] = None): # <--- 修改类型提示
         self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
         self._db: Optional[kuzu.Database] = None
-        self._embedder = embedder
+        self._embedder = embedder # 现在 self._embedder 会是 LocalModelHandler 实例
         kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. DB path: {self.db_path}")
         if self._embedder:
             kg_logger.info(f"KGRetriever initialized with embedder: {type(self._embedder)}")
@@ -197,26 +200,22 @@ class KGRetriever:
         all_kuzu_records: List[Dict[str, Any]] = []
         
         # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
-        if self._embedder:
+        if self._embedder: # self._embedder 现在是 LocalModelHandler 实例
             try:
-                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}'")
-                query_vector_np = self._embedder.encode(search_text_for_vector, normalize_embeddings=True)
-                query_vector_list = query_vector_np.tolist()
+                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}' using LocalModelHandler via KGRetriever.")
+                query_vector_list = await self._embedder.embed_query(search_text_for_vector) # <--- 添加 await
+
+                if not query_vector_list: 
+                    raise ValueError(f"Embedding generation failed in KGRetriever for vector search text: '{search_text_for_vector}'")
                 
-                # --- 修改：根据研究报告更新 KuzuDB 向量查询 ---
-                # 假设索引名为 'entity_embedding_idx'，建立在 ExtractedEntity 表的 'embedding' (FLOAT[]) 列上
-                vector_search_query = """
+                vector_search_query = """ 
                     CALL QUERY_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', $query_vector, $top_k_param)
                     YIELD node, distance
                     RETURN node.id_prop AS id_prop, node.text AS text, node.label AS label, distance AS _score
                 """
-                vector_params = {"query_vector": query_vector_list, "top_k_param": top_k} 
-                # --- 修改结束 ---
+                vector_params = {"query_vector": query_vector_list, "top_k_param": top_k}
                 
                 kg_logger.info(f"Executing KuzuDB vector search. Table: 'ExtractedEntity', Index: 'entity_embedding_idx', Top K: {top_k}")
-                # kg_logger.debug(f"Vector search query: {vector_search_query.strip()}")
-                # kg_logger.debug(f"Vector search params (vector preview): {{'query_vector': {str(query_vector_list)[:100]}..., 'top_k_param': {top_k}}}")
-
                 vector_results = self._execute_cypher_query_sync(vector_search_query, vector_params)
                 
                 if vector_results:

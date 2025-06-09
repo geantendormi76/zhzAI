@@ -3540,7 +3540,6 @@ from dagster import (
 # 导入所有资产列表
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.ingestion_assets import all_ingestion_assets
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import all_processing_assets
-from zhz_rag_pipeline_dagster.zhz_rag_pipeline.evaluation_assets import all_evaluation_assets
 
 # 导入所有资源和 IO 管理器
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
@@ -3554,7 +3553,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.custom_io_managers import PydanticListJsonIOManager
 
 # 1. 定义一个包含项目中所有资产的列表
-all_defined_assets = all_ingestion_assets + all_processing_assets + all_evaluation_assets
+all_defined_assets = all_ingestion_assets + all_processing_assets
 
 # 2. [最终的、最简单的作业定义]
 #    直接选择所有资产。因为我们使用了 in_process_executor，
@@ -3563,7 +3562,7 @@ all_defined_assets = all_ingestion_assets + all_processing_assets + all_evaluati
 #    当您只想运行 KuzuDB 相关的部分时，可以在 UI 中选择一个子集。
 kuzu_kg_write_job = define_asset_job(
     name="kuzu_kg_write_job",
-    selection=AssetSelection.all(), # 选择所有已定义的资产
+    selection=AssetSelection.all(), # 选择 all_defined_assets 中的所有资产
     executor_def=in_process_executor
 )
 
@@ -3579,7 +3578,9 @@ defs = Definitions(
         "chroma_db": ChromaDBResource(collection_name=ChromaDBResourceConfig().collection_name, persist_directory=ChromaDBResourceConfig().persist_directory),
         "sglang_api": LocalLLMAPIResource(api_url=LocalLLMAPIResourceConfig().api_url, default_temperature=LocalLLMAPIResourceConfig().default_temperature, default_max_new_tokens=LocalLLMAPIResourceConfig().default_max_new_tokens),
         "kuzu_readwrite_db": KuzuDBReadWriteResource(),
+        # kuzu_readonly_db 资源暂时没有被任何启用的资产使用，但保留它也无妨
         "kuzu_readonly_db": KuzuDBReadOnlyResource(),
+        # gemini_api 资源也只被评估资产使用，理论上可以注释掉，但保留也无妨
         "gemini_api": GeminiAPIResource(model_name=GeminiAPIResourceConfig().model_name, proxy_url=GeminiAPIResourceConfig().proxy_url, default_temperature=GeminiAPIResourceConfig().default_temperature, default_max_tokens=GeminiAPIResourceConfig().default_max_tokens),
         "pydantic_json_io_manager": pydantic_io_manager_instance,
     }
@@ -3961,26 +3962,27 @@ all_ingestion_assets = [load_documents_asset, parse_document_asset]
 
   File: processing_assets.py
     --- START OF FILE CONTENT ---
-# /home/zhz/zhz_agent/zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
+# 文件: zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
+
 import dagster as dg
 from typing import List, Dict, Any, Optional
 import uuid
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import hashlib
-import pandas as pd 
+import pandas as pd
 from zhz_rag.utils.common_utils import normalize_text_for_id
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
     ChunkOutput,
     ParsedDocumentOutput,
     EmbeddingOutput,
-    KGTripleSetOutput, 
+    KGTripleSetOutput,
     ExtractedEntity,
     ExtractedRelation
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     SentenceTransformerResource,
     ChromaDBResource,
-    LocalLLMAPIResource, 
+    LocalLLMAPIResource,
     KuzuDBReadWriteResource,
     KuzuDBReadOnlyResource
 )
@@ -3991,346 +3993,134 @@ import numpy as np
 import os
 import time
 
+# --- text_chunks, text_embeddings, vector_store_embeddings, keyword_index 资产定义保持不变 ---
+# (为了保持代码完整，这里包含了所有资产的代码)
+
 class TextChunkerConfig(dg.Config):
     chunk_size: int = 500
     chunk_overlap: int = 50
-    # separators: Optional[List[str]] = None # 可选的自定义分隔符
 
 @dg.asset(
     name="text_chunks",
     description="Cleans and chunks parsed documents into smaller text segments.",
-    group_name="processing", # 属于处理组
-    # deps=["parsed_documents"] # <--- 删除或注释掉这一行
+    group_name="processing",
+    deps=["parsed_documents"]
 )
 def clean_chunk_text_asset(
     context: dg.AssetExecutionContext,
     config: TextChunkerConfig,
-    parsed_documents: List[ParsedDocumentOutput] 
-) -> List[ChunkOutput]: 
-    
+    parsed_documents: List[ParsedDocumentOutput]
+) -> List[ChunkOutput]:
     all_chunks: List[ChunkOutput] = []
     context.log.info(f"Received {len(parsed_documents)} parsed documents to clean and chunk.")
-
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
-        # length_function=len, # 默认
-        # add_start_index=True, # 如果需要块的起始索引
-        # separators=config.separators if config.separators else None # 使用配置的分隔符
     )
-
     for parsed_doc in parsed_documents:
-        # 使用原始文件名作为文档ID，如果不存在则生成UUID
-        doc_id_from_meta = parsed_doc.original_metadata.get("filename")
-        if not doc_id_from_meta:
-            doc_id_from_meta = parsed_doc.original_metadata.get("document_path", str(uuid.uuid4()))
-            context.log.warning(f"Filename not found in metadata for a document, using path or UUID: {doc_id_from_meta}")
-        
-        source_dir = parsed_doc.original_metadata.get('source_directory', 'Unknown_Source_Dir')
-        context.log.info(f"Processing document: {doc_id_from_meta} (from {source_dir})")
-
+        doc_id_from_meta = parsed_doc.original_metadata.get("filename", str(uuid.uuid4()))
+        context.log.info(f"Processing document: {doc_id_from_meta}")
         cleaned_text = parsed_doc.parsed_text.strip()
-
-        if not cleaned_text or cleaned_text.startswith("[Unsupported file type:") or cleaned_text.startswith("[Error parsing document:"):
-            context.log.warning(f"Document {doc_id_from_meta} has no valid content or was unsupported/errored in parsing, skipping chunking.")
+        if not cleaned_text:
+            context.log.warning(f"Document {doc_id_from_meta} has no valid content, skipping.")
             continue
-        
         try:
             chunks_text_list = text_splitter.split_text(cleaned_text)
             context.log.info(f"Document {doc_id_from_meta} split into {len(chunks_text_list)} chunks.")
-
             for i, chunk_text_content in enumerate(chunks_text_list):
-                chunk_meta = parsed_doc.original_metadata.copy() 
-                chunk_meta.update({
-                    "chunk_number": i + 1,
-                    "total_chunks_for_doc": len(chunks_text_list),
-                    "chunk_char_length": len(chunk_text_content),
-                })
-
-                chunk_output = ChunkOutput( # chunk_id 会在 ChunkOutput 的 __init__ 中自动生成
-                    chunk_text=chunk_text_content,
-                    source_document_id=doc_id_from_meta, # 使用从元数据获取的文档ID
-                    chunk_metadata=chunk_meta
-                )
-                all_chunks.append(chunk_output)
-        
+                chunk_meta = parsed_doc.original_metadata.copy()
+                chunk_meta.update({"chunk_number": i + 1, "total_chunks_for_doc": len(chunks_text_list)})
+                all_chunks.append(ChunkOutput(chunk_text=chunk_text_content, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
         except Exception as e:
             context.log.error(f"Failed to chunk document {doc_id_from_meta}: {e}")
-            
-    if all_chunks:
-        context.add_output_metadata(
-            metadata={
-                "total_chunks_generated": len(all_chunks),
-                "first_chunk_doc_id": all_chunks[0].source_document_id if all_chunks else "N/A"
-            }
-        )
-    else:
-        context.log.warning("No chunks were generated from the input documents.")
-        
+    context.add_output_metadata(metadata={"total_chunks_generated": len(all_chunks)})
     return all_chunks
 
-# --- 新增：EmbeddingGenerationAgent (实现为 Asset) ---
 @dg.asset(
     name="text_embeddings",
-    description="Generates vector embeddings for text chunks using a SentenceTransformer model.",
+    description="Generates vector embeddings for text chunks.",
     group_name="processing",
-    # deps=["text_chunks"] # <--- 删除或注释掉这一行
+    deps=["text_chunks"]
 )
 def generate_embeddings_asset(
     context: dg.AssetExecutionContext,
-    text_chunks: List[ChunkOutput], # 输入是上游资产的输出列表
-    embedder: SentenceTransformerResource # <--- 注入我们定义的Resource
+    text_chunks: List[ChunkOutput],
+    embedder: SentenceTransformerResource
 ) -> List[EmbeddingOutput]:
-    
     all_embeddings: List[EmbeddingOutput] = []
-    context.log.info(f"Received {len(text_chunks)} text chunks to generate embeddings for.")
-
     if not text_chunks:
-        context.log.warning("No text chunks received, skipping embedding generation.")
         return all_embeddings
-
-    # 提取所有块的文本内容进行批量编码
     chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks]
-    
-    try:
-        context.log.info(f"Starting batch embedding generation for {len(chunk_texts_to_encode)} texts...")
-        # 使用Resource的encode方法
-        vectors = embedder.encode(chunk_texts_to_encode) 
-        context.log.info(f"Successfully generated {len(vectors)} embedding vectors.")
-
-        if len(vectors) != len(text_chunks):
-            # 这是一个预期外的情况，应该记录严重错误
-            context.log.error(f"Mismatch in number of chunks ({len(text_chunks)}) and generated vectors ({len(vectors)}). Aborting.")
-            # 可以在这里抛出异常来使资产失败
-            raise ValueError("Embedding generation resulted in a mismatched number of vectors.")
-
-        for i, chunk_input in enumerate(text_chunks):
-            embedding_output = EmbeddingOutput(
-                chunk_id=chunk_input.chunk_id,
-                chunk_text=chunk_input.chunk_text,
-                embedding_vector=vectors[i],
-                embedding_model_name=embedder.model_name_or_path, # 从Resource获取模型名
-                original_chunk_metadata=chunk_input.chunk_metadata
-            )
-            all_embeddings.append(embedding_output)
-        
-        context.log.info(f"All {len(all_embeddings)} embeddings prepared.")
-
-    except Exception as e:
-        context.log.error(f"Failed to generate embeddings: {e}")
-        # 根据策略，可以选择让资产失败，或者返回空列表/部分结果
-        # 这里我们选择抛出异常，让资产运行失败，以便调查
-        raise
-
-    if all_embeddings:
-        context.add_output_metadata(
-            metadata={
-                "total_embeddings_generated": len(all_embeddings),
-                "embedding_model_used": embedder.model_name_or_path,
-                "first_chunk_id_embedded": all_embeddings[0].chunk_id if all_embeddings else "N/A"
-            }
-        )
+    vectors = embedder.encode(chunk_texts_to_encode)
+    for i, chunk_input in enumerate(text_chunks):
+        all_embeddings.append(EmbeddingOutput(
+            chunk_id=chunk_input.chunk_id,
+            chunk_text=chunk_input.chunk_text,
+            embedding_vector=vectors[i],
+            embedding_model_name=embedder.model_name_or_path,
+            original_chunk_metadata=chunk_input.chunk_metadata
+        ))
+    context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
     return all_embeddings
 
-# --- 新增：VectorStorageAgent (实现为 Asset) ---
 @dg.asset(
     name="vector_store_embeddings",
     description="Stores text embeddings into a ChromaDB vector store.",
-    group_name="indexing", # 新的分组
-    # deps=["text_embeddings"] # 依赖上一个资产的name
+    group_name="indexing",
+    deps=["text_embeddings"]
 )
 def vector_storage_asset(
     context: dg.AssetExecutionContext,
-    text_embeddings: List[EmbeddingOutput], # 输入是上游资产的输出列表
-    chroma_db: ChromaDBResource # <--- 注入ChromaDB Resource
-) -> None: # 这个资产通常只执行操作，不产生新的可传递数据资产，所以返回None
-    
-    context.log.info(f"Received {len(text_embeddings)} embeddings to store in ChromaDB.")
-
+    text_embeddings: List[EmbeddingOutput],
+    chroma_db: ChromaDBResource
+) -> None:
     if not text_embeddings:
         context.log.warning("No embeddings received, nothing to store.")
-        # 可以在这里添加一个 AssetMaterialization 来记录这个空操作
-        context.add_output_metadata(metadata={"num_embeddings_stored": 0, "status": "No data to store"})
         return
+    ids_to_store = [emb.chunk_id for emb in text_embeddings]
+    embeddings_to_store = [emb.embedding_vector for emb in text_embeddings]
+    metadatas_to_store = [emb.original_chunk_metadata for emb in text_embeddings]
+    for meta, emb in zip(metadatas_to_store, text_embeddings):
+        meta["chunk_text"] = emb.chunk_text
+    chroma_db.add_embeddings(ids=ids_to_store, embeddings=embeddings_to_store, metadatas=metadatas_to_store)
+    context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
 
-    ids_to_store: List[str] = []
-    embeddings_to_store: List[List[float]] = []
-    metadatas_to_store: List[Dict[str, Any]] = []
-
-    for emb_output in text_embeddings: # emb_output 是 EmbeddingOutput 类型
-        ids_to_store.append(emb_output.chunk_id) 
-        embeddings_to_store.append(emb_output.embedding_vector)
-        
-        simple_metadata = {}
-        for key, value in emb_output.original_chunk_metadata.items(): # 从原始块元数据开始
-            if isinstance(value, (str, int, float, bool)):
-                simple_metadata[key] = value
-            else:
-                simple_metadata[key] = str(value) 
-        
-        simple_metadata["chunk_text"] = emb_output.chunk_text # <--- 直接从emb_output获取
-
-        metadatas_to_store.append(simple_metadata)
-
-    try:
-        chroma_db.add_embeddings(
-            ids=ids_to_store,
-            embeddings=embeddings_to_store,
-            metadatas=metadatas_to_store
-        )
-        context.log.info(f"Successfully stored/updated {len(ids_to_store)} embeddings in ChromaDB.")
-        
-        # 记录物化信息
-        context.add_output_metadata(
-            metadata={
-                "num_embeddings_stored": len(ids_to_store),
-                "collection_name": chroma_db.collection_name,
-                "status": "Success"
-            }
-        )
-    except Exception as e:
-        context.log.error(f"Failed to store embeddings in ChromaDB: {e}")
-        context.add_output_metadata(
-            metadata={
-                "num_embeddings_stored": 0,
-                "collection_name": chroma_db.collection_name,
-                "status": f"Failed: {str(e)}"
-            }
-        )
-        raise # 让资产失败
-
-
-# --- 新增：定义 KeywordIndexAgent 的配置 Pydantic 模型 ---
 class BM25IndexConfig(dg.Config):
     index_file_path: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index/"
 
-# --- 修改：KeywordIndexAgent (实现为 Asset) ---
 @dg.asset(
     name="keyword_index",
     description="Builds and persists a BM25 keyword index from text chunks.",
     group_name="indexing",
-    # deps=["text_chunks"] 
+    deps=["text_chunks"]
 )
 def keyword_index_asset(
     context: dg.AssetExecutionContext,
     config: BM25IndexConfig,
-    text_chunks: List[ChunkOutput] 
+    text_chunks: List[ChunkOutput]
 ) -> None:
-    
-    context.log.info(f"Received {len(text_chunks)} text chunks to build BM25 index.")
-
     if not text_chunks:
-        # ... (无数据处理不变) ...
         context.log.warning("No text chunks received, skipping BM25 index building.")
-        context.add_output_metadata(metadata={"num_documents_indexed": 0, "status": "No data"})
         return
-
-    corpus_texts: List[str] = [chunk.chunk_text for chunk in text_chunks]
-    document_ids: List[str] = [chunk.chunk_id for chunk in text_chunks] # 我们仍然需要保存这个映射
-
-    context.log.info("Tokenizing corpus using jieba...")
-    # 使用jieba分词，但bm25s有自己的tokenize函数，可以接受自定义分词器，或者直接处理分词后的列表
-    # 为了与bm25s的tokenize函数配合，我们可以先用jieba分好，再传给bm25s的tokenizer
-    # 或者，如果bm25s的默认分词或其Tokenizer类能满足中文需求，可以直接用。
-    # 为了简单且利用jieba，我们先分词
+    corpus_texts = [chunk.chunk_text for chunk in text_chunks]
+    document_ids = [chunk.chunk_id for chunk in text_chunks]
     corpus_tokenized_jieba = [list(jieba.cut_for_search(text)) for text in corpus_texts]
-    context.log.info(f"Jieba tokenization complete. Example: {corpus_tokenized_jieba[0][:10] if corpus_tokenized_jieba else 'N/A'}")
+    bm25_model = bm25s.BM25()
+    bm25_model.index(corpus_tokenized_jieba)
+    index_directory = config.index_file_path
+    os.makedirs(index_directory, exist_ok=True)
+    bm25_model.save(index_directory)
+    doc_ids_path = os.path.join(index_directory, "doc_ids.pkl")
+    with open(doc_ids_path, 'wb') as f_out:
+        pickle.dump(document_ids, f_out)
+    context.add_output_metadata(metadata={"num_documents_indexed": len(corpus_texts), "index_directory_path": index_directory})
 
-    context.log.info("Initializing BM25s model and indexing corpus...")
-    try:
-        # 根据bm25s文档，先创建BM25对象，然后调用index方法
-        bm25_model = bm25s.BM25() # 可以传入k1, b等参数
-        # .index() 方法接受已经分词的语料库 (list of list of str)
-        bm25_model.index(corpus_tokenized_jieba)
-        context.log.info("BM25s model indexed successfully.")
-    except Exception as e:
-        context.log.error(f"Failed to initialize or index with BM25s model: {e}")
-        raise
 
-    index_directory = config.index_file_path # 这应该是一个目录路径
-
-    if not os.path.exists(index_directory):
-        os.makedirs(index_directory, exist_ok=True)
-        context.log.info(f"Created directory for BM25 index: {index_directory}")
-
-    try:
-        context.log.info(f"Saving BM25 model to directory: {index_directory}")
-        # 使用bm25s的save方法，它会将多个文件保存到该目录下
-        # 它会自动保存词汇表 (vocab.index.json) 和其他必要文件
-        bm25_model.save(
-            index_directory,
-            # 文件名参数是可选的，bm25s有默认文件名，例如：
-            # data_name="data.csc.index.npy",
-            # indices_name="indices.csc.index.npy",
-            # indptr_name="indptr.csc.index.npy",
-            # vocab_name="vocab.index.json", 
-            # params_name="params.index.json"
-        )
-        context.log.info(f"BM25 model saved successfully to {index_directory}")
-
-        # 单独保存我们的 document_ids 列表，因为bm25s内部索引是基于0,1,2...
-        # 而我们需要映射回原始的chunk_id
-        doc_ids_path = os.path.join(index_directory, "doc_ids.pkl") # 保持这个文件名
-        with open(doc_ids_path, 'wb') as f_out:
-            pickle.dump(document_ids, f_out)
-        context.log.info(f"Document IDs saved successfully to {doc_ids_path}")
-        
-        context.add_output_metadata(
-            metadata={
-                "num_documents_indexed": len(corpus_texts),
-                "index_directory_path": index_directory, # <--- 修改：现在是目录路径
-                "status": "Success"
-            }
-        )
-    except Exception as e:
-        # ... (错误处理不变) ...
-        context.log.error(f"Failed to save BM25 model or document IDs: {e}")
-        context.add_output_metadata(
-            metadata={
-                "num_documents_indexed": 0,
-                "index_directory_path": index_directory,
-                "status": f"Failed to save index: {str(e)}"
-            }
-        )
-        raise
-
-# 知识图谱
-DEFAULT_KG_EXTRACTION_SCHEMA = { # <--- 覆盖这里的整个字典
-    "type": "object",
-    "properties": {
-        "entities": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "提取到的实体原文"},
-                    "label": {"type": "string", "description": "实体类型 (例如: PERSON, ORGANIZATION, TASK)"}
-                },
-                "required": ["text", "label"]
-            },
-            "description": "从文本中提取出的实体列表。"
-        },
-        "relations": { # <--- 新增/确保这部分存在且正确
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "head_entity_text": {"type": "string", "description": "头实体的文本"},
-                    "head_entity_label": {"type": "string", "description": "头实体的类型 (例如: PERSON, TASK)"},
-                    "relation_type": {"type": "string", "description": "关系类型 (例如: WORKS_AT, ASSIGNED_TO)"},
-                    "tail_entity_text": {"type": "string", "description": "尾实体的文本"},
-                    "tail_entity_label": {"type": "string", "description": "尾实体的类型 (例如: ORGANIZATION, PERSON)"}
-                },
-                "required": ["head_entity_text", "head_entity_label", "relation_type", "tail_entity_text", "tail_entity_label"]
-            },
-            "description": "从文本中提取出的关系三元组列表。"
-        }
-    },
-    "required": ["entities", "relations"] # <--- 确保 "relations" 也在这里
-}
+# --- KG Extraction 相关的配置和资产 ---
 
 class KGExtractionConfig(dg.Config):
-    extraction_prompt_template: str = ( # <--- 覆盖这里的整个多行字符串
+    # --- [核心修复] 使用双重大括号 {{ 和 }} 转义所有JSON示例中的大括号 ---
+    extraction_prompt_template: str = (
         "你是一个信息抽取助手。请从以下提供的文本中抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体。\n"
         "同时，请抽取出以下两种关系：\n"
         "1. WORKS_AT (当一个人在一个组织工作时，例如：PERSON WORKS_AT ORGANIZATION)\n"
@@ -4347,210 +4137,217 @@ class KGExtractionConfig(dg.Config):
         "  ]\n"
         "}}\n"
         "如果文本中没有可抽取的实体或关系，请返回一个空的对应列表 (例如 {{\"entities\": [], \"relations\": []}})。\n\n"
-        "示例文本1：'项目Alpha的文档编写任务分配给了张三。张三在谷歌工作。'\n"
-        "期望JSON输出1：\n"
-        "{{\n"
-        "  \"entities\": [\n"
-        "    {{\"text\": \"项目Alpha的文档编写任务\", \"label\": \"TASK\"}},\n"
-        "    {{\"text\": \"张三\", \"label\": \"PERSON\"}},\n"
-        "    {{\"text\": \"谷歌\", \"label\": \"ORGANIZATION\"}}\n"
-        "  ],\n"
-        "  \"relations\": [\n"
-        "    {{\"head_entity_text\": \"项目Alpha的文档编写任务\", \"head_entity_label\": \"TASK\", \"relation_type\": \"ASSIGNED_TO\", \"tail_entity_text\": \"张三\", \"tail_entity_label\": \"PERSON\"}},\n"
-        "    {{\"head_entity_text\": \"张三\", \"head_entity_label\": \"PERSON\", \"relation_type\": \"WORKS_AT\", \"tail_entity_text\": \"谷歌\", \"tail_entity_label\": \"ORGANIZATION\"}}\n"
-        "  ]\n"
-        "}}\n\n"
         "文本：\n"
         "\"{text_to_extract}\"\n\n"
         "JSON输出："
     )
-    sglang_model_name: str = "Qwen2.5-3B-Instruct_via_SGLang" # 保持不变
+    # --- [修复结束] ---
+    local_llm_model_name: str = "Qwen3-1.7B-GGUF_via_llama.cpp"
 
-# --- 新增：KGExtractionAgent (实现为 Asset) ---
+# --- [核心修复] 在这里添加缺失的常量定义 ---
+DEFAULT_KG_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "提取到的实体原文"},
+                    "label": {"type": "string", "description": "实体类型 (例如: PERSON, ORGANIZATION, TASK)"}
+                },
+                "required": ["text", "label"]
+            },
+            "description": "从文本中提取出的实体列表。"
+        },
+        "relations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "head_entity_text": {"type": "string", "description": "头实体的文本"},
+                    "head_entity_label": {"type": "string", "description": "头实体的类型 (例如: PERSON, TASK)"},
+                    "relation_type": {"type": "string", "description": "关系类型 (例如: WORKS_AT, ASSIGNED_TO)"},
+                    "tail_entity_text": {"type": "string", "description": "尾实体的文本"},
+                    "tail_entity_label": {"type": "string", "description": "尾实体的类型 (例如: ORGANIZATION, PERSON)"}
+                },
+                "required": ["head_entity_text", "head_entity_label", "relation_type", "tail_entity_text", "tail_entity_label"]
+            },
+            "description": "从文本中提取出的关系三元组列表。"
+        }
+    },
+    "required": ["entities", "relations"]
+}
+# --- [修复结束] ---
+
 @dg.asset(
     name="kg_extractions",
-    description="Extracts entities (and potentially relations) from text chunks for knowledge graph construction.",
+    description="Extracts entities and relations from text chunks for knowledge graph construction.",
     group_name="kg_building",
-    io_manager_key="pydantic_json_io_manager" 
+    io_manager_key="pydantic_json_io_manager",
+    deps=["text_chunks"]
 )
 async def kg_extraction_asset(
     context: dg.AssetExecutionContext,
-    text_chunks: List[ChunkOutput], 
-    config: KGExtractionConfig,     
-    sglang_api: LocalLLMAPIResource 
+    text_chunks: List[ChunkOutput],
+    config: KGExtractionConfig,
+    sglang_api: LocalLLMAPIResource
 ) -> List[KGTripleSetOutput]:
-    
     all_kg_outputs: List[KGTripleSetOutput] = []
-    context.log.info(f"Received {len(text_chunks)} text chunks for KG extraction.")
-
     if not text_chunks:
-        context.log.warning("No text chunks received, skipping KG extraction.")
-        context.add_output_metadata(metadata={"num_chunks_processed": 0, "total_entities_extracted": 0, "total_relations_extracted": 0})
         return all_kg_outputs
-
     total_entities_count = 0
     total_relations_count = 0
     for i, chunk in enumerate(text_chunks):
-        context.log.info(f"Extracting KG from chunk {i+1}/{len(text_chunks)} (ID: {chunk.chunk_id})")
-        
         prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
-        
         try:
-            structured_response = await sglang_api.generate_structured_output(
-                prompt=prompt,
-                json_schema=DEFAULT_KG_EXTRACTION_SCHEMA 
-            )
-             # --- 核心修改：在这一步就进行规范化 ---
+            structured_response = await sglang_api.generate_structured_output(prompt=prompt, json_schema=DEFAULT_KG_EXTRACTION_SCHEMA)
             entities_data = structured_response.get("entities", [])
-            extracted_entities_list: List[ExtractedEntity] = []
-            if isinstance(entities_data, list):
-                for entity_dict in entities_data:
-                    if isinstance(entity_dict, dict) and "text" in entity_dict and "label" in entity_dict:
-                        # 对 LLM 返回的文本和标签立即进行规范化
-                        normalized_text = normalize_text_for_id(entity_dict["text"])
-                        normalized_label = entity_dict["label"].upper()
-                        extracted_entities_list.append(ExtractedEntity(
-                            text=normalized_text, 
-                            label=normalized_label
-                        ))
-            
+            extracted_entities_list = [ExtractedEntity(text=normalize_text_for_id(e["text"]), label=e["label"].upper()) for e in entities_data if isinstance(e, dict)]
             relations_data = structured_response.get("relations", [])
-            extracted_relations_list: List[ExtractedRelation] = []
-            if isinstance(relations_data, list):
-                for rel_dict in relations_data:
-                    if (isinstance(rel_dict, dict) and
-                        all(key in rel_dict for key in ["head_entity_text", "head_entity_label", 
-                                                        "relation_type", "tail_entity_text", "tail_entity_label"])):
-                        # 对关系中的所有文本和标签也进行规范化
-                        extracted_relations_list.append(ExtractedRelation(
-                            head_entity_text=normalize_text_for_id(rel_dict["head_entity_text"]),
-                            head_entity_label=rel_dict["head_entity_label"].upper(),
-                            relation_type=rel_dict["relation_type"].upper(),
-                            tail_entity_text=normalize_text_for_id(rel_dict["tail_entity_text"]),
-                            tail_entity_label=rel_dict["tail_entity_label"].upper()
-                        ))
-            # --- 修改结束 --- 
+            extracted_relations_list = [ExtractedRelation(head_entity_text=r['head_entity_text'], head_entity_label=r['head_entity_label'], relation_type=r['relation_type'], tail_entity_text=r['tail_entity_text'], tail_entity_label=r['tail_entity_label']) for r in relations_data if isinstance(r, dict)]
             total_entities_count += len(extracted_entities_list)
             total_relations_count += len(extracted_relations_list)
-
-            kg_output = KGTripleSetOutput(
+            all_kg_outputs.append(KGTripleSetOutput(
                 chunk_id=chunk.chunk_id,
                 extracted_entities=extracted_entities_list,
                 extracted_relations=extracted_relations_list,
-                extraction_model_name=config.sglang_model_name,
+                extraction_model_name=config.local_llm_model_name,
                 original_chunk_metadata=chunk.chunk_metadata
-            )
-            all_kg_outputs.append(kg_output)
-
-        except Exception as e:
-            context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True) # 添加 exc_info=True
-            all_kg_outputs.append(KGTripleSetOutput(
-                chunk_id=chunk.chunk_id,
-                extraction_model_name=config.sglang_model_name,
-                original_chunk_metadata={"error": str(e), **chunk.chunk_metadata}
             ))
-            
-    context.add_output_metadata(
-        metadata={
-            "num_chunks_processed": len(text_chunks),
-            "total_entities_extracted": total_entities_count,
-            "total_relations_extracted": total_relations_count,
-            "status": "Success" if len(all_kg_outputs) == len(text_chunks) else "Partial Success"
-        }
-    )
+        except Exception as e:
+            context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
+    context.add_output_metadata(metadata={"total_entities_extracted": total_entities_count, "total_relations_extracted": total_relations_count})
     return all_kg_outputs
 
-KUZU_WRITE_CONCURRENCY_KEY = "kuzu_write_access"
-
+# --- KuzuDB 构建资产链 ---
 
 @dg.asset(
-    name="kuzu_graph_construction",
-    description="Creates schema, loads data, and creates vector index in KuzuDB.",
+    name="kuzu_schema",
+    description="Creates the base schema (node and rel tables) in KuzuDB.",
     group_name="kg_building",
-    op_tags={"dagster/concurrency_key": "kuzu_write_pool"},
-    deps=[kg_extraction_asset],
-    tags={dg.MAX_RUNTIME_SECONDS_TAG: "900"}
+    deps=[kg_extraction_asset]
 )
-def kuzu_graph_construction_asset(
-    context: dg.AssetExecutionContext,
-    kg_extractions: List[KGTripleSetOutput],
-    kuzu_readwrite_db: KuzuDBReadWriteResource,
-    embedder: SentenceTransformerResource
-):
-    context.log.info("--- Starting Unified KuzuDB Graph Construction Asset ---")
-    if not kg_extractions:
-        context.log.warning("No KG extractions received. Skipping.")
-        return
+def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+    context.log.info("--- Starting KuzuDB Schema Creation Asset ---")
+    with kuzu_readwrite_db.get_connection() as conn:
+        EMBEDDING_DIM = embedder.get_embedding_dimension()
+        conn.execute(
+            f"CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, embedding FLOAT[{EMBEDDING_DIM}], PRIMARY KEY (id_prop))"
+        )
+        # --- [核心修复] 将关系表名改为全大写，以匹配后续 MERGE 操作 ---
+        conn.execute("CREATE REL TABLE IF NOT EXISTS WORKS_AT (FROM ExtractedEntity TO ExtractedEntity)")
+        conn.execute("CREATE REL TABLE IF NOT EXISTS ASSIGNED_TO (FROM ExtractedEntity TO ExtractedEntity)")
+        # --- [修复结束] ---
+        context.log.info("KuzuDB Schema DDL commands executed successfully.")
 
+@dg.asset(
+    name="kuzu_nodes",
+    description="Loads all unique extracted entities as nodes into KuzuDB.",
+    group_name="kg_building",
+    deps=["kuzu_schema", "kg_extractions"]
+)
+def kuzu_nodes_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGTripleSetOutput], kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+    context.log.info("--- Starting KuzuDB Node Loading Asset ---")
+    if not kg_extractions:
+        context.log.warning("No KG extractions received. Skipping node loading.")
+        return
+    unique_nodes = {}
+    for kg_set in kg_extractions:
+        for entity in kg_set.extracted_entities:
+            node_key = (normalize_text_for_id(entity.text), entity.label.upper())
+            if node_key not in unique_nodes:
+                unique_nodes[node_key] = {
+                    "id_prop": hashlib.md5(f"{node_key[0]}_{node_key[1]}".encode('utf-8')).hexdigest(),
+                    "text": node_key[0],
+                    "label": node_key[1],
+                    "embedding": embedder.encode([node_key[0]])[0]
+                }
+    node_data = list(unique_nodes.values())
+    if not node_data:
+        context.log.warning("No unique nodes found in extractions to load.")
+        return
+    with kuzu_readwrite_db.get_connection() as conn:
+        nodes_df = pd.DataFrame(node_data)
+        context.log.info(f"Copying {len(nodes_df)} unique nodes into ExtractedEntity table...")
+        conn.execute("COPY ExtractedEntity FROM nodes_df;")
+        conn.execute("CHECKPOINT;")
+        context.log.info("Successfully copied nodes and checkpointed.")
+
+@dg.asset(
+    name="kuzu_relations",
+    description="Loads all extracted relationships into KuzuDB.",
+    group_name="kg_building",
+    deps=["kuzu_nodes"]
+)
+def kuzu_relations_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGTripleSetOutput], kuzu_readwrite_db: KuzuDBReadWriteResource):
+    context.log.info("--- Starting KuzuDB Relation Loading Asset ---")
+    if not kg_extractions:
+        context.log.warning("No KG extractions received. Skipping relation loading.")
+        return
+    relation_data = []
+    for kg_set in kg_extractions:
+        for rel in kg_set.extracted_relations:
+            head_text_norm = normalize_text_for_id(rel.head_entity_text)
+            head_label_norm = rel.head_entity_label.upper()
+            tail_text_norm = normalize_text_for_id(rel.tail_entity_text)
+            tail_label_norm = rel.tail_entity_label.upper()
+            relation_data.append({
+                "from_id": hashlib.md5(f"{head_text_norm}_{head_label_norm}".encode('utf-8')).hexdigest(),
+                "to_id": hashlib.md5(f"{tail_text_norm}_{tail_label_norm}".encode('utf-8')).hexdigest(),
+                "relation_type": rel.relation_type.upper()
+            })
+    if not relation_data:
+        context.log.warning("No relation data found in extractions to load.")
+        return
+    with kuzu_readwrite_db.get_connection() as conn:
+        all_rels_df = pd.DataFrame(relation_data)
+        for rel_type in all_rels_df['relation_type'].unique():
+            rels_df_for_merge = all_rels_df[all_rels_df['relation_type'] == rel_type]
+            batch_params = rels_df_for_merge.to_dict(orient='records')
+            if not batch_params: continue
+            context.log.info(f"Attempting to MERGE {len(batch_params)} relations of type '{rel_type}'...")
+            merge_query = f"""
+                UNWIND $batch AS rel_item
+                MATCH (from_node:ExtractedEntity {{id_prop: rel_item.from_id}})
+                MATCH (to_node:ExtractedEntity {{id_prop: rel_item.to_id}})
+                MERGE (from_node)-[:`{rel_type}`]->(to_node)
+            """
+            conn.execute(merge_query, {"batch": batch_params})
+            context.log.info(f"Successfully merged relations of type '{rel_type}'.")
+        conn.execute("CHECKPOINT;")
+        context.log.info("Successfully merged all relations and checkpointed.")
+
+@dg.asset(
+    name="kuzu_vector_index",
+    description="Creates the vector index on the ExtractedEntity table.",
+    group_name="kg_building",
+    deps=["kuzu_relations"]
+)
+def kuzu_vector_index_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource):
+    context.log.info("--- Starting KuzuDB Vector Index Creation Asset ---")
     with kuzu_readwrite_db.get_connection() as conn:
         try:
-            # 步骤 1: 创建 Schema (在自动事务中)
-            context.log.info("Step 1: Creating Schema...")
-            EMBEDDING_DIM = embedder.get_embedding_dimension()
-            conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, embedding FLOAT[{EMBEDDING_DIM}], PRIMARY KEY (id_prop))"
-            )
-            conn.execute("CREATE REL TABLE IF NOT EXISTS WorksAt (FROM ExtractedEntity TO ExtractedEntity)")
-            conn.execute("CREATE REL TABLE IF NOT EXISTS AssignedTo (FROM ExtractedEntity TO ExtractedEntity)")
-            context.log.info("Schema DDL commands executed.")
-
-            # 步骤 2: 加载节点数据 (在自动事务中)
-            context.log.info("Step 2: Loading node data...")
-            node_data = [
-                {
-                    "id_prop": hashlib.md5((normalize_text_for_id(e.text) + e.label.upper()).encode('utf-8')).hexdigest(),
-                    "text": e.text, "label": e.label.upper(), "embedding": embedder.encode([e.text])[0]
-                }
-                for kg_set in kg_extractions for e in kg_set.extracted_entities
-            ]
-            if node_data:
-                nodes_df = pd.DataFrame(node_data)
-                conn.execute("COPY ExtractedEntity FROM nodes_df (ignore_errors=true);")
-                context.log.info(f"Successfully copied {len(nodes_df)} nodes.")
-
-            # 步骤 3: 加载关系数据 (在自动事务中)
-            context.log.info("Step 3: Loading relation data...")
-            relation_data = [
-                {"from_id": hashlib.md5((normalize_text_for_id(r.head_entity_text) + r.head_entity_label.upper()).encode('utf-8')).hexdigest(),
-                 "to_id": hashlib.md5((normalize_text_for_id(r.tail_entity_text) + r.tail_entity_label.upper()).encode('utf-8')).hexdigest(),
-                 "relation_type": r.relation_type.upper()}
-                for kg_set in kg_extractions for r in kg_set.extracted_relations
-            ]
-            if relation_data:
-                all_rels_df = pd.DataFrame(relation_data)
-                for rel_type in all_rels_df['relation_type'].unique():
-                    rels_df_for_copy = all_rels_df[all_rels_df['relation_type'] == rel_type][["from_id", "to_id"]]
-                    if not rels_df_for_copy.empty:
-                        conn.execute(f"COPY {rel_type} FROM (LOAD FROM rels_df_for_copy RETURN from_id, to_id);")
-                context.log.info(f"Successfully copied {len(relation_data)} relations.")
-
-            # 步骤 4: CHECKPOINT (可选但推荐)
-            context.log.info("Step 4: Executing CHECKPOINT...")
-            conn.execute("CHECKPOINT;")
-            context.log.info("CHECKPOINT successful.")
-
-            # 步骤 5: 创建向量索引 (在自动事务中)
-            context.log.info("Step 5: Creating Vector Index...")
             conn.execute("LOAD VECTOR;")
-            conn.execute("CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')")
-            context.log.info("Vector index creation command successfully executed.")
+            context.log.info("VECTOR extension loaded for index creation.")
+        except Exception as e_load_vec:
+            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded): {e_load_vec}")
+        context.log.info("Executing vector index creation command...")
+        conn.execute("CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')")
+        context.log.info("Vector index creation command successfully executed.")
 
-        except Exception as e:
-            raise dg.Failure(f"An error occurred within the KuzuDB asset: {e}") from e
-
-    context.log.info("--- KuzuDB Graph Construction Asset Finished Successfully ---")
-
-
-# 更新 all_processing_assets 列表
+# --- 更新 all_processing_assets 列表 ---
 all_processing_assets = [
     clean_chunk_text_asset,
     generate_embeddings_asset,
     vector_storage_asset,
     keyword_index_asset,
     kg_extraction_asset,
-    kuzu_graph_construction_asset
+    kuzu_schema_asset,
+    kuzu_nodes_asset,
+    kuzu_relations_asset,
+    kuzu_vector_index_asset,
 ]
-
     --- END OF FILE CONTENT ---
 
   File: pydantic_models_dagster.py
@@ -4873,22 +4670,25 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
         在作业开始时被调用一次。创建并持有 kuzu.Database 对象。
         """
         self._logger = context.log
+        # 使用 context.instance.storage_directory() 可能更稳健，但我们先用之前的逻辑
         project_root = os.environ.get("DAGSTER_PROJECT_ROOT", os.getcwd())
         self._resolved_db_path = os.path.join(project_root, self.db_path_str)
         
         self._logger.info(
-            f"KuzuDBReadWriteResource setup: DB path is '{self._resolved_db_path}'."
+            f"KuzuDBReadWriteResource setup for run: DB path is '{self._resolved_db_path}'."
         )
         
-        # 清理旧数据库，确保从干净状态开始
+        # 在每次作业运行开始时，清理旧数据库，确保从干净状态开始
         if os.path.exists(self._resolved_db_path):
             shutil.rmtree(self._resolved_db_path)
             self._logger.info(f"Cleaned up existing database directory: {self._resolved_db_path}")
 
         try:
+            # 确保父目录存在
             os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
+            # 创建数据库实例，并将其保存在 self._db 中，供整个作业生命周期使用
             self._db = kuzu.Database(self._resolved_db_path)
-            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the run.")
+            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the entire run.")
         except Exception as e:
             self._logger.error(f"Failed to initialize shared kuzu.Database object: {e}", exc_info=True)
             raise
@@ -4897,9 +4697,9 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
         """
         在作业结束时被调用一次。销毁 kuzu.Database 对象以释放所有资源。
         """
-        self._logger.info(f"Tearing down KuzuDBReadWriteResource...")
+        self._logger.info(f"Tearing down KuzuDBReadWriteResource for run...")
         if self._db is not None:
-            del self._db 
+            # del self._db 是依赖析构函数，为了更明确，我们直接设为 None
             self._db = None
             self._logger.info("Shared kuzu.Database object destroyed, releasing file lock.")
         self._logger.info("KuzuDBReadWriteResource teardown complete.")
@@ -4907,23 +4707,22 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
     @contextmanager
     def get_connection(self) -> Iterator[kuzu.Connection]:
         """
-        一个上下文管理器，从共享的 DB 对象获取一个新连接。
+        一个上下文管理器，从【共享的】DB 对象获取一个新连接。
+        这确保了所有资产操作都在同一个数据库实例上。
         """
         if self._db is None:
-            raise ConnectionError("Shared KuzuDB Database object is not initialized.")
+            raise ConnectionError("Shared KuzuDB Database object is not initialized. This should not happen if setup_for_execution was successful.")
         
         conn = None
         try:
-            # --- [最终修复] 使用正确的语法创建连接 ---
-            conn = kuzu.Connection(self._db) 
-            # --- [最终修复] ---
+            # 从保存在 self._db 中的共享数据库实例创建连接
+            conn = kuzu.Connection(self._db)
             self._logger.debug("New kuzu.Connection obtained from shared Database object.")
             yield conn
         finally:
             if conn is not None:
-                del conn
-                self._logger.debug("kuzu.Connection object destroyed.")
-
+                # 连接对象在使用后会被垃圾回收，无需显式关闭
+                self._logger.debug("kuzu.Connection from shared DB object is going out of scope.")
 
 class KuzuDBReadOnlyResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
@@ -5144,7 +4943,6 @@ Directory: zhz_rag/
   File: __init__.py
     --- File is empty ---
 
-  File (skipped, extension not included): setup - 副本.py:Zone.Identifier
   File: setup.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_agent/zhz_rag/setup.py
@@ -5659,6 +5457,7 @@ class QueryRequest(BaseModel):
     top_k_vector: int = Field(description="期望检索的向量搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_kg: int = Field(description="期望检索的知识图谱结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
     top_k_bm25: int = Field(description="期望检索的 BM25 关键词搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
+    top_k_final: int = Field(default=3, description="最终融合后返回的文档数量。") 
 
     @root_validator(pre=True)
     @classmethod
@@ -6426,16 +6225,14 @@ import os
 from zhz_rag.config.pydantic_models import RetrievedDocument
 
 class FusionEngine:
-    _current_script_path = os.path.abspath(__file__)
-    _script_directory = os.path.dirname(_current_script_path)
-
-    # 确保您的模型路径指向正确的位置，如果不在 local_models/bge-reranker-base
-    LOCAL_RERANKER_MODEL_PATH = os.getenv(
-        "RERANKER_MODEL_PATH", 
-        "/home/zhz/models/bge-reranker-base" # <--- 直接指定新的、统一管理后的模型路径
-    )
-
     def __init__(self, logger: Optional[logging.Logger] = None):
+
+        self.reranker_model_path_from_env = os.getenv("RERANKER_MODEL_PATH")
+        if not self.reranker_model_path_from_env:
+            default_fallback_path = "/home/zhz/models/Qwen3-Reranker-0.6B-seq-cls" 
+            logging.error(f"RERANKER_MODEL_PATH not found in environment variables! Falling back to default: {default_fallback_path}")
+            self.reranker_model_path_from_env = default_fallback_path
+
         if logger:
             self.logger = logger
         else:
@@ -6452,10 +6249,9 @@ class FusionEngine:
         self._load_reranker_model()
 
     def _load_reranker_model(self):
-        self.logger.info(f"FusionEngine: Loading reranker model from: {self.LOCAL_RERANKER_MODEL_PATH} to {self.reranker_device}...")
-        
-        if not os.path.isdir(self.LOCAL_RERANKER_MODEL_PATH): # 检查是否是目录
-            _error_msg_model_path = f"Error: Reranker model local path does not exist or is not a directory: {self.LOCAL_RERANKER_MODEL_PATH}."
+        self.logger.info(f"FusionEngine: Loading reranker model from: {self.reranker_model_path_from_env} to {self.reranker_device}...")
+        if not os.path.isdir(self.reranker_model_path_from_env):
+            _error_msg_model_path = f"Error: Reranker model local path does not exist or is not a directory: {self.reranker_model_path_from_env}."
             self.logger.error(_error_msg_model_path)
             # 在实际应用中，这里可能应该抛出异常，或者让服务无法启动
             # 为了测试，我们先允许模型为空，后续调用会检查
@@ -6464,8 +6260,8 @@ class FusionEngine:
             return # 提前返回
 
         try:
-            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.LOCAL_RERANKER_MODEL_PATH)
-            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.LOCAL_RERANKER_MODEL_PATH)
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_path_from_env) # <--- 修改后的行
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_path_from_env) # <--- 修改后的行
             self.reranker_model.to(self.reranker_device)
 
             if self.reranker_device == 'cuda' and hasattr(self.reranker_model, 'half'): # 检查是否有half方法
@@ -6668,7 +6464,7 @@ import json
 import kuzu
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional, Callable, Iterator
+from typing import List, Dict, Any, Optional, Callable, Iterator, TYPE_CHECKING
 import logging
 from contextlib import contextmanager
 import hashlib # 确保导入 hashlib
@@ -6676,6 +6472,9 @@ import hashlib # 确保导入 hashlib
 # --- 从项目中导入必要的模块 ---
 from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, IdentifiedEntity
+if TYPE_CHECKING:
+    from zhz_rag.llm.local_model_handler import LocalModelHandler
+
 
 # 日志配置
 kg_logger = logging.getLogger(__name__)
@@ -6692,10 +6491,10 @@ kg_logger.info("KGRetriever (KuzuDB) logger initialized/reconfirmed.")
 class KGRetriever:
     KUZU_DB_PATH_ENV = os.getenv("KUZU_DB_PATH", "/home/zhz/zhz_agent/zhz_rag/stored_data/kuzu_default_db")
 
-    def __init__(self, db_path: Optional[str] = None, embedder: Optional[SentenceTransformer] = None):
+    def __init__(self, db_path: Optional[str] = None, embedder: Optional['LocalModelHandler'] = None): # <--- 修改类型提示
         self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
         self._db: Optional[kuzu.Database] = None
-        self._embedder = embedder
+        self._embedder = embedder # 现在 self._embedder 会是 LocalModelHandler 实例
         kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. DB path: {self.db_path}")
         if self._embedder:
             kg_logger.info(f"KGRetriever initialized with embedder: {type(self._embedder)}")
@@ -6863,24 +6662,18 @@ class KGRetriever:
         # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
         if self._embedder:
             try:
-                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}'")
-                query_vector_np = self._embedder.encode(search_text_for_vector, normalize_embeddings=True)
-                query_vector_list = query_vector_np.tolist()
-                
-                # --- 修改：根据研究报告更新 KuzuDB 向量查询 ---
-                # 假设索引名为 'entity_embedding_idx'，建立在 ExtractedEntity 表的 'embedding' (FLOAT[]) 列上
+                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}' using LocalModelHandler.")
+                query_vector_list = self._embedder.embed_query(search_text_for_vector) 
+                if not query_vector_list: # LocalModelHandler.embed_query 在失败时可能返回空列表
+                    raise ValueError(f"Embedding generation failed in KGRetriever for vector search text: '{search_text_for_vector}'")
                 vector_search_query = """
                     CALL QUERY_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', $query_vector, $top_k_param)
                     YIELD node, distance
                     RETURN node.id_prop AS id_prop, node.text AS text, node.label AS label, distance AS _score
                 """
-                vector_params = {"query_vector": query_vector_list, "top_k_param": top_k} 
-                # --- 修改结束 ---
+                vector_params = {"query_vector": query_vector_list, "top_k_param": top_k}
                 
                 kg_logger.info(f"Executing KuzuDB vector search. Table: 'ExtractedEntity', Index: 'entity_embedding_idx', Top K: {top_k}")
-                # kg_logger.debug(f"Vector search query: {vector_search_query.strip()}")
-                # kg_logger.debug(f"Vector search params (vector preview): {{'query_vector': {str(query_vector_list)[:100]}..., 'top_k_param': {top_k}}}")
-
                 vector_results = self._execute_cypher_query_sync(vector_search_query, vector_params)
                 
                 if vector_results:
@@ -7002,7 +6795,7 @@ from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 import chromadb
 import logging
-
+from .embedding_functions import LlamaCppEmbeddingFunction
 
 # 配置ChromaDBRetriever的日志记录器
 logger = logging.getLogger(__name__)
@@ -7011,9 +6804,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 class ChromaDBRetriever:
     def __init__(
         self,
-        collection_name: str = "rag_documents",
-        persist_directory: str = "/home/zhz/dagster_home/chroma_data",
-        embedding_model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5",
+        collection_name: str, # 改为必需参数
+        persist_directory: str, # 改为必需参数
+        embedding_function: LlamaCppEmbeddingFunction # <--- 新增参数
     ):
         """
         初始化ChromaDBRetriever。
@@ -7021,41 +6814,37 @@ class ChromaDBRetriever:
         Args:
             collection_name (str): 要查询的ChromaDB集合名称。
             persist_directory (str): ChromaDB数据持久化的目录。
-            embedding_model_name_or_path (str): 用于查询向量化的SentenceTransformer模型名称或路径。
-            device (str): 模型运行的设备 (例如 "cpu", "cuda")。
+            embedding_function (LlamaCppEmbeddingFunction): 用于生成嵌入的函数实例。
         """
         self.collection_name = collection_name
         self.persist_directory = persist_directory
-        self.embedding_model_name_or_path = embedding_model_name_or_path
+        self._embedding_function = embedding_function # <--- 使用新参数
         self._client: Optional[chromadb.Client] = None
         self._collection: Optional[chromadb.Collection] = None
-        self._embedding_model: Optional[SentenceTransformer] = None
 
         self._initialize_retriever()
 
     def _initialize_retriever(self):
         """
-        初始化ChromaDB客户端、集合和嵌入模型。
+        初始化ChromaDB客户端和集合。嵌入模型由传入的 embedding_function 处理。
         """
         try:
             logger.info(f"Initializing ChromaDB client from path: {self.persist_directory}")
             self._client = chromadb.PersistentClient(path=self.persist_directory)
-            logger.info(f"Getting ChromaDB collection: {self.collection_name}")
-            self._collection = self._client.get_collection(name=self.collection_name)
+            
+            logger.info(f"Getting or creating ChromaDB collection: {self.collection_name} using provided embedding function.")
+            self._collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                embedding_function=self._embedding_function # <--- 传递嵌入函数
+
+            )
+
             if self._collection.count() == 0:
                 logger.warning(f"ChromaDB collection '{self.collection_name}' is empty!")
             else:
                 logger.info(f"ChromaDB collection '{self.collection_name}' loaded. Item count: {self._collection.count()}")
         except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB client or collection: {e}")
-            raise
-
-        try:
-            logger.info(f"Loading SentenceTransformer model: {self.embedding_model_name_or_path}")
-            self._embedding_model = SentenceTransformer(self.embedding_model_name_or_path)
-            logger.info("SentenceTransformer model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load SentenceTransformer model: {e}")
+            logger.error(f"Failed to initialize ChromaDB client or collection: {e}", exc_info=True)
             raise
             
     def retrieve(self, query_text: str, n_results: int = 5, include_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -7078,27 +6867,25 @@ class ChromaDBRetriever:
                                    'distance' (相似度距离，越小越相似)
                                    具体结构取决于ChromaDB的返回和我们的处理。
         """
-        if self._collection is None or self._embedding_model is None:
-            logger.error("Retriever is not properly initialized.")
+        if self._collection is None or self._embedding_function is None:
+            logger.error("Retriever is not properly initialized (collection or embedding_function is None).")
             # 尝试重新初始化，或者直接返回错误/空列表
             try:
                 self._initialize_retriever()
-                if self._collection is None or self._embedding_model is None: # 再次检查
+                if self._collection is None or self._embedding_function is None: # 再次检查
                     return []
-            except Exception as e:
-                logger.error(f"Failed to re-initialize retriever during retrieve call: {e}")
+            except Exception as e_reinit:
+                logger.error(f"Failed to re-initialize retriever during retrieve call: {e_reinit}")
                 return []
 
         logger.info(f"Retrieving documents for query: '{query_text[:100]}...' with n_results={n_results}")
         
         try:
-            # 1. 将查询文本向量化并归一化
-            query_embedding_np = self._embedding_model.encode(
-                query_text, 
-                convert_to_tensor=False, 
-                normalize_embeddings=True # <--- 关键：归一化查询嵌入
-            )
-            query_embedding = query_embedding_np.tolist()
+            # 1. 将查询文本向量化 (现在通过 LlamaCppEmbeddingFunction)
+            query_embedding = self._embedding_function.embed_query(query_text) # <--- 修改
+            if not query_embedding: # 如果嵌入失败返回空列表
+                logger.error(f"Failed to generate embedding for query: {query_text[:100]}")
+                return []
             
             # 2. 在ChromaDB中查询 (include_fields_query 的逻辑不变)
             if include_fields is None:
@@ -7188,6 +6975,138 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"An error occurred during the test: {e}")
 
+    --- END OF FILE CONTENT ---
+
+  File: embedding_functions.py
+    --- START OF FILE CONTENT ---
+# 文件: zhz_rag/core_rag/retrievers/embedding_functions.py
+import logging
+from typing import List, TYPE_CHECKING, Optional, Sequence
+import numpy as np # <--- 确保导入 numpy
+
+# ChromaDB 的 EmbeddingFunction 接口通常需要 __call__ 方法
+from chromadb import Documents, Embeddings # 确保导入这些类型
+
+if TYPE_CHECKING:
+    from zhz_rag.llm.local_model_handler import LocalModelHandler # 避免循环导入
+
+logger = logging.getLogger(__name__) # 使用模块级 logger
+
+def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
+    """对一批嵌入向量进行L2归一化。"""
+    if not embeddings or not isinstance(embeddings, list):
+        return []
+    
+    normalized_embeddings = []
+    for emb_list in embeddings:
+        if not emb_list or not isinstance(emb_list, list): 
+            normalized_embeddings.append([])
+            continue
+        try:
+            emb_array = np.array(emb_list, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm == 0: 
+                # 对于全零向量，归一化后仍然是全零向量，或者根据需求处理
+                # logger.debug("Encountered zero-vector during L2 normalization.")
+                normalized_embeddings.append(emb_list) # 返回原始（全零）向量
+            else:
+                normalized_embeddings.append((emb_array / norm).tolist())
+        except Exception as e_norm:
+            logger.error(f"Error during L2 normalization of an embedding: {e_norm}", exc_info=True)
+            normalized_embeddings.append(emb_list) # 出错则返回原始嵌入
+    return normalized_embeddings
+
+class LlamaCppEmbeddingFunction:
+    """
+    一个自定义的 ChromaDB 嵌入函数，使用 LocalModelHandler (llama.cpp) 生成嵌入。
+    """
+    def __init__(self, model_handler: 'LocalModelHandler'):
+        if model_handler is None or model_handler.embedding_model is None:
+            logger.error("LlamaCppEmbeddingFunction initialized with no model_handler or no embedding model in handler.")
+            raise ValueError("LocalModelHandler with a loaded embedding model is required.")
+        self.model_handler = model_handler
+        self._dimension: Optional[int] = None # 用于缓存维度
+        logger.info("LlamaCppEmbeddingFunction initialized.")
+
+    def __call__(self, texts: Documents) -> Embeddings:
+        """
+        ChromaDB 调用此方法来获取文本的嵌入。
+        
+        Args:
+            texts: 一个字符串列表 (ChromaDB 的 Documents 类型)。
+        
+        Returns:
+            一个嵌入列表，其中每个嵌入是浮点数列表 (ChromaDB 的 Embeddings 类型)。
+        """
+        if not isinstance(texts, list):
+            logger.error(f"LlamaCppEmbeddingFunction received texts of type {type(texts)}, expected List[str].")
+            # 尝试处理非列表输入，但这不是ChromaDB的典型用法
+            if isinstance(texts, str):
+                processed_texts_for_handler = [texts + "<|endoftext|>" if texts and not texts.endswith("<|endoftext|>") else texts]
+            else:
+                try: # 尝试迭代，如果不行就返回对应数量的空嵌入
+                    num_texts = len(texts)
+                    return [[] for _ in range(num_texts)]
+                except TypeError:
+                    return [[]] 
+        elif not texts:
+            return [] # 如果输入列表为空，返回空嵌入列表
+        else:
+            # 为每个文本添加 <|endoftext|>
+            processed_texts_for_handler: List[str] = []
+            for text_item in texts:
+                if isinstance(text_item, str):
+                    if text_item and not text_item.endswith("<|endoftext|>"):
+                        processed_texts_for_handler.append(text_item + "<|endoftext|>")
+                    else:
+                        processed_texts_for_handler.append(text_item) # 如果已存在或为空字符串，则直接添加
+                else:
+                    logger.warning(f"LlamaCppEmbeddingFunction received non-string item in texts list: {type(text_item)}. Converting to string and adding <|endoftext|>.")
+                    str_item = str(text_item)
+                    processed_texts_for_handler.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
+        
+        logger.info(f"LlamaCppEmbeddingFunction: Generating embeddings for {len(processed_texts_for_handler)} processed texts.")
+        if processed_texts_for_handler:
+            logger.debug(f"LlamaCppEmbeddingFunction: First processed text for embedding: '{processed_texts_for_handler[0][:150]}...'")
+
+        try:
+            raw_embeddings_list = self.model_handler.embed_documents(processed_texts_for_handler)
+            
+            # L2 归一化
+            if raw_embeddings_list:
+                logger.debug("LlamaCppEmbeddingFunction: Normalizing embeddings (L2).")
+                embeddings_list = l2_normalize_embeddings(raw_embeddings_list)
+            else:
+                embeddings_list = []
+            
+            # 验证嵌入的维度是否一致
+            if embeddings_list and self._dimension is None and embeddings_list[0]: # 确保第一个嵌入不是空列表
+                self._dimension = len(embeddings_list[0])
+                logger.debug(f"LlamaCppEmbeddingFunction: Cached embedding dimension: {self._dimension}")
+            elif embeddings_list and embeddings_list[0] and len(embeddings_list[0]) != self._dimension: # 也检查第一个嵌入非空
+                logger.warning(f"LlamaCppEmbeddingFunction: Inconsistent embedding dimension detected! "
+                               f"Expected {self._dimension}, got {len(embeddings_list[0])}.")
+            
+            return embeddings_list
+        except Exception as e:
+            logger.error(f"LlamaCppEmbeddingFunction: Error during embedding generation: {e}", exc_info=True)
+            return [[] for _ in texts] # 在出错时，为每个输入文本返回一个空列表
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        return self.__call__(list(texts))
+
+    def embed_query(self, text: str) -> List[float]:
+        if not text:
+            return []
+        embeddings_list = self.__call__([text])
+        return embeddings_list[0] if embeddings_list and embeddings_list[0] else []
+
+    def get_dimension(self) -> Optional[int]:
+        if self._dimension is None:
+            self._dimension = self.model_handler.get_embedding_dimension()
+            if self._dimension:
+                logger.debug(f"LlamaCppEmbeddingFunction: Fetched dimension from model_handler: {self._dimension}")
+        return self._dimension
     --- END OF FILE CONTENT ---
 
   File: file_bm25_retriever.py
@@ -8485,6 +8404,220 @@ async def extract_entities_for_kg_query(user_question: str) -> Optional[Extracte
         return None
     --- END OF FILE CONTENT ---
 
+  File: local_model_handler.py
+    --- START OF FILE CONTENT ---
+# 文件: zhz_rag/llm/local_model_handler.py
+import os
+import logging
+from typing import List, Optional, Dict
+from llama_cpp import Llama
+import asyncio
+import numpy as np
+
+
+logger = logging.getLogger(__name__) # 使用模块级logger
+# 建议在调用此模块的顶层配置日志，例如在 rag_api_service.py
+
+def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
+    if not embeddings or not isinstance(embeddings, list):
+        return []
+    normalized_embeddings = []
+    for emb_list in embeddings:
+        if not emb_list or not isinstance(emb_list, list):
+            normalized_embeddings.append([])
+            continue
+        try:
+            emb_array = np.array(emb_list, dtype=np.float32)
+            norm = np.linalg.norm(emb_array)
+            if norm == 0:
+                normalized_embeddings.append(emb_list)
+            else:
+                normalized_embeddings.append((emb_array / norm).tolist())
+        except Exception as e_norm:
+            logger.error(f"Error during L2 normalization of an embedding in LocalModelHandler: {e_norm}", exc_info=True)
+            normalized_embeddings.append(emb_list)
+    return normalized_embeddings
+
+
+class LocalModelHandler:
+    def __init__(
+        self,
+        llm_model_path: Optional[str] = None, # 用于文本生成的LLM模型路径
+        embedding_model_path: Optional[str] = None, # 用于文本嵌入的GGUF模型路径
+        n_ctx_llm: int = 4096,
+        n_gpu_layers_llm: int = 0, # 默认为0，表示CPU
+        n_ctx_embed: int = 2048, # 嵌入模型的上下文窗口
+        n_gpu_layers_embed: int = 0 # 默认为0，表示CPU
+    ):
+        self.llm_model: Optional[Llama] = None
+        self.embedding_model: Optional[Llama] = None
+        self.embedding_model_dimension: Optional[int] = None # 用于存储嵌入维度
+
+        if llm_model_path:
+            try:
+                logger.info(f"LocalModelHandler: Loading LLM model from: {llm_model_path}")
+                self.llm_model = Llama(
+                    model_path=llm_model_path,
+                    n_ctx=n_ctx_llm,
+                    n_gpu_layers=n_gpu_layers_llm,
+                    verbose=False 
+                )
+                logger.info("LocalModelHandler: LLM model loaded successfully.")
+            except Exception as e:
+                logger.error(f"LocalModelHandler: Failed to load LLM model from {llm_model_path}: {e}", exc_info=True)
+
+        if embedding_model_path:
+            try:
+                logger.info(f"LocalModelHandler: Loading embedding model from: {embedding_model_path}")
+                self.embedding_model = Llama(
+                    model_path=embedding_model_path,
+                    n_ctx=n_ctx_embed,
+                    n_gpu_layers=n_gpu_layers_embed,
+                    embedding=True, # <--- 关键: 必须设置为 True for GGUF embedding models
+                    verbose=False
+                )
+                logger.info("LocalModelHandler: Embedding model loaded successfully.")
+                # 尝试获取嵌入维度
+                try:
+                    test_emb = self.embedding_model.embed("test")
+                    self.embedding_model_dimension = len(test_emb)
+                    logger.info(f"LocalModelHandler: Determined embedding dimension: {self.embedding_model_dimension}")
+                except Exception as e_dim:
+                    logger.warning(f"LocalModelHandler: Could not automatically determine embedding dimension: {e_dim}. It might need to be set manually or checked later.")
+                    # Qwen3-Embedding-0.6B 的维度是 1024，可以作为后备
+                    # self.embedding_model_dimension = 1024 
+                    # logger.info(f"LocalModelHandler: Assuming embedding dimension 1024 for Qwen3-Embedding-0.6B.")
+
+
+            except Exception as e:
+                logger.error(f"LocalModelHandler: Failed to load embedding model from {embedding_model_path}: {e}", exc_info=True)
+        
+        if not self.llm_model and not self.embedding_model:
+            logger.warning("LocalModelHandler initialized without any models loaded.")
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not self.embedding_model:
+            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed documents.")
+            return [[] for _ in texts] 
+
+        if not texts:
+            return []
+        
+        # --- 添加 <|endoftext|> ---
+        processed_texts: List[str] = []
+        for text_item in texts:
+            if isinstance(text_item, str):
+                if text_item and not text_item.endswith("<|endoftext|>"):
+                    processed_texts.append(text_item + "<|endoftext|>")
+                else:
+                    processed_texts.append(text_item)
+            else:
+                logger.warning(f"LocalModelHandler received non-string item in texts list for embedding: {type(text_item)}.")
+                str_item = str(text_item)
+                processed_texts.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
+        
+        logger.info(f"LocalModelHandler: Embedding {len(processed_texts)} documents...")
+        try:
+            raw_embeddings_np_list = self.embedding_model.embed(processed_texts)
+            raw_embeddings_list = [embedding.tolist() for embedding in raw_embeddings_np_list]
+            
+            # --- L2 归一化 ---
+            normalized_embeddings_list = l2_normalize_embeddings(raw_embeddings_list)
+            
+            logger.info(f"LocalModelHandler: Successfully embedded and normalized {len(processed_texts)} documents.")
+            return normalized_embeddings_list
+        except Exception as e:
+            logger.error(f"LocalModelHandler: Error during document embedding: {e}", exc_info=True)
+            return [[] for _ in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        if not self.embedding_model:
+            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed query.")
+            return []
+
+        if not text: # 处理空查询字符串
+            return []
+
+        # --- 添加 <|endoftext|> ---
+        processed_text = text + "<|endoftext|>" if not text.endswith("<|endoftext|>") else text
+            
+        logger.info(f"LocalModelHandler: Embedding query (first 100 chars): {processed_text[:100]}...")
+        try:
+            raw_embedding_np = self.embedding_model.embed(processed_text)
+            raw_embedding_list = [raw_embedding_np.tolist()] # embed 单个文本返回单个np数组，包装成列表给 l2_normalize_embeddings
+            
+            # --- L2 归一化 ---
+            normalized_embedding_list_of_list = l2_normalize_embeddings(raw_embedding_list)
+            
+            final_embedding = normalized_embedding_list_of_list[0] if normalized_embedding_list_of_list and normalized_embedding_list_of_list[0] else []
+
+            logger.info(f"LocalModelHandler: Successfully embedded and normalized query.")
+            return final_embedding
+        except Exception as e:
+            logger.error(f"LocalModelHandler: Error during query embedding: {e}", exc_info=True)
+            return []
+
+    def get_embedding_dimension(self) -> Optional[int]:
+        """获取嵌入模型的输出维度。"""
+        if self.embedding_model_dimension:
+            return self.embedding_model_dimension
+        
+        # 如果初始化时未能获取，再次尝试
+        if self.embedding_model:
+            try:
+                test_emb = self.embedding_model.embed("dimension_check")
+                self.embedding_model_dimension = len(test_emb)
+                logger.info(f"LocalModelHandler: Determined embedding dimension on demand: {self.embedding_model_dimension}")
+                return self.embedding_model_dimension
+            except Exception as e:
+                logger.warning(f"LocalModelHandler: Could not determine embedding dimension on demand: {e}")
+        return None # 如果还是无法确定
+
+    async def generate_text_with_local_llm(self, messages: List[Dict[str,str]], temperature: float = 0.1, max_tokens: int = 1024, stop: Optional[List[str]]=None) -> Optional[str]:
+        """
+        使用本地加载的LLM模型生成文本。
+        这个方法是异步的，因为它可能在 FastAPI 的异步端点中被调用。
+        但 llama-cpp-python 的调用本身是同步阻塞的，所以我们用 asyncio.to_thread。
+        """
+        if not self.llm_model:
+            logger.error("LocalModelHandler: LLM model is not loaded. Cannot generate text.")
+            return None
+        
+        logger.info(f"LocalModelHandler: Generating text with local LLM. Message count: {len(messages)}")
+        
+        # llama-cpp-python 的调用是同步的，如果在异步函数中直接调用会阻塞事件循环
+        # 所以我们使用 asyncio.to_thread 将其包装起来在单独的线程中运行
+        def _blocking_llm_call():
+            try:
+                completion_params = {
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                if stop:
+                    completion_params["stop"] = stop
+                
+                response = self.llm_model.create_chat_completion(**completion_params) # type: ignore
+                
+                if response and response.get("choices") and response["choices"][0].get("message"):
+                    content = response["choices"][0]["message"].get("content")
+                    logger.info(f"LocalModelHandler: LLM generation successful (sync part). Output (first 100 chars): {str(content)[:100]}...")
+                    return content
+                else:
+                    logger.warning(f"LocalModelHandler: LLM generation did not return expected content (sync part). Response: {response}")
+                    return None
+            except Exception as e_sync:
+                logger.error(f"LocalModelHandler: Error during synchronous LLM call: {e_sync}", exc_info=True)
+                return None # 或者抛出异常由上层捕获
+
+        try:
+            generated_content = await asyncio.to_thread(_blocking_llm_call)
+            return generated_content
+        except Exception as e_async: # 捕获 to_thread 可能抛出的其他错误
+            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for LLM call: {e_async}", exc_info=True)
+            return None
+    --- END OF FILE CONTENT ---
+
   File: rag_prompts.py
     --- START OF FILE CONTENT ---
 # /home/zhz/zhz_rag/llm/rag_prompts.py
@@ -9745,6 +9878,7 @@ Directory: zhz_rag/stored_data/rag_interaction_logs/
   File (skipped, extension not included): rag_interactions_20250606.jsonl
   File (skipped, extension not included): rag_interactions_20250607.jsonl
   File (skipped, extension not included): rag_interactions_20250608.jsonl
+  File (skipped, extension not included): rag_interactions_20250609.jsonl
 
 Directory: zhz_rag/stored_data/evaluation_results_logs/
 
@@ -9760,12 +9894,6 @@ Directory: zhz_rag/stored_data/kuzu_default_db/
 
 Directory: zhz_rag/stored_data/chromadb_index/
   File (skipped, extension not included): chroma.sqlite3
-
-Directory: zhz_rag/stored_data/chromadb_index/fc39f817-3d12-4574-a52b-5bdfe2d8f24b/
-  File (skipped, extension not included): data_level0.bin
-  File (skipped, extension not included): header.bin
-  File (skipped, extension not included): length.bin
-  File (skipped, extension not included): link_lists.bin
 
 Directory: zhz_rag/stored_data/kuzu_test_visibility_db/
   File (skipped, extension not included): .lock
@@ -9800,7 +9928,7 @@ Directory: zhz_rag/stored_data/bm25_index/
 
   File: vocab.index.json
     --- START OF FILE CONTENT ---
-{"三":0,"的":1,"分配":2,"文档":3,"工作":4,"第二个":5,"自然":6,"语言":7,"自然语言":8,"谷歌":9,"了":10,"技术":11,"任务":12,"。":13,"第二":14,"处理":15,"编写":16,"给":17,"张":18,"Alpha":19,"张三在":20,"项目":21,"二个":22,"讨论":23,"任务分配":24,"":25}
+{"处理":0,"给":1,"第二个":2,"张三在":3,"张":4,"分配":5,"二个":6,"任务":7,"技术":8,"自然语言":9,"编写":10,"三":11,"语言":12,"了":13,"。":14,"的":15,"第二":16,"谷歌":17,"Alpha":18,"文档":19,"任务分配":20,"讨论":21,"项目":22,"工作":23,"自然":24,"":25}
     --- END OF FILE CONTENT ---
 
 
@@ -11618,6 +11746,256 @@ async def read_root():
 if __name__ == "__main__":
     print("--- 启动 Main FastAPI 服务器 (包含任务管理API) ---")
     uvicorn.run("zhz_agent.main:app", host="0.0.0.0", port=8000, reload=True) # Ensure correct run command
+    --- END OF FILE CONTENT ---
+
+  File: rag_api_service.py
+    --- START OF FILE CONTENT ---
+# 文件: zhz_rag/api/rag_api_service.py (已修正，完整覆盖)
+
+import os
+import asyncio
+from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional
+import logging
+import sys
+
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+
+# --- 添加开始：明确指定 .env 文件路径 ---
+# 获取 rag_api_service.py 文件所在的目录
+_current_file_dir = os.path.dirname(os.path.abspath(__file__))
+# .env 文件通常在项目根目录，即 zhz_rag 包的上两级目录 (zhz_agent/)
+# zhz_agent/zhz_rag/api/rag_api_service.py
+# zhz_agent/zhz_rag/
+# zhz_agent/  <-- .env 文件在这里
+_project_root_dir = os.path.abspath(os.path.join(_current_file_dir, "..", ".."))
+_dotenv_path = os.path.join(_project_root_dir, ".env")
+
+if os.path.exists(_dotenv_path):
+    load_dotenv(dotenv_path=_dotenv_path)
+    print(f"RagApiService: Successfully loaded .env file from: {_dotenv_path}")
+else:
+    print(f"RagApiService: .env file not found at {_dotenv_path}. Relying on system environment variables or defaults.")
+    # 即使没找到，也执行一次 load_dotenv()，它可能会从其他地方加载或什么都不做
+    load_dotenv()
+
+
+# --- [MODIFIED] Import new handlers and functions ---
+from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
+from zhz_rag.llm.llm_interface import generate_answer_from_context, generate_expanded_queries, NO_ANSWER_PHRASE_ANSWER_CLEAN
+# --- 添加 LocalModelHandler 的导入 ---
+from zhz_rag.llm.local_model_handler import LocalModelHandler
+from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
+from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
+from zhz_rag.core_rag.kg_retriever import KGRetriever
+# --- 添加 LlamaCppEmbeddingFunction 的导入 ---
+from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
+from zhz_rag.core_rag.fusion_engine import FusionEngine
+
+# --- 日志配置 ---
+api_logger = logging.getLogger("RAGApiServiceLogger")
+api_logger.setLevel(logging.INFO)
+if not api_logger.hasHandlers():
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
+    handler.setFormatter(formatter)
+    api_logger.addHandler(handler)
+    api_logger.propagate = False
+
+load_dotenv()
+
+# --- 应用上下文 Dataclass ---
+@dataclass
+class RAGAppContext:
+    model_handler: LocalModelHandler
+    chroma_retriever: ChromaDBRetriever
+    kg_retriever: KGRetriever
+    file_bm25_retriever: FileBM25Retriever
+    fusion_engine: FusionEngine
+
+# --- FastAPI 生命周期管理 ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    api_logger.info("--- RAG API Service: Initializing RAG components with Qwen3 GGUF models ---")
+    
+    # --- 读取环境变量 ---
+    # LLM GGUF 模型路径 (用于 LocalModelHandler 中的 LLM 功能，如果 rag_api_service 也用它生成答案的话)
+    # 注意: 当前 rag_api_service 中的 generate_answer_from_context 等函数是调用外部的 local_llm_service.py
+    # 所以 llm_model_path_for_handler 可能暂时不直接用于答案生成，但 LocalModelHandler 初始化需要它。
+    # 如果您希望 LocalModelHandler 只负责嵌入，可以将 llm_model_path 设置为 None。
+    # 我们先假设您可能希望 LocalModelHandler 也能处理 LLM 任务。
+    llm_gguf_model_path_for_handler = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH") # 您需要在 .env 中定义这个变量
+    if not llm_gguf_model_path_for_handler:
+        api_logger.warning("LOCAL_LLM_GGUF_MODEL_PATH not set in .env. LLM features of LocalModelHandler might be unavailable.")
+
+    embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH") # 这个我们已经更新了
+    chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
+    bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
+    kuzu_db_path = os.getenv("KUZU_DB_PATH")
+
+
+    if not all([embedding_gguf_model_path, chroma_persist_dir, bm25_index_dir, kuzu_db_path]):
+        api_logger.critical("One or more critical paths (embedding, chroma, bm25, kuzu) are not set in environment variables!")
+        # 根据您的需求，这里可以决定是否抛出异常使服务启动失败
+        app.state.rag_context = None # 明确设置 rag_context 为 None
+        yield # 即使部分失败，也需要 yield 以完成生命周期
+        return
+
+    try:
+        # 1. 初始化 LocalModelHandler
+        #    LocalModelHandler 现在负责加载GGUF嵌入模型和可选的GGUF LLM模型
+        api_logger.info(f"Initializing LocalModelHandler with Embedding GGUF: {embedding_gguf_model_path}")
+        if llm_gguf_model_path_for_handler:
+             api_logger.info(f"LocalModelHandler will also attempt to load LLM GGUF: {llm_gguf_model_path_for_handler}")
+        
+        model_handler = LocalModelHandler(
+            llm_model_path=llm_gguf_model_path_for_handler, # 可选，如果只用嵌入则为 None
+            embedding_model_path=embedding_gguf_model_path,
+            # 可以从 .env 读取 n_ctx, n_gpu_layers 等参数，或使用 LocalModelHandler 的默认值
+            n_gpu_layers_embed=int(os.getenv("EMBED_N_GPU_LAYERS", 0)), # 示例
+            n_gpu_layers_llm=int(os.getenv("LLM_N_GPU_LAYERS", 0))   # 示例
+        )
+        if not model_handler.embedding_model:
+            raise RuntimeError("Failed to load GGUF embedding model in LocalModelHandler.")
+
+        # 2. 创建 LlamaCppEmbeddingFunction
+        api_logger.info("Creating LlamaCppEmbeddingFunction...")
+        custom_embed_fn = LlamaCppEmbeddingFunction(model_handler=model_handler)
+
+        # 3. 初始化 ChromaDBRetriever，传入自定义嵌入函数
+        api_logger.info(f"Initializing ChromaDBRetriever with persist_directory: {chroma_persist_dir}")
+        chroma_retriever_instance = ChromaDBRetriever(
+            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"), # 从env或默认
+            persist_directory=chroma_persist_dir,
+            embedding_function=custom_embed_fn # <--- 关键：传入自定义嵌入函数
+        )
+
+        # 4. 初始化 FileBM25Retriever (保持不变)
+        api_logger.info(f"Initializing FileBM25Retriever with index_directory: {bm25_index_dir}")
+        file_bm25_retriever_instance = FileBM25Retriever(index_directory_path=bm25_index_dir)
+
+        # 5. 初始化 KGRetriever
+        #    KGRetriever 的 __init__ 需要一个 embedder 参数用于其内部的向量搜索。
+        #    我们可以直接将 model_handler 传递给它，KGRetriever 内部应调用 model_handler.embed_query()
+        api_logger.info(f"Initializing KGRetriever with db_path: {kuzu_db_path}")
+        kg_retriever_instance = KGRetriever(
+            db_path=kuzu_db_path,
+            embedder=model_handler # <--- 将 model_handler 作为 embedder 传递
+        )
+
+        # 6. 初始化 FusionEngine (它内部会从env读取RERANKER_MODEL_PATH)
+        api_logger.info("Initializing FusionEngine...")
+        fusion_engine_instance = FusionEngine(logger=api_logger)
+
+        app.state.rag_context = RAGAppContext(
+            model_handler=model_handler,
+            chroma_retriever=chroma_retriever_instance,
+            kg_retriever=kg_retriever_instance,
+            file_bm25_retriever=file_bm25_retriever_instance,
+            fusion_engine=fusion_engine_instance
+        )
+        api_logger.info("--- RAG components initialized successfully using Qwen3 GGUF models. Service is ready. ---")
+    except Exception as e:
+        api_logger.critical(f"FATAL: Failed to initialize RAG components during startup: {e}", exc_info=True)
+        app.state.rag_context = None # 确保出错时 rag_context 为 None
+    
+    yield
+    
+    api_logger.info("--- RAG API Service: Cleaning up resources ---")
+    rag_context_to_clean: Optional[RAGAppContext] = getattr(app.state, 'rag_context', None)
+    if rag_context_to_clean and rag_context_to_clean.kg_retriever:
+        rag_context_to_clean.kg_retriever.close() # KGRetriever 有 close 方法
+    # LocalModelHandler 中的 Llama 对象会在其被垃圾回收时自动释放资源
+    api_logger.info("--- Cleanup complete. ---")
+
+# --- FastAPI 应用实例 ---
+app = FastAPI(
+    title="Upgraded Standalone RAG API Service",
+    description="Provides API access to the RAG framework, now powered by Qwen3 models.",
+    version="2.0.0", # Major version upgrade!
+    lifespan=lifespan
+)
+
+# --- API 端点 ---
+@app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
+async def query_rag_endpoint(request: Request, query_request: QueryRequest):
+    api_logger.info(f"\n--- Received RAG query: '{query_request.query}' ---")
+    
+    app_ctx: RAGAppContext = request.app.state.rag_context
+    if not app_ctx:
+        raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
+
+    try:
+        # Note: generate_expanded_queries and generate_answer_from_context
+        # still use the external local_llm_service. We can refactor them later
+        # to use app_ctx.model_handler if we want to merge everything. For now, it's fine.
+        expanded_queries = await generate_expanded_queries(query_request.query)
+        
+        retrieval_tasks = []
+        for q_text in expanded_queries:
+            retrieval_tasks.append(app_ctx.chroma_retriever.retrieve_async(q_text, query_request.top_k_vector))
+            retrieval_tasks.append(asyncio.to_thread(app_ctx.file_bm25_retriever.retrieve, q_text, query_request.top_k_bm25))
+            retrieval_tasks.append(app_ctx.kg_retriever.retrieve(q_text, query_request.top_k_kg))
+        
+        results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
+
+        all_retrieved_docs: List[RetrievedDocument] = []
+        bm25_results_to_enrich: List[Dict[str, Any]] = []
+
+        for result_group in results_from_gather:
+            if isinstance(result_group, Exception):
+                api_logger.error(f"An error occurred in a retrieval task: {result_group}", exc_info=True)
+                continue
+            if not result_group or not isinstance(result_group, list): 
+                continue
+
+            for item in result_group:
+                if isinstance(item, RetrievedDocument):
+                    all_retrieved_docs.append(item)
+                elif isinstance(item, dict) and 'id' in item and 'score' in item:
+                    bm25_results_to_enrich.append(item)
+        
+        if bm25_results_to_enrich:
+            # [FIXED] Corrected the typo from bm2s to bm25
+            bm25_ids = list(set([res['id'] for res in bm25_results_to_enrich]))
+            if bm25_ids:
+                texts_map = app_ctx.chroma_retriever.get_texts_by_ids(bm25_ids)
+                for res in bm25_results_to_enrich:
+                    chunk_id = res['id']
+                    content_text = texts_map.get(chunk_id, f"[Content for chunk_id {chunk_id} not found]")
+                    all_retrieved_docs.append(RetrievedDocument(
+                        source_type="keyword_bm25s",
+                        content=content_text,
+                        score=res.get('score'),
+                        metadata={"chunk_id": chunk_id}
+                    ))
+        
+        if not all_retrieved_docs:
+             return HybridRAGResponse(answer=NO_ANSWER_PHRASE_ANSWER_CLEAN, original_query=query_request.query, retrieved_sources=[])
+
+        final_context_docs = await app_ctx.fusion_engine.fuse_results(all_retrieved_docs, query_request.query, query_request.top_k_final)
+        
+        if not final_context_docs:
+            final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+        else:
+            context_strings = [f"Source: {doc.source_type}, Score: {doc.rerank_score or doc.score or 0:.4f}\nContent: {doc.content}" for doc in final_context_docs]
+            fused_context = "\n\n---\n\n".join(context_strings)
+            final_answer = await generate_answer_from_context(query_request.query, fused_context) or NO_ANSWER_PHRASE_ANSWER_CLEAN
+
+        return HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs)
+
+    except Exception as e:
+        api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+# --- Main execution block ---
+if __name__ == "__main__":
+    api_logger.info("Starting Standalone RAG API Service...")
+    uvicorn.run(app, host="0.0.0.0", port=8081)
     --- END OF FILE CONTENT ---
 
   File: rag_mcp_service.py
@@ -13642,7 +14020,6 @@ if __name__ == "__main__":
     uvicorn.run("local_agent_app:app", host="0.0.0.0", port=LOCAL_AGENT_PORT, reload=True)
     --- END OF FILE CONTENT ---
 
-  File (skipped, extension not included): local_agent_app.py:Zone.Identifier
 
 Directory: core/
   File: __init__.py
