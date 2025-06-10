@@ -283,49 +283,75 @@ def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: Kuzu
     name="kuzu_nodes",
     description="Loads all unique extracted entities as nodes into KuzuDB.",
     group_name="kg_building",
-    deps=["kuzu_schema", "kg_extractions"]
+    deps=["kuzu_schema", "kg_extractions"] # kuzu_schema 依赖 kg_extractions 是为了保证表存在
 )
 def kuzu_nodes_asset(
     context: dg.AssetExecutionContext, 
     kg_extractions: List[KGTripleSetOutput], 
     kuzu_readwrite_db: KuzuDBReadWriteResource, 
-    embedder: GGUFEmbeddingResource # <--- 修改
+    embedder: GGUFEmbeddingResource 
 ):
-    context.log.info("--- Starting KuzuDB Node Loading Asset ---")
+    context.log.info("--- Starting KuzuDB Node Loading Asset (Using MERGE) ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping node loading.")
         return
-    unique_nodes = {}
+
+    unique_nodes_data_for_merge: List[Dict[str, Any]] = []
+    unique_nodes_keys = set()
+
     for kg_set in kg_extractions:
         for entity in kg_set.extracted_entities:
-            node_key = (normalize_text_for_id(entity.text), entity.label.upper())
-            if node_key not in unique_nodes:
-                node_text_to_embed = node_key[0]
-                embedding_vector_list = embedder.encode([node_text_to_embed]) 
+            normalized_text = normalize_text_for_id(entity.text)
+            normalized_label = entity.label.upper()
+            node_unique_key = (normalized_text, normalized_label)
+
+            if node_unique_key not in unique_nodes_keys:
+                unique_nodes_keys.add(node_unique_key)
+                
+                embedding_vector_list = embedder.encode([normalized_text]) 
                 final_embedding_for_kuzu: List[float]
-                if embedding_vector_list and embedding_vector_list[0] and len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
+
+                if embedding_vector_list and embedding_vector_list[0] and \
+                   isinstance(embedding_vector_list[0], list) and \
+                   len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
                     final_embedding_for_kuzu = embedding_vector_list[0]
                 else:
-                    context.log.warning(f"Failed to generate valid embedding for node: {node_key[0]}. Using zero vector.")
+                    context.log.warning(f"Failed to generate valid embedding for node: {normalized_text} ({normalized_label}). Using zero vector. Embedding result: {embedding_vector_list}")
                     final_embedding_for_kuzu = [0.0] * embedder.get_embedding_dimension() 
                     
-                unique_nodes[node_key] = {
-                    "id_prop": hashlib.md5(f"{node_key[0]}_{node_key[1]}".encode('utf-8')).hexdigest(),
-                    "text": node_key[0],
-                    "label": node_key[1],
+                unique_nodes_data_for_merge.append({
+                    "id_prop": hashlib.md5(f"{normalized_text}_{normalized_label}".encode('utf-8')).hexdigest(),
+                    "text": normalized_text,
+                    "label": normalized_label,
                     "embedding": final_embedding_for_kuzu 
-                }
+                })
 
-    node_data = list(unique_nodes.values())
-    if not node_data:
+    if not unique_nodes_data_for_merge:
         context.log.warning("No unique nodes found in extractions to load.")
         return
+
+    nodes_merged_count = 0
+    nodes_created_count = 0
     with kuzu_readwrite_db.get_connection() as conn:
-        nodes_df = pd.DataFrame(node_data)
-        context.log.info(f"Copying {len(nodes_df)} unique nodes into ExtractedEntity table...")
-        conn.execute("COPY ExtractedEntity FROM nodes_df;")
+        context.log.info(f"Attempting to MERGE {len(unique_nodes_data_for_merge)} unique nodes into ExtractedEntity table...")
+        for node_data_dict in unique_nodes_data_for_merge:
+
+            merge_query = """
+            MERGE (e:ExtractedEntity {id_prop: $id_prop})
+            ON CREATE SET e.text = $text, e.label = $label, e.embedding = $embedding
+            ON MATCH SET e.text = $text, e.label = $label, e.embedding = $embedding
+            """
+
+            try:
+                conn.execute(merge_query, node_data_dict)
+                nodes_merged_count +=1 
+            except Exception as e_merge:
+                context.log.error(f"Error MERGING node with id_prop {node_data_dict.get('id_prop')}: {e_merge}", exc_info=True)
+        
+        context.log.info(f"Successfully MERGED/processed {nodes_merged_count} nodes.")
+        # --- 修改结束 ---
         conn.execute("CHECKPOINT;")
-        context.log.info("Successfully copied nodes and checkpointed.")
+        context.log.info("Node processing and CHECKPOINT complete.")
 
 @dg.asset(
     name="kuzu_relations",
@@ -373,42 +399,60 @@ def kuzu_relations_asset(context: dg.AssetExecutionContext, kg_extractions: List
 
 @dg.asset(
     name="kuzu_vector_index",
-    description="Creates the vector index on the ExtractedEntity table.",
+    description="Creates the vector index on the ExtractedEntity table.", # 保持原始描述
     group_name="kg_building",
-    deps=["kuzu_relations"]
+    deps=["kuzu_relations"] 
 )
 def kuzu_vector_index_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource):
     context.log.info("--- Starting KuzuDB Vector Index Creation Asset ---")
+    index_name_to_create = "entity_embedding_idx"
+    table_to_index = "ExtractedEntity"
+    property_to_index = "embedding"
+
     with kuzu_readwrite_db.get_connection() as conn:
         try:
-            conn.execute("LOAD VECTOR;") # 确保 VECTOR 扩展已加载
+            conn.execute("LOAD VECTOR;") 
             context.log.info("VECTOR extension loaded for index creation.")
         except Exception as e_load_vec:
             context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded or Kuzu version handles it differently): {e_load_vec}")
         
-        index_creation_query = "CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')"
+        # 直接尝试创建索引，不预先检查。
+        # 如果我们之前的假设是正确的（即Dagster每次运行时KuzuDBReadWriteResource会清理并重建数据库），
+        # 那么这里不应该出现 "already exists" 的错误。
+        # 如果我们保留了不清空数据库的KuzuDBReadWriteResource，并且此资产重复运行，则此处可能会失败。
+        # 我们当前的目标是验证一次完整、干净的创建流程。
+        
+        index_creation_query = f"CALL CREATE_VECTOR_INDEX('{table_to_index}', '{index_name_to_create}', '{property_to_index}', metric := 'cosine')"
         context.log.info(f"Executing vector index creation command: {index_creation_query}")
         try:
-            conn.execute(index_creation_query) # index_creation_query 应该是之前定义的
+            conn.execute(index_creation_query)
             context.log.info("Vector index creation command successfully executed.")
 
             context.log.info("Verifying created indexes...")
-            show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;") # <--- 修改为不带参数的调用
+            show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;")
             
-            indexes_df = show_indexes_result.get_as_df()
-            context.log.info(f"All indexes in the database:\n{indexes_df.to_string()}") # 打印所有索引以供调试
+            indexes_df = pd.DataFrame(show_indexes_result.get_as_df())
+            context.log.info(f"All indexes in the database:\n{indexes_df.to_string()}") 
 
             # 筛选出针对 ExtractedEntity 表的索引
-            entity_indexes_df = indexes_df[indexes_df['table name'] == 'ExtractedEntity'] # <--- 使用带空格的列名
-            context.log.info(f"Current indexes on ExtractedEntity:\n{entity_indexes_df.to_string()}")
-            
-            if 'entity_embedding_idx' in entity_indexes_df['index name'].tolist(): # <--- 使用带空格的列名
-                context.log.info("SUCCESS: Vector index 'entity_embedding_idx' confirmed to exist on ExtractedEntity.")
+            # 使用 show_indexes_result.get_as_df() 返回的实际列名进行筛选
+            # 通常列名是 'table name' 和 'index name'
+            if not indexes_df.empty and 'table name' in indexes_df.columns and 'index name' in indexes_df.columns:
+                entity_indexes_df = indexes_df[indexes_df['table name'] == table_to_index]
+                context.log.info(f"Current indexes on {table_to_index}:\n{entity_indexes_df.to_string()}")
+                
+                if index_name_to_create in entity_indexes_df['index name'].tolist():
+                    context.log.info(f"SUCCESS: Vector index '{index_name_to_create}' confirmed to exist on {table_to_index}.")
+                else:
+                    context.log.error(f"FAILURE: Vector index '{index_name_to_create}' NOT FOUND on {table_to_index} after creation attempt.")
+            elif indexes_df.empty:
+                context.log.error(f"FAILURE: No indexes found in the database after creation attempt.")
             else:
-                context.log.error("FAILURE: Vector index 'entity_embedding_idx' NOT FOUND on ExtractedEntity after creation attempt.")
+                context.log.error(f"FAILURE: Could not verify index. 'table name' or 'index name' column missing in SHOW_INDEXES output. Columns: {indexes_df.columns.tolist()}")
+
         except Exception as e_create_index:
             context.log.error(f"Error during vector index creation or verification: {e_create_index}", exc_info=True)
-            raise
+            raise # 将异常抛出，以便 Dagster 捕获并标记资产失败
 
 # --- 更新 all_processing_assets 列表 ---
 all_processing_assets = [
@@ -418,7 +462,7 @@ all_processing_assets = [
     keyword_index_asset,
     kg_extraction_asset,
     kuzu_schema_asset,
-    kuzu_nodes_asset,
+    kuzu_nodes_asset, # 应为使用 MERGE 的版本
     kuzu_relations_asset,
-    kuzu_vector_index_asset,
+    kuzu_vector_index_asset, # 当前修改的这个
 ]

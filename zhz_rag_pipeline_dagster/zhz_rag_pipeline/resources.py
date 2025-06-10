@@ -320,36 +320,84 @@ class GeminiAPIResource(dg.ConfigurableResource):
 
 class KuzuDBReadWriteResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
-        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
+        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"), # 这是期望相对于 ZHZ_AGENT_PROJECT_ROOT 的路径
         description="Path to the KuzuDB database directory."
     )
 
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
     _resolved_db_path: str = PrivateAttr()
-    _db: Optional[kuzu.Database] = PrivateAttr(default=None) # 这个 db 对象将在整个作业运行期间保持
+    _db: Optional[kuzu.Database] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        """
-        在作业开始时被调用一次。创建并持有 kuzu.Database 对象。
-        """
         self._logger = context.log
-        # 使用 context.instance.storage_directory() 可能更稳健，但我们先用之前的逻辑
-        project_root = os.environ.get("DAGSTER_PROJECT_ROOT", os.getcwd())
-        self._resolved_db_path = os.path.join(project_root, self.db_path_str)
+
+        project_root_from_env = os.getenv("ZHZ_AGENT_PROJECT_ROOT")
+        python_path_env = os.getenv("PYTHONPATH")
+        
+        determined_project_root = None
+
+        if project_root_from_env and os.path.isdir(os.path.join(project_root_from_env, "zhz_rag")):
+            determined_project_root = project_root_from_env
+            self._logger.info(f"KuzuDBReadWriteResource: Using ZHZ_AGENT_PROJECT_ROOT: {determined_project_root}")
+        elif python_path_env:
+            # PYTHONPATH 可能包含多个路径，用 os.pathsep 分隔 (Linux是':', Windows是';')
+            first_python_path = python_path_env.split(os.pathsep)[0]
+            if os.path.isdir(os.path.join(first_python_path, "zhz_rag")):
+                determined_project_root = first_python_path
+                self._logger.info(f"KuzuDBReadWriteResource: Using first path from PYTHONPATH: {determined_project_root}")
+            else: # Fallback if PYTHONPATH doesn't seem right
+                determined_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+                self._logger.warning(f"KuzuDBReadWriteResource: PYTHONPATH ('{python_path_env}') does not seem to point to project root. Falling back to relative path guess: {determined_project_root}")
+        else: # Fallback if no relevant env var
+            determined_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+            self._logger.warning(f"KuzuDBReadWriteResource: Neither ZHZ_AGENT_PROJECT_ROOT nor PYTHONPATH found for project root. Falling back to relative path guess: {determined_project_root}")
+
+        # 确保我们猜的根目录至少包含 zhz_rag 子目录，这是一个基本检查
+        if not os.path.isdir(os.path.join(determined_project_root, "zhz_rag")):
+            self._logger.error(f"KuzuDBReadWriteResource: CRITICAL - Could not reliably determine project root. Path '{determined_project_root}' does not contain 'zhz_rag'. Please set ZHZ_AGENT_PROJECT_ROOT environment variable to '/home/zhz/zhz_agent'.")
+            # 在这种情况下，后续操作很可能会失败，但我们还是构造一个路径以暴露问题
+        
+        project_root_for_dagster = determined_project_root
+        # --- 修改结束 ---
+        
+        self._logger.info(f"KuzuDBReadWriteResource: Determined project_root_for_dagster: {project_root_for_dagster}")
+
+        if os.path.isabs(self.db_path_str):
+            self._resolved_db_path = self.db_path_str
+        else:
+            self._resolved_db_path = os.path.join(project_root_for_dagster, self.db_path_str)
         
         self._logger.info(
-            f"KuzuDBReadWriteResource setup for run: DB path is '{self._resolved_db_path}'."
+            f"KuzuDBReadWriteResource: FINAL Resolved DB path is '{os.path.abspath(self._resolved_db_path)}'."
         )
-        
-        # 在每次作业运行开始时，清理旧数据库，确保从干净状态开始
+
+        # --- 确保每次都清理并重建数据库目录 ---
         if os.path.exists(self._resolved_db_path):
             shutil.rmtree(self._resolved_db_path)
             self._logger.info(f"Cleaned up existing database directory: {self._resolved_db_path}")
+        os.makedirs(self._resolved_db_path, exist_ok=True)
+        self._logger.info(f"KuzuDBReadWriteResource: Recreated database directory: {self._resolved_db_path}")
+        # --- 清理逻辑结束 ---
+
+        # --- 添加开始：准备本地扩展 ---
+        manual_extension_source_path = os.getenv("KUZU_VECTOR_EXTENSION_PATH", "/home/zhz/.kuzu/extension/0.10.0/linux_amd64/vector/libvector.kuzu_extension") # 从环境变量读取或使用默认
+        
+        extensions_dir_in_db = os.path.join(self._resolved_db_path, "extensions")
+        os.makedirs(extensions_dir_in_db, exist_ok=True)
+        self._logger.info(f"KuzuDBReadWriteResource: Ensured extensions directory exists: {extensions_dir_in_db}")
+
+        if os.path.exists(manual_extension_source_path):
+            target_path_vector = os.path.join(extensions_dir_in_db, "vector.kuzu_extension")
+            try:
+                shutil.copy2(manual_extension_source_path, target_path_vector)
+                self._logger.info(f"KuzuDBReadWriteResource: Copied vector extension to '{target_path_vector}'")
+            except Exception as e_copy:
+                self._logger.error(f"KuzuDBReadWriteResource: ERROR - Could not copy vector extension: {e_copy}")
+        else:
+            self._logger.error(f"KuzuDBReadWriteResource: ERROR - Manual vector extension file not found at '{manual_extension_source_path}'. LOAD VECTOR will likely fail if Kuzu doesn't find it elsewhere.")
+        # --- 添加结束 ---
 
         try:
-            # 确保父目录存在
-            os.makedirs(os.path.dirname(self._resolved_db_path), exist_ok=True)
-            # 创建数据库实例，并将其保存在 self._db 中，供整个作业生命周期使用
             self._db = kuzu.Database(self._resolved_db_path)
             self._logger.info(f"Shared kuzu.Database object CREATED successfully for the entire run.")
         except Exception as e:
@@ -357,36 +405,28 @@ class KuzuDBReadWriteResource(dg.ConfigurableResource):
             raise
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        """
-        在作业结束时被调用一次。销毁 kuzu.Database 对象以释放所有资源。
-        """
         self._logger.info(f"Tearing down KuzuDBReadWriteResource for run...")
         if self._db is not None:
-            # del self._db 是依赖析构函数，为了更明确，我们直接设为 None
-            self._db = None
-            self._logger.info("Shared kuzu.Database object destroyed, releasing file lock.")
+            self._db = None # KuzuDB 对象依赖析构函数来关闭数据库和释放锁
+            self._logger.info("Shared kuzu.Database object dereferenced, relying on destructor to close and release lock.")
+        else:
+            self._logger.info("Shared kuzu.Database object was already None during teardown.")
         self._logger.info("KuzuDBReadWriteResource teardown complete.")
 
     @contextmanager
     def get_connection(self) -> Iterator[kuzu.Connection]:
-        """
-        一个上下文管理器，从【共享的】DB 对象获取一个新连接。
-        这确保了所有资产操作都在同一个数据库实例上。
-        """
         if self._db is None:
             raise ConnectionError("Shared KuzuDB Database object is not initialized. This should not happen if setup_for_execution was successful.")
         
         conn = None
         try:
-            # 从保存在 self._db 中的共享数据库实例创建连接
             conn = kuzu.Connection(self._db)
             self._logger.debug("New kuzu.Connection obtained from shared Database object.")
             yield conn
         finally:
             if conn is not None:
-                # 连接对象在使用后会被垃圾回收，无需显式关闭
                 self._logger.debug("kuzu.Connection from shared DB object is going out of scope.")
-
+                
 class KuzuDBReadOnlyResource(dg.ConfigurableResource):
     db_path_str: str = PydanticField(
         default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),

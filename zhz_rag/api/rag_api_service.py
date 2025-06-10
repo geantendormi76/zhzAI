@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 import logging
 import sys
-
+import shutil # <--- 添加 shutil
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from dataclasses import dataclass
@@ -76,24 +76,45 @@ async def lifespan(app: FastAPI):
     # 所以 llm_model_path_for_handler 可能暂时不直接用于答案生成，但 LocalModelHandler 初始化需要它。
     # 如果您希望 LocalModelHandler 只负责嵌入，可以将 llm_model_path 设置为 None。
     # 我们先假设您可能希望 LocalModelHandler 也能处理 LLM 任务。
-    llm_gguf_model_path_for_handler = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH") # 您需要在 .env 中定义这个变量
-    if not llm_gguf_model_path_for_handler:
-        api_logger.warning("LOCAL_LLM_GGUF_MODEL_PATH not set in .env. LLM features of LocalModelHandler might be unavailable.")
-
-    embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH") # 这个我们已经更新了
+    llm_gguf_model_path_for_handler = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
+    embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH")
     chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
     bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
-    kuzu_db_path = os.getenv("KUZU_DB_PATH")
+    kuzu_db_path_env = os.getenv("KUZU_DB_PATH") # <--- 获取环境变量
 
-
-    if not all([embedding_gguf_model_path, chroma_persist_dir, bm25_index_dir, kuzu_db_path]):
+    if not all([embedding_gguf_model_path, chroma_persist_dir, bm25_index_dir, kuzu_db_path_env]): # <--- 使用 kuzu_db_path_env
         api_logger.critical("One or more critical paths (embedding, chroma, bm25, kuzu) are not set in environment variables!")
-        # 根据您的需求，这里可以决定是否抛出异常使服务启动失败
-        app.state.rag_context = None # 明确设置 rag_context 为 None
-        yield # 即使部分失败，也需要 yield 以完成生命周期
+        app.state.rag_context = None 
+        yield 
         return
 
     try:
+        # --- 添加开始：准备本地扩展 for RAG API Service ---
+        if kuzu_db_path_env: # 确保路径存在
+            manual_extension_source_path_api = os.getenv("KUZU_VECTOR_EXTENSION_PATH", "/home/zhz/.kuzu/extension/0.10.0/linux_amd64/vector/libvector.kuzu_extension")
+            
+            extensions_dir_in_api_db = os.path.join(kuzu_db_path_env, "extensions") # kuzu_db_path_env 应该是绝对路径
+            os.makedirs(extensions_dir_in_api_db, exist_ok=True)
+            api_logger.info(f"RAG API Service: Ensured extensions directory exists: {extensions_dir_in_api_db}")
+
+            if os.path.exists(manual_extension_source_path_api):
+                target_path_vector_api = os.path.join(extensions_dir_in_api_db, "vector.kuzu_extension")
+                try:
+                    # 只有当目标文件不存在或源文件更新时才复制，避免不必要的IO
+                    if not os.path.exists(target_path_vector_api) or \
+                       os.path.getmtime(manual_extension_source_path_api) > os.path.getmtime(target_path_vector_api):
+                        shutil.copy2(manual_extension_source_path_api, target_path_vector_api)
+                        api_logger.info(f"RAG API Service: Copied/Updated vector extension to '{target_path_vector_api}'")
+                    else:
+                        api_logger.info(f"RAG API Service: Vector extension already up-to-date at '{target_path_vector_api}'")
+                except Exception as e_copy_api:
+                    api_logger.error(f"RAG API Service: ERROR - Could not copy vector extension for API: {e_copy_api}")
+            else:
+                api_logger.error(f"RAG API Service: ERROR - Manual vector extension file not found at '{manual_extension_source_path_api}'. KGRetriever might fail.")
+        else:
+            api_logger.error("RAG API Service: KUZU_DB_PATH not set, cannot prepare local extensions for KGRetriever.")
+        # --- 添加结束 ---
+
         # 1. 初始化 LocalModelHandler
         #    LocalModelHandler 现在负责加载GGUF嵌入模型和可选的GGUF LLM模型
         api_logger.info(f"Initializing LocalModelHandler with Embedding GGUF: {embedding_gguf_model_path}")
@@ -129,10 +150,10 @@ async def lifespan(app: FastAPI):
         # 5. 初始化 KGRetriever
         #    KGRetriever 的 __init__ 需要一个 embedder 参数用于其内部的向量搜索。
         #    我们可以直接将 model_handler 传递给它，KGRetriever 内部应调用 model_handler.embed_query()
-        api_logger.info(f"Initializing KGRetriever with db_path: {kuzu_db_path}")
+        api_logger.info(f"Initializing KGRetriever with db_path: {kuzu_db_path_env}") # 使用 kuzu_db_path_env
         kg_retriever_instance = KGRetriever(
-            db_path=kuzu_db_path,
-            embedder=model_handler # <--- 将 model_handler 作为 embedder 传递
+            db_path=kuzu_db_path_env, # 使用 kuzu_db_path_env
+            embedder=model_handler 
         )
 
         # 6. 初始化 FusionEngine (它内部会从env读取RERANKER_MODEL_PATH)
@@ -149,15 +170,14 @@ async def lifespan(app: FastAPI):
         api_logger.info("--- RAG components initialized successfully using Qwen3 GGUF models. Service is ready. ---")
     except Exception as e:
         api_logger.critical(f"FATAL: Failed to initialize RAG components during startup: {e}", exc_info=True)
-        app.state.rag_context = None # 确保出错时 rag_context 为 None
+        app.state.rag_context = None 
     
     yield
     
     api_logger.info("--- RAG API Service: Cleaning up resources ---")
     rag_context_to_clean: Optional[RAGAppContext] = getattr(app.state, 'rag_context', None)
     if rag_context_to_clean and rag_context_to_clean.kg_retriever:
-        rag_context_to_clean.kg_retriever.close() # KGRetriever 有 close 方法
-    # LocalModelHandler 中的 Llama 对象会在其被垃圾回收时自动释放资源
+        rag_context_to_clean.kg_retriever.close() 
     api_logger.info("--- Cleanup complete. ---")
 
 # --- FastAPI 应用实例 ---

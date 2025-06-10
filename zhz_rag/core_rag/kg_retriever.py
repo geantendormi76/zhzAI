@@ -34,13 +34,13 @@ class KGRetriever:
     def __init__(self, db_path: Optional[str] = None, embedder: Optional['LocalModelHandler'] = None): # <--- 修改类型提示
         self.db_path = db_path if db_path else self.KUZU_DB_PATH_ENV
         self._db: Optional[kuzu.Database] = None
-        self._embedder = embedder # 现在 self._embedder 会是 LocalModelHandler 实例
+        self._embedder = embedder 
         kg_logger.info(f"KGRetriever (KuzuDB) __init__ called. DB path: {self.db_path}")
         if self._embedder:
             kg_logger.info(f"KGRetriever initialized with embedder: {type(self._embedder)}")
         else:
             kg_logger.warning("KGRetriever initialized WITHOUT an embedder. Vector search will not be available.")
-        self._connect_to_kuzu()
+        self._connect_to_kuzu() # <--- _connect_to_kuzu 会被调用
 
     def _connect_to_kuzu(self):
         kg_logger.info(f"Attempting to load KuzuDB from path: {self.db_path}")
@@ -50,22 +50,36 @@ class KGRetriever:
                 self._db = None
                 return
             
-            self._db = kuzu.Database(self.db_path, read_only=True)
-            kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path}.")
+            # --- 修改开始：尝试以读写模式打开 ---
+            kg_logger.warning("KGRetriever: DIAGNOSTIC MODE - Opening KuzuDB in READ_WRITE mode.")
+            self._db = kuzu.Database(self.db_path, read_only=False) 
+            # --- 修改结束 ---
+            kg_logger.info(f"Successfully loaded KuzuDB from {self.db_path} (read_only=False FOR DIAGNOSTICS).")
 
-            # --- 添加开始：为 KGRetriever 的连接加载 VECTOR 扩展 ---
-            try:
-                kg_logger.info("KGRetriever: Attempting to LOAD VECTOR extension for this session...")
-                with self._get_connection() as conn:
-                    conn.execute("LOAD VECTOR;")
+            with self._get_connection() as conn: # 使用 self._get_connection 来获取连接
+                kg_logger.info("KGRetriever: Attempting to LOAD VECTOR extension for this session during _connect_to_kuzu...")
+                conn.execute("LOAD VECTOR;")
                 kg_logger.info("KGRetriever: VECTOR extension loaded successfully for this retriever instance.")
-            except Exception as e_load:
-                kg_logger.error(f"KGRetriever: CRITICAL - Failed to LOAD VECTOR extension during initialization: {e_load}", exc_info=True)
-                raise ConnectionError(f"Failed to load KuzuDB VECTOR extension for KGRetriever: {e_load}") from e_load
+
+                # --- 添加开始：在连接和加载扩展后立即检查索引 ---
+                kg_logger.info("KGRetriever: Verifying indexes immediately after connecting and loading vector extension...")
+                show_indexes_result_init = conn.execute("CALL SHOW_INDEXES() RETURN *;")
+                if show_indexes_result_init:
+                    indexes_df_init = pd.DataFrame(show_indexes_result_init.get_as_df())
+                    kg_logger.info(f"KGRetriever: Indexes visible during __init__ / _connect_to_kuzu:\n{indexes_df_init.to_string()}")
+                    if not indexes_df_init.empty and 'index name' in indexes_df_init.columns and 'entity_embedding_idx' in indexes_df_init['index name'].tolist():
+                        kg_logger.info("KGRetriever __init__: 'entity_embedding_idx' IS VISIBLE at initialization.")
+                    else:
+                        kg_logger.warning("KGRetriever __init__: 'entity_embedding_idx' IS NOT VISIBLE at initialization.")
+                else:
+                    kg_logger.warning("KGRetriever __init__: CALL SHOW_INDEXES() did not return a result during initialization.")
+                # --- 添加结束 ---
 
         except Exception as e:
-            kg_logger.error(f"Failed to connect to KuzuDB at {self.db_path}: {e}", exc_info=True)
+            kg_logger.error(f"Failed to connect to KuzuDB at {self.db_path} or load/verify extension during init: {e}", exc_info=True)
             self._db = None
+            # 如果在初始化时就失败，可能需要让服务启动失败或进入降级模式
+            raise ConnectionError(f"Failed to initialize KGRetriever's KuzuDB connection or vector setup: {e}") from e
 
     @contextmanager
     def _get_connection(self) -> Iterator[kuzu.Connection]:
@@ -102,13 +116,24 @@ class KGRetriever:
         results_list: List[Dict[str, Any]] = []
         try:
             with self._get_connection() as conn:
-                if "QUERY_VECTOR_INDEX" in query.upper(): # 只在向量查询前执行
+                # --- 添加开始 ---
+                is_vector_query = "QUERY_VECTOR_INDEX" in query.upper()
+                if is_vector_query: 
                     try:
                         conn.execute("LOAD VECTOR;")
                         kg_logger.debug("LOAD VECTOR executed before QUERY_VECTOR_INDEX in _execute_cypher_query_sync.")
+                        
+                        # 打印当前可见的索引
+                        show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;")
+                        indexes_df = pd.DataFrame(show_indexes_result.get_as_df())
+                        kg_logger.info(f"KGRetriever: Indexes visible to current connection before vector query:\n{indexes_df.to_string()}")
+                        if not indexes_df.empty and 'entity_embedding_idx' in indexes_df['index name'].tolist():
+                            kg_logger.info("KGRetriever: 'entity_embedding_idx' IS VISIBLE to current connection.")
+                        else:
+                            kg_logger.warning("KGRetriever: 'entity_embedding_idx' IS NOT VISIBLE to current connection.")
+                            
                     except Exception as e_load_vec_exec:
-                        kg_logger.warning(f"Failed to execute LOAD VECTOR in _execute_cypher_query_sync (continuing anyway): {e_load_vec_exec}")
-
+                        kg_logger.warning(f"Failed to execute LOAD VECTOR or SHOW_INDEXES in _execute_cypher_query_sync (continuing anyway): {e_load_vec_exec}")
                 actual_params = parameters if parameters else {}
                 query_result = conn.execute(query, parameters=actual_params)
                 if hasattr(query_result, 'get_as_df'):
