@@ -3,63 +3,138 @@ import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator,Tuple
-import logging
+from typing import List, Dict, Any, Optional, Iterator
 import httpx
-import asyncio
 import json
-# from neo4j import GraphDatabase, Driver, Result # Neo4j不再直接用于此资源
 import litellm
 import os
 import kuzu # 确保导入 kuzu
 import shutil
-from pydantic import PrivateAttr, Field as PydanticField
 from contextlib import contextmanager
-import portalocker # <--- 重新导入 portalocker
-import time # <--- 导入 time，可能用于短暂等待
+from pydantic import Field as PydanticField
+from pydantic import PrivateAttr
+import asyncio
 
-# --- SentenceTransformerResource ---
-class SentenceTransformerResourceConfig(dg.Config):
-    model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5"
+try:
+    from zhz_rag.llm.local_model_handler import LocalModelHandler
+except ImportError as e:
+    print(f"FATAL: Could not import LocalModelHandler from zhz_rag.llm.local_model_handler. "
+          f"Please ensure 'zhz_rag' package is installed and accessible in the Dagster environment's PYTHONPATH. Error: {e}")
+    raise
 
-class SentenceTransformerResource(dg.ConfigurableResource):
-    model_name_or_path: str
-    _model: SentenceTransformer = PrivateAttr(default=None)
+
+# --- 新的 GGUFEmbeddingResource 定义 ---
+class GGUFEmbeddingResourceConfig(dg.Config):
+    embedding_model_path: str = PydanticField(
+        description="Path to the GGUF embedding model file."
+    )
+    n_ctx: int = PydanticField(
+        default=2048,
+        description="Context size for the embedding model."
+    )
+    n_gpu_layers: int = PydanticField(
+        default=0,
+        description="Number of GPU layers to offload for the embedding model."
+    )
+
+class GGUFEmbeddingResource(dg.ConfigurableResource):
+    embedding_model_path: str
+    n_ctx: int
+    n_gpu_layers: int
+
+    _model_handler: LocalModelHandler = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+
+    # --- 添加辅助方法 ---
+    def _run_async_in_new_loop(self, coro):
+        """辅助函数，在当前线程中创建一个新事件循环来运行协程。"""
+        try:
+            # 尝试获取当前线程已有的循环，如果没有则创建一个新的
+            # 这对于 Dagster 这种可能在不同线程中执行资源初始化的场景更稳健
+            loop = asyncio.get_event_loop_policy().new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            loop.close()
+            return result
+        except RuntimeError as e:
+            if "cannot run event loop while another loop is running" in str(e):
+                # 如果当前线程已经有一个正在运行的循环 (理论上 Dagster 资产执行时不会)
+                # 这种情况比较复杂，直接在同步代码中调用异步代码的最佳实践是使用 asyncio.to_thread
+                # 但这里资源方法是被同步资产调用的，我们期望它返回实际结果。
+                # 对于 Dagster 资源，更常见的是资源方法本身是同步的，如果它们需要调用异步操作，
+                # 它们需要自己管理事件循环的运行。
+                self._logger.error(f"GGUFEmbeddingResource: Nested event loop issue in _run_async_in_new_loop: {e}")
+                # 另一种选择是，如果 LocalModelHandler 的方法是纯CPU密集型，
+                # 也许 LocalModelHandler 的方法应该设计成同步的，然后在需要异步的地方用 to_thread。
+                # 但我们之前为了 LlamaCppEmbeddingFunction 的 asyncio.run 改成了 async.
+                # 这里我们先尝试创建一个新的循环。
+            self._logger.error(f"GGUFEmbeddingResource: Error running async task in new loop: {e}", exc_info=True)
+            raise # 将原始错误重新抛出
+    # --- 结束添加 ---
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}")
+        self._logger.info(f"Initializing GGUFEmbeddingResource...")
+        
+        if not os.path.exists(self.embedding_model_path):
+            error_msg = f"GGUF embedding model file not found at: {self.embedding_model_path}"
+            self._logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
         try:
-            self._model = SentenceTransformer(self.model_name_or_path)
-            self._logger.info("SentenceTransformer model initialized successfully.")
+            # 只初始化嵌入功能
+            self._model_handler = LocalModelHandler(
+                embedding_model_path=self.embedding_model_path,
+                n_ctx_embed=self.n_ctx,
+                n_gpu_layers_embed=self.n_gpu_layers
+            )
+            if not self._model_handler.embedding_model:
+                raise RuntimeError("Failed to load GGUF embedding model inside LocalModelHandler.")
+            
+            self._logger.info(f"GGUFEmbeddingResource initialized successfully. Model: {self.embedding_model_path}")
         except Exception as e:
-            self._logger.error(f"Failed to initialize SentenceTransformer model: {e}", exc_info=True)
+            self._logger.error(f"Failed to initialize GGUFEmbeddingResource: {e}", exc_info=True)
             raise
 
-    def encode(self, texts: List[str], batch_size: int = 32, normalize_embeddings: bool = True) -> List[List[float]]:
-        if self._model is None:
-            if self._logger:
-                self._logger.error("SentenceTransformer model is not initialized in encode method.")
-            raise RuntimeError("SentenceTransformer model is not initialized.")
+    def encode(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+        """
+        提供与 SentenceTransformer.encode 类似的接口。
+        忽略 kwargs 以保持兼容性。
+        """
+        if not hasattr(self, '_model_handler'):
+            raise RuntimeError("GGUFEmbeddingResource is not initialized. Call setup_for_execution first.")
         
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.debug(f"Encoding {len(texts)} texts. Normalize embeddings: {normalize_embeddings}")
-        
-        embeddings_np = self._model.encode(
-            texts, 
-            batch_size=batch_size, 
-            convert_to_tensor=False, 
-            normalize_embeddings=normalize_embeddings
-        )
-        return [emb.tolist() for emb in embeddings_np]
-    
-    # --- [添加开始] ---
+        logger_instance.debug(f"GGUFEmbeddingResource: Encoding {len(texts)} texts using LocalModelHandler.")
+
+        # --- 修改调用方式 ---
+        # LocalModelHandler.embed_documents 是 async def
+        # GGUFEmbeddingResource.encode 是同步方法，在 Dagster 资产中被同步调用
+        # 我们需要在这里同步地执行异步的 embed_documents 方法
+        try:
+            # 使用辅助方法来运行异步的 embed_documents
+            embeddings = self._run_async_in_new_loop(
+                self._model_handler.embed_documents(texts)
+            )
+            return embeddings
+        except Exception as e:
+             logger_instance.error(f"GGUFEmbeddingResource: Error during encode by calling LocalModelHandler: {e}", exc_info=True)
+             # 根据上游资产的期望，这里可能需要返回一个特定格式的错误，或者让异常传播
+             # 为了简单，我们先让异常传播
+             raise
+        # --- 结束修改 ---
+
+
     def get_embedding_dimension(self) -> int:
         """返回嵌入模型的维度大小。"""
-        if self._model and hasattr(self._model, 'get_sentence_embedding_dimension'):
-            return self._model.get_sentence_embedding_dimension()
-        return 512
+        if not hasattr(self, '_model_handler'):
+            raise RuntimeError("GGUFEmbeddingResource is not initialized.")
+        
+        dimension = self._model_handler.get_embedding_dimension()
+        if dimension is None:
+            raise ValueError("Could not determine embedding dimension from the loaded GGUF model.")
+        return dimension
+
 
 # --- ChromaDBResource ---
 class ChromaDBResourceConfig(dg.Config):

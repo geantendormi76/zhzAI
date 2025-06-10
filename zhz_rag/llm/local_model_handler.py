@@ -123,24 +123,30 @@ class LocalModelHandler:
         
         def _blocking_embed_docs():
             try:
-                # self.embedding_model.embed() 当输入是列表时，应该返回 List[numpy.ndarray] 或 List[List[float]]
                 embedding_results_from_llama = self.embedding_model.embed(processed_texts)
                 
-                # --- 修改开始：处理可能的返回类型 ---
                 raw_embeddings_list_for_norm: List[List[float]] = []
-                if isinstance(embedding_results_from_llama, list):
+                # --- 修改开始：更稳健地处理各种返回情况 ---
+                if not embedding_results_from_llama: # 如果返回是None或空列表
+                    return [[] for _ in processed_texts]
+
+                # 情况1: 输入是单个文本，embed可能返回 List[float]
+                if len(processed_texts) == 1 and isinstance(embedding_results_from_llama, list) and \
+                    all(isinstance(x, (float, int)) for x in embedding_results_from_llama):
+                    raw_embeddings_list_for_norm.append(embedding_results_from_llama)
+                # 情况2: 输入是多个文本，embed应该返回 List[List[float]] 或 List[np.ndarray]
+                elif isinstance(embedding_results_from_llama, list):
                     for item in embedding_results_from_llama:
                         if isinstance(item, np.ndarray):
                             raw_embeddings_list_for_norm.append(item.tolist())
                         elif isinstance(item, list) and all(isinstance(x, (float, int)) for x in item):
                             raw_embeddings_list_for_norm.append(item)
                         else:
-                            logger.warning(f"LocalModelHandler: Skipping unexpected item type in embedding results: {type(item)}")
-                            raw_embeddings_list_for_norm.append([]) # 添加空列表占位
+                            logger.warning(f"LocalModelHandler: Skipping unexpected item type in embedding results list: {type(item)}")
+                            raw_embeddings_list_for_norm.append([]) 
                 else:
                     logger.error(f"LocalModelHandler: Unexpected return type from self.embedding_model.embed() for multiple texts: {type(embedding_results_from_llama)}")
-                    return [[] for _ in processed_texts] # 返回对应数量的空列表
-                # --- 修改结束 ---
+                    return [[] for _ in processed_texts]
 
                 normalized_embeddings_list = l2_normalize_embeddings(raw_embeddings_list_for_norm)
                 logger.info(f"LocalModelHandler: Successfully embedded and normalized {len(processed_texts)} documents (sync part).")

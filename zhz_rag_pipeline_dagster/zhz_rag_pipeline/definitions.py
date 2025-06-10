@@ -15,7 +15,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import all_proc
 
 # 导入所有资源和 IO 管理器
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
-    SentenceTransformerResource, SentenceTransformerResourceConfig,
+    GGUFEmbeddingResource, GGUFEmbeddingResourceConfig,
     ChromaDBResource, ChromaDBResourceConfig,
     LocalLLMAPIResource, LocalLLMAPIResourceConfig,
     KuzuDBReadWriteResource,
@@ -46,13 +46,15 @@ defs = Definitions(
     assets=all_defined_assets,
     jobs=[kuzu_kg_write_job],
     resources={
-        "embedder": SentenceTransformerResource(model_name_or_path=SentenceTransformerResourceConfig().model_name_or_path),
+        "embedder": GGUFEmbeddingResource(
+            embedding_model_path=os.getenv("EMBEDDING_MODEL_PATH"), 
+            n_ctx=int(os.getenv("EMBEDDING_N_CTX", GGUFEmbeddingResourceConfig.model_fields['n_ctx'].default)),
+            n_gpu_layers=int(os.getenv("EMBEDDING_N_GPU_LAYERS", GGUFEmbeddingResourceConfig.model_fields['n_gpu_layers'].default))
+        ),
         "chroma_db": ChromaDBResource(collection_name=ChromaDBResourceConfig().collection_name, persist_directory=ChromaDBResourceConfig().persist_directory),
         "sglang_api": LocalLLMAPIResource(api_url=LocalLLMAPIResourceConfig().api_url, default_temperature=LocalLLMAPIResourceConfig().default_temperature, default_max_new_tokens=LocalLLMAPIResourceConfig().default_max_new_tokens),
         "kuzu_readwrite_db": KuzuDBReadWriteResource(),
-        # kuzu_readonly_db 资源暂时没有被任何启用的资产使用，但保留它也无妨
         "kuzu_readonly_db": KuzuDBReadOnlyResource(),
-        # gemini_api 资源也只被评估资产使用，理论上可以注释掉，但保留也无妨
         "gemini_api": GeminiAPIResource(model_name=GeminiAPIResourceConfig().model_name, proxy_url=GeminiAPIResourceConfig().proxy_url, default_temperature=GeminiAPIResourceConfig().default_temperature, default_max_tokens=GeminiAPIResourceConfig().default_max_tokens),
         "pydantic_json_io_manager": pydantic_io_manager_instance,
     }

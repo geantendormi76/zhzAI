@@ -16,7 +16,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
     ExtractedRelation
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
-    SentenceTransformerResource,
+    GGUFEmbeddingResource,
     ChromaDBResource,
     LocalLLMAPIResource,
     KuzuDBReadWriteResource,
@@ -81,19 +81,21 @@ def clean_chunk_text_asset(
 def generate_embeddings_asset(
     context: dg.AssetExecutionContext,
     text_chunks: List[ChunkOutput],
-    embedder: SentenceTransformerResource
+    embedder: GGUFEmbeddingResource
 ) -> List[EmbeddingOutput]:
     all_embeddings: List[EmbeddingOutput] = []
     if not text_chunks:
         return all_embeddings
     chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks]
     vectors = embedder.encode(chunk_texts_to_encode)
+
     for i, chunk_input in enumerate(text_chunks):
+        model_name_for_log = embedder.embedding_model_path
         all_embeddings.append(EmbeddingOutput(
             chunk_id=chunk_input.chunk_id,
             chunk_text=chunk_input.chunk_text,
-            embedding_vector=vectors[i],
-            embedding_model_name=embedder.model_name_or_path,
+            embedding_vector=vectors[i] if i < len(vectors) and vectors[i] else [0.0] * embedder.get_embedding_dimension(), # 提供默认值以防嵌入失败
+            embedding_model_name=model_name_for_log, 
             original_chunk_metadata=chunk_input.chunk_metadata
         ))
     context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
@@ -264,7 +266,7 @@ async def kg_extraction_asset(
     group_name="kg_building",
     deps=[kg_extraction_asset]
 )
-def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: GGUFEmbeddingResource):
     context.log.info("--- Starting KuzuDB Schema Creation Asset ---")
     with kuzu_readwrite_db.get_connection() as conn:
         EMBEDDING_DIM = embedder.get_embedding_dimension()
@@ -283,7 +285,12 @@ def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: Kuzu
     group_name="kg_building",
     deps=["kuzu_schema", "kg_extractions"]
 )
-def kuzu_nodes_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGTripleSetOutput], kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+def kuzu_nodes_asset(
+    context: dg.AssetExecutionContext, 
+    kg_extractions: List[KGTripleSetOutput], 
+    kuzu_readwrite_db: KuzuDBReadWriteResource, 
+    embedder: GGUFEmbeddingResource # <--- 修改
+):
     context.log.info("--- Starting KuzuDB Node Loading Asset ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping node loading.")
@@ -293,12 +300,22 @@ def kuzu_nodes_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGT
         for entity in kg_set.extracted_entities:
             node_key = (normalize_text_for_id(entity.text), entity.label.upper())
             if node_key not in unique_nodes:
+                node_text_to_embed = node_key[0]
+                embedding_vector_list = embedder.encode([node_text_to_embed]) 
+                final_embedding_for_kuzu: List[float]
+                if embedding_vector_list and embedding_vector_list[0] and len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
+                    final_embedding_for_kuzu = embedding_vector_list[0]
+                else:
+                    context.log.warning(f"Failed to generate valid embedding for node: {node_key[0]}. Using zero vector.")
+                    final_embedding_for_kuzu = [0.0] * embedder.get_embedding_dimension() 
+                    
                 unique_nodes[node_key] = {
                     "id_prop": hashlib.md5(f"{node_key[0]}_{node_key[1]}".encode('utf-8')).hexdigest(),
                     "text": node_key[0],
                     "label": node_key[1],
-                    "embedding": embedder.encode([node_key[0]])[0]
+                    "embedding": final_embedding_for_kuzu 
                 }
+
     node_data = list(unique_nodes.values())
     if not node_data:
         context.log.warning("No unique nodes found in extractions to load.")
