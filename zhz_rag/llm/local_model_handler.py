@@ -107,7 +107,6 @@ class LocalModelHandler:
             return []
         
         processed_texts: List[str] = []
-
         for text_item in texts:
             if isinstance(text_item, str):
                 if text_item and not text_item.endswith("<|endoftext|>"):
@@ -123,43 +122,60 @@ class LocalModelHandler:
         
         def _blocking_embed_docs():
             try:
+                # 调用 llama-cpp-python 的 embed 方法
                 embedding_results_from_llama = self.embedding_model.embed(processed_texts)
                 
                 raw_embeddings_list_for_norm: List[List[float]] = []
-                # --- 修改开始：更稳健地处理各种返回情况 ---
-                if not embedding_results_from_llama: # 如果返回是None或空列表
-                    return [[] for _ in processed_texts]
 
-                # 情况1: 输入是单个文本，embed可能返回 List[float]
-                if len(processed_texts) == 1 and isinstance(embedding_results_from_llama, list) and \
-                    all(isinstance(x, (float, int)) for x in embedding_results_from_llama):
-                    raw_embeddings_list_for_norm.append(embedding_results_from_llama)
-                # 情况2: 输入是多个文本，embed应该返回 List[List[float]] 或 List[np.ndarray]
-                elif isinstance(embedding_results_from_llama, list):
-                    for item in embedding_results_from_llama:
-                        if isinstance(item, np.ndarray):
-                            raw_embeddings_list_for_norm.append(item.tolist())
+                # --- 关键逻辑修改开始 ---
+                if not embedding_results_from_llama:
+                    logger.warning("LocalModelHandler: self.embedding_model.embed() returned None or empty.")
+                    return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
+
+                # 检查返回的是否是单个向量 (当 processed_texts 只有一个元素时，某些版本的 llama-cpp-python 可能直接返回一个向量)
+                if len(processed_texts) == 1 and isinstance(embedding_results_from_llama, (np.ndarray, list)) and \
+                   ( (isinstance(embedding_results_from_llama, np.ndarray) and embedding_results_from_llama.ndim == 1) or \
+                     (isinstance(embedding_results_from_llama, list) and all(isinstance(x, (float, int)) for x in embedding_results_from_llama)) ):
+                    logger.debug("LocalModelHandler: embed() returned a single vector for single input text.")
+                    single_embedding = embedding_results_from_llama.tolist() if isinstance(embedding_results_from_llama, np.ndarray) else embedding_results_from_llama
+                    if len(single_embedding) == self.embedding_model_dimension:
+                        raw_embeddings_list_for_norm.append(single_embedding)
+                    else:
+                        logger.warning(f"LocalModelHandler: Single embedding dimension mismatch. Expected {self.embedding_model_dimension}, got {len(single_embedding)}. Using zero vector.")
+                        raw_embeddings_list_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
+                # 检查返回的是否是向量列表 (当 processed_texts 有多个元素时，或者单个元素也可能返回列表的列表)
+                elif isinstance(embedding_results_from_llama, list) and all(isinstance(item, (np.ndarray, list)) for item in embedding_results_from_llama):
+                    logger.debug("LocalModelHandler: embed() returned a list of vectors/arrays.")
+                    for item_idx, item in enumerate(embedding_results_from_llama):
+                        current_embedding: List[float] = []
+                        if isinstance(item, np.ndarray) and item.ndim == 1:
+                            current_embedding = item.tolist()
                         elif isinstance(item, list) and all(isinstance(x, (float, int)) for x in item):
-                            raw_embeddings_list_for_norm.append(item)
+                            current_embedding = item
                         else:
-                            logger.warning(f"LocalModelHandler: Skipping unexpected item type in embedding results list: {type(item)}")
-                            raw_embeddings_list_for_norm.append([]) 
+                            logger.warning(f"LocalModelHandler: Unexpected item type or structure at index {item_idx} in embedding results list: {type(item)}. Using zero vector.")
+                        
+                        if len(current_embedding) == self.embedding_model_dimension:
+                            raw_embeddings_list_for_norm.append(current_embedding)
+                        else:
+                            logger.warning(f"LocalModelHandler: Embedding dimension mismatch for item {item_idx}. Expected {self.embedding_model_dimension}, got {len(current_embedding)}. Using zero vector.")
+                            raw_embeddings_list_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
                 else:
-                    logger.error(f"LocalModelHandler: Unexpected return type from self.embedding_model.embed() for multiple texts: {type(embedding_results_from_llama)}")
-                    return [[] for _ in processed_texts]
+                    logger.error(f"LocalModelHandler: Unexpected return type or structure from self.embedding_model.embed(): {type(embedding_results_from_llama)}. Cannot process. Value preview: {str(embedding_results_from_llama)[:200]}")
+                    return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
 
                 normalized_embeddings_list = l2_normalize_embeddings(raw_embeddings_list_for_norm)
-                logger.info(f"LocalModelHandler: Successfully embedded and normalized {len(processed_texts)} documents (sync part).")
+                logger.info(f"LocalModelHandler: Successfully embedded and normalized {len(normalized_embeddings_list)} documents (sync part).")
                 return normalized_embeddings_list
             except Exception as e_sync_embed_docs:
                 logger.error(f"LocalModelHandler: Error during synchronous document embedding: {e_sync_embed_docs}", exc_info=True)
-                return [[] for _ in processed_texts]
+                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
 
         try:
             return await asyncio.to_thread(_blocking_embed_docs)
         except Exception as e_async_embed_docs:
             logger.error(f"LocalModelHandler: Error in asyncio.to_thread for document embedding: {e_async_embed_docs}", exc_info=True)
-            return [[] for _ in texts]
+            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in texts]
 
     async def embed_query(self, text: str) -> List[float]:
         if not self.embedding_model:

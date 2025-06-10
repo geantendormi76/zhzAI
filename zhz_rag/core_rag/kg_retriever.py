@@ -260,22 +260,30 @@ class KGRetriever:
 
                     if extracted_info.relation_hint:
                         mapped_rel_type = None
-                        if "工作" in extracted_info.relation_hint and entity_info.label.upper() == "PERSON":
-                            mapped_rel_type = "WorksAt"
-                        elif "分配" in extracted_info.relation_hint and entity_info.label.upper() == "TASK":
-                            mapped_rel_type = "AssignedTo"
-                        
+                        relation_hint_upper = extracted_info.relation_hint.upper() # 确保比较时也用大写
+                        entity_label_upper = entity_info.label.upper()
+
+                        if "WORK" in relation_hint_upper and entity_label_upper == "PERSON":
+                            mapped_rel_type = "WORKS_AT" # <--- 确保是大写
+                        elif ("ASSIGN" in relation_hint_upper or "负责" in extracted_info.relation_hint) and \
+                             (entity_label_upper == "TASK" or entity_label_upper == "PROJECT"): # 扩展适用范围
+                            mapped_rel_type = "ASSIGNED_TO" # <--- 确保是大写
+
                         if mapped_rel_type:
                             neighbor_query = f"""
                                 MATCH (src:ExtractedEntity {{text: $text, label: $label}})
-                                      -[r:{mapped_rel_type}]->
+                                      -[r:{mapped_rel_type}]-> 
                                       (tgt:ExtractedEntity)
                                 RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
                                        label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score 
-                                LIMIT {top_k} 
-                            """ # 邻居查询的距离更大
-                            neighbor_params = {"text": entity_info.text, "label": entity_info.label.upper()}
-                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}'")
+                                LIMIT {{top_k_param_neighbor}} 
+                            """
+                            neighbor_params = {
+                                "text": entity_info.text, 
+                                "label": entity_label_upper, # 使用大写的标签
+                                "top_k_param_neighbor": top_k # 将top_k作为参数传递
+                            }
+                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}' with top_k={top_k}")
                             neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
                             if neighbor_results:
                                 all_kuzu_records.extend(neighbor_results)
