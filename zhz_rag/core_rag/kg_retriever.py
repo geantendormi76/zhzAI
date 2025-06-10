@@ -102,6 +102,13 @@ class KGRetriever:
         results_list: List[Dict[str, Any]] = []
         try:
             with self._get_connection() as conn:
+                if "QUERY_VECTOR_INDEX" in query.upper(): # 只在向量查询前执行
+                    try:
+                        conn.execute("LOAD VECTOR;")
+                        kg_logger.debug("LOAD VECTOR executed before QUERY_VECTOR_INDEX in _execute_cypher_query_sync.")
+                    except Exception as e_load_vec_exec:
+                        kg_logger.warning(f"Failed to execute LOAD VECTOR in _execute_cypher_query_sync (continuing anyway): {e_load_vec_exec}")
+
                 actual_params = parameters if parameters else {}
                 query_result = conn.execute(query, parameters=actual_params)
                 if hasattr(query_result, 'get_as_df'):
@@ -275,7 +282,12 @@ class KGRetriever:
                         # --- 结束初始化 ---
 
                         if mapped_rel_type:
-                            neighbor_query = f"""... LIMIT $limit_val """ # 原来的查询字符串
+                            neighbor_query = f"""
+                            MATCH (src:ExtractedEntity {{text: $text, label: $label}})
+                                  -[r:{mapped_rel_type}]-> 
+                                  (tgt:ExtractedEntity)
+                            RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
+                                   label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score LIMIT $limit_val""" # 原来的查询字符串
                             neighbor_params = {
                                 "text": entity_info.text, 
                                 "label": entity_label_upper,

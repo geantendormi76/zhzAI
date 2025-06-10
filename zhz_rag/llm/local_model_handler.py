@@ -91,111 +91,72 @@ class LocalModelHandler:
         if not self.llm_model and not self.embedding_model:
             logger.warning("LocalModelHandler initialized without any models loaded.")
 
-    def _blocking_embed_documents_internal(self, processed_texts: List[str]) -> List[List[float]]:
-        """Synchronous internal method to embed multiple documents."""
-        if not self.embedding_model: return [[] for _ in processed_texts]
+    def _blocking_embed_documents_internal(self, processed_texts_for_block: List[str]) -> List[List[float]]:
+        if not self.embedding_model: return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
         try:
-            embedding_results_from_llama = self.embedding_model.embed(processed_texts)
+            embedding_results_from_llama = self.embedding_model.embed(processed_texts_for_block)
             processed_embeddings_for_norm: List[List[float]] = []
 
             if not embedding_results_from_llama:
                 logger.warning("LMH (_blocking_embed_docs_internal): embed() returned None or empty for batch.")
-                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
+                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
 
             if isinstance(embedding_results_from_llama, list):
                 if not embedding_results_from_llama:
-                     return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
+                     return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
 
-                if all(isinstance(item, list) and all(isinstance(x, (float, int)) for x in item) for item in embedding_results_from_llama):
-                    logger.debug("LMH (_blocking_embed_docs_internal): embed() returned List[List[float]].")
-                    for item_idx, item_list_float in enumerate(embedding_results_from_llama):
-                        if len(item_list_float) == self.embedding_model_dimension:
-                            processed_embeddings_for_norm.append([float(x) for x in item_list_float])
-                        else:
-                            logger.warning(f"LMH (_blocking_embed_docs_internal): Dim mismatch for item {item_idx} (already List[float]). Expected {self.embedding_model_dimension}, got {len(item_list_float)}. Using zero vector.")
-                            processed_embeddings_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
-                elif all(isinstance(item, np.ndarray) for item in embedding_results_from_llama):
-                    logger.debug("LMH (_blocking_embed_docs_internal): embed() returned List[np.ndarray].")
-                    for item_idx, item_np_array in enumerate(embedding_results_from_llama):
-                        if item_np_array.ndim == 1 and len(item_np_array) == self.embedding_model_dimension:
-                            processed_embeddings_for_norm.append(item_np_array.tolist())
-                        else:
-                            logger.warning(f"LMH (_blocking_embed_docs_internal): Dim mismatch or wrong ndim for item {item_idx} (np.ndarray). Expected 1D of {self.embedding_model_dimension}, got shape {item_np_array.shape}. Using zero vector.")
-                            processed_embeddings_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
-                else:
-                    logger.error(f"LMH (_blocking_embed_docs_internal): embed() returned a list, but its elements are not uniformly List[float] or np.ndarray. Type of first element: {type(embedding_results_from_llama[0]) if embedding_results_from_llama else 'EmptyList'}")
-                    return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
-            elif isinstance(embedding_results_from_llama, np.ndarray) and len(processed_texts) == 1: # Should not happen if processed_texts is always a list
-                logger.debug("LMH (_blocking_embed_docs_internal): embed() returned a single np.ndarray for a single input text in batch (unexpected).")
-                if embedding_results_from_llama.ndim == 1 and len(embedding_results_from_llama) == self.embedding_model_dimension:
-                    processed_embeddings_for_norm.append(embedding_results_from_llama.tolist())
-                else:
-                    logger.warning(f"LMH (_blocking_embed_docs_internal): Dim mismatch or wrong ndim for single np.ndarray. Expected 1D of {self.embedding_model_dimension}, got shape {embedding_results_from_llama.shape}. Using zero vector.")
-                    processed_embeddings_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
+                for item_idx, item_from_llama in enumerate(embedding_results_from_llama):
+                    # --- 尝试更通用的解包逻辑 ---
+                    current_item_unwrapped = item_from_llama
+                    while isinstance(current_item_unwrapped, list) and len(current_item_unwrapped) == 1 and isinstance(current_item_unwrapped[0], list):
+                        current_item_unwrapped = current_item_unwrapped[0]
+                    
+                    current_embedding_list: List[float] = []
+                    if isinstance(current_item_unwrapped, np.ndarray) and current_item_unwrapped.ndim == 1:
+                        current_embedding_list = current_item_unwrapped.tolist()
+                    elif isinstance(current_item_unwrapped, list) and all(isinstance(x, (float, int)) for x in current_item_unwrapped):
+                        current_embedding_list = [float(x) for x in current_item_unwrapped]
+                    else:
+                        logger.warning(f"LMH (_blocking_embed_docs_internal): Final unwrapped item {item_idx} is not List[float] or 1D np.ndarray. Type: {type(current_item_unwrapped)}. Using zero vector.")
+                    
+                    # --- 后续逻辑不变 ---
+                    if len(current_embedding_list) == self.embedding_model_dimension:
+                        processed_embeddings_for_norm.append(current_embedding_list)
+                    else:
+                        logger.warning(f"LMH (_blocking_embed_docs_internal): Embedding dim mismatch for item {item_idx}. Expected {self.embedding_model_dimension}, got {len(current_embedding_list)}. Using zero vector.")
+                        processed_embeddings_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
             else:
-                logger.error(f"LMH (_blocking_embed_docs_internal): Unexpected return type from embed() for batch: {type(embedding_results_from_llama)}. Value: {str(embedding_results_from_llama)[:200]}")
-                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
+                logger.error(f"LMH (_blocking_embed_docs_internal): Unexpected return type from embed() for batch: {type(embedding_results_from_llama)}. Expected List.")
+                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
 
             normalized_embeddings_list = l2_normalize_embeddings(processed_embeddings_for_norm)
             logger.info(f"LMH: Successfully processed {len(normalized_embeddings_list)} document embeddings (sync part).")
             return normalized_embeddings_list
         except Exception as e_sync_embed_docs:
             logger.error(f"LMH: Error during synchronous document embedding: {e_sync_embed_docs}", exc_info=True)
-            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts]
-
-    async def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if not self.embedding_model:
-            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed documents.")
-            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in texts]
-        if not texts:
-            return []
-        
-        processed_texts_for_block: List[str] = []
-        for text_item in texts:
-            if isinstance(text_item, str):
-                if text_item and not text_item.endswith("<|endoftext|>"):
-                    processed_texts_for_block.append(text_item + "<|endoftext|>")
-                else:
-                    processed_texts_for_block.append(text_item)
-            else:
-                logger.warning(f"LocalModelHandler received non-string item in texts list for embedding: {type(text_item)}.")
-                str_item = str(text_item)
-                processed_texts_for_block.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
-
-        logger.info(f"LocalModelHandler: Embedding {len(processed_texts_for_block)} documents (async via to_thread)...")
-        try:
-            return await asyncio.to_thread(self._blocking_embed_documents_internal, processed_texts_for_block)
-        except Exception as e_async_embed_docs:
-            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for document embedding: {e_async_embed_docs}", exc_info=True)
-            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in texts]
+            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block] 
 
     def _blocking_embed_query_internal(self, processed_text: str) -> List[float]:
-        """Synchronous internal method to embed a single query."""
-        if not self.embedding_model: return []
+        if not self.embedding_model: return [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
         try:
             embedding_result = self.embedding_model.embed(processed_text)
-            single_embedding_list: List[float] = []
-
-            if isinstance(embedding_result, np.ndarray):
-                if embedding_result.ndim == 1:
-                    single_embedding_list = embedding_result.tolist()
-                elif embedding_result.ndim == 2 and embedding_result.shape[0] == 1:
-                    single_embedding_list = embedding_result[0].tolist()
-                else:
-                    logger.error(f"LMH (_blocking_embed_query_internal): Unexpected NumPy array shape: {embedding_result.shape} for '{processed_text[:50]}...'")
-            elif isinstance(embedding_result, list):
-                if all(isinstance(x, (float, int)) for x in embedding_result):
-                    single_embedding_list = [float(x) for x in embedding_result]
-                elif len(embedding_result) == 1 and isinstance(embedding_result[0], list) and \
-                     all(isinstance(x, (float, int)) for x in embedding_result[0]):
-                    single_embedding_list = [float(x) for x in embedding_result[0]]
-                else:
-                    logger.error(f"LMH (_blocking_embed_query_internal): Unexpected list structure from embed() for '{processed_text[:50]}...'. Got list, but not List[float] or List[List[float]] with one element. Type of first element: {type(embedding_result[0]) if embedding_result else 'EmptyList'}.")
-            else:
-                logger.error(f"LMH (_blocking_embed_query_internal): Unexpected return type from embed() for '{processed_text[:50]}...': {type(embedding_result)}. Value: {str(embedding_result)[:100]}")
             
+            # --- 尝试更通用的解包逻辑 ---
+            current_embedding = embedding_result
+            while isinstance(current_embedding, list) and len(current_embedding) == 1 and isinstance(current_embedding[0], list):
+                current_embedding = current_embedding[0] # 持续解包，直到不再是单元素列表的列表
+            
+            single_embedding_list: List[float] = []
+            if isinstance(current_embedding, np.ndarray) and current_embedding.ndim == 1:
+                single_embedding_list = current_embedding.tolist()
+            elif isinstance(current_embedding, list) and all(isinstance(x, (float, int)) for x in current_embedding):
+                single_embedding_list = [float(x) for x in current_embedding]
+            else:
+                logger.error(f"LMH (_blocking_embed_query_internal): Final unwrapped embedding is not List[float] or 1D np.ndarray. Type: {type(current_embedding)}. Value: {str(current_embedding)[:100]} for text: '{processed_text[:50]}...'")
+
+            # --- 后续逻辑不变 ---
             if not single_embedding_list or (self.embedding_model_dimension and len(single_embedding_list) != self.embedding_model_dimension):
-                logger.warning(f"LMH (_blocking_embed_query_internal): Embedding dimension mismatch or empty. Expected {self.embedding_model_dimension}, got {len(single_embedding_list) if single_embedding_list else 'empty'}. Using zero vector. Processed text: '{processed_text[:50]}...'")
+                logger.warning(f"LMH (_blocking_embed_query_internal): Embedding dim mismatch or empty. Expected {self.embedding_model_dimension}, got {len(single_embedding_list) if single_embedding_list else 'empty'}. Using zero vector for text: '{processed_text[:50]}...'")
                 final_embedding = [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
             else:
                 normalized_embedding_list_of_list = l2_normalize_embeddings([single_embedding_list])

@@ -3543,7 +3543,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import all_proc
 
 # 导入所有资源和 IO 管理器
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
-    SentenceTransformerResource, SentenceTransformerResourceConfig,
+    GGUFEmbeddingResource, GGUFEmbeddingResourceConfig,
     ChromaDBResource, ChromaDBResourceConfig,
     LocalLLMAPIResource, LocalLLMAPIResourceConfig,
     KuzuDBReadWriteResource,
@@ -3574,13 +3574,15 @@ defs = Definitions(
     assets=all_defined_assets,
     jobs=[kuzu_kg_write_job],
     resources={
-        "embedder": SentenceTransformerResource(model_name_or_path=SentenceTransformerResourceConfig().model_name_or_path),
+        "embedder": GGUFEmbeddingResource(
+            embedding_model_path=os.getenv("EMBEDDING_MODEL_PATH"), 
+            n_ctx=int(os.getenv("EMBEDDING_N_CTX", GGUFEmbeddingResourceConfig.model_fields['n_ctx'].default)),
+            n_gpu_layers=int(os.getenv("EMBEDDING_N_GPU_LAYERS", GGUFEmbeddingResourceConfig.model_fields['n_gpu_layers'].default))
+        ),
         "chroma_db": ChromaDBResource(collection_name=ChromaDBResourceConfig().collection_name, persist_directory=ChromaDBResourceConfig().persist_directory),
         "sglang_api": LocalLLMAPIResource(api_url=LocalLLMAPIResourceConfig().api_url, default_temperature=LocalLLMAPIResourceConfig().default_temperature, default_max_new_tokens=LocalLLMAPIResourceConfig().default_max_new_tokens),
         "kuzu_readwrite_db": KuzuDBReadWriteResource(),
-        # kuzu_readonly_db 资源暂时没有被任何启用的资产使用，但保留它也无妨
         "kuzu_readonly_db": KuzuDBReadOnlyResource(),
-        # gemini_api 资源也只被评估资产使用，理论上可以注释掉，但保留也无妨
         "gemini_api": GeminiAPIResource(model_name=GeminiAPIResourceConfig().model_name, proxy_url=GeminiAPIResourceConfig().proxy_url, default_temperature=GeminiAPIResourceConfig().default_temperature, default_max_tokens=GeminiAPIResourceConfig().default_max_tokens),
         "pydantic_json_io_manager": pydantic_io_manager_instance,
     }
@@ -3980,7 +3982,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
     ExtractedRelation
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
-    SentenceTransformerResource,
+    GGUFEmbeddingResource,
     ChromaDBResource,
     LocalLLMAPIResource,
     KuzuDBReadWriteResource,
@@ -4045,19 +4047,21 @@ def clean_chunk_text_asset(
 def generate_embeddings_asset(
     context: dg.AssetExecutionContext,
     text_chunks: List[ChunkOutput],
-    embedder: SentenceTransformerResource
+    embedder: GGUFEmbeddingResource
 ) -> List[EmbeddingOutput]:
     all_embeddings: List[EmbeddingOutput] = []
     if not text_chunks:
         return all_embeddings
     chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks]
     vectors = embedder.encode(chunk_texts_to_encode)
+
     for i, chunk_input in enumerate(text_chunks):
+        model_name_for_log = embedder.embedding_model_path
         all_embeddings.append(EmbeddingOutput(
             chunk_id=chunk_input.chunk_id,
             chunk_text=chunk_input.chunk_text,
-            embedding_vector=vectors[i],
-            embedding_model_name=embedder.model_name_or_path,
+            embedding_vector=vectors[i] if i < len(vectors) and vectors[i] else [0.0] * embedder.get_embedding_dimension(), # 提供默认值以防嵌入失败
+            embedding_model_name=model_name_for_log, 
             original_chunk_metadata=chunk_input.chunk_metadata
         ))
     context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
@@ -4228,7 +4232,7 @@ async def kg_extraction_asset(
     group_name="kg_building",
     deps=[kg_extraction_asset]
 )
-def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: GGUFEmbeddingResource):
     context.log.info("--- Starting KuzuDB Schema Creation Asset ---")
     with kuzu_readwrite_db.get_connection() as conn:
         EMBEDDING_DIM = embedder.get_embedding_dimension()
@@ -4247,7 +4251,12 @@ def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: Kuzu
     group_name="kg_building",
     deps=["kuzu_schema", "kg_extractions"]
 )
-def kuzu_nodes_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGTripleSetOutput], kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: SentenceTransformerResource):
+def kuzu_nodes_asset(
+    context: dg.AssetExecutionContext, 
+    kg_extractions: List[KGTripleSetOutput], 
+    kuzu_readwrite_db: KuzuDBReadWriteResource, 
+    embedder: GGUFEmbeddingResource # <--- 修改
+):
     context.log.info("--- Starting KuzuDB Node Loading Asset ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping node loading.")
@@ -4257,12 +4266,22 @@ def kuzu_nodes_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGT
         for entity in kg_set.extracted_entities:
             node_key = (normalize_text_for_id(entity.text), entity.label.upper())
             if node_key not in unique_nodes:
+                node_text_to_embed = node_key[0]
+                embedding_vector_list = embedder.encode([node_text_to_embed]) 
+                final_embedding_for_kuzu: List[float]
+                if embedding_vector_list and embedding_vector_list[0] and len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
+                    final_embedding_for_kuzu = embedding_vector_list[0]
+                else:
+                    context.log.warning(f"Failed to generate valid embedding for node: {node_key[0]}. Using zero vector.")
+                    final_embedding_for_kuzu = [0.0] * embedder.get_embedding_dimension() 
+                    
                 unique_nodes[node_key] = {
                     "id_prop": hashlib.md5(f"{node_key[0]}_{node_key[1]}".encode('utf-8')).hexdigest(),
                     "text": node_key[0],
                     "label": node_key[1],
-                    "embedding": embedder.encode([node_key[0]])[0]
+                    "embedding": final_embedding_for_kuzu 
                 }
+
     node_data = list(unique_nodes.values())
     if not node_data:
         context.log.warning("No unique nodes found in extractions to load.")
@@ -4328,13 +4347,34 @@ def kuzu_vector_index_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db
     context.log.info("--- Starting KuzuDB Vector Index Creation Asset ---")
     with kuzu_readwrite_db.get_connection() as conn:
         try:
-            conn.execute("LOAD VECTOR;")
+            conn.execute("LOAD VECTOR;") # 确保 VECTOR 扩展已加载
             context.log.info("VECTOR extension loaded for index creation.")
         except Exception as e_load_vec:
-            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded): {e_load_vec}")
-        context.log.info("Executing vector index creation command...")
-        conn.execute("CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')")
-        context.log.info("Vector index creation command successfully executed.")
+            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded or Kuzu version handles it differently): {e_load_vec}")
+        
+        index_creation_query = "CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')"
+        context.log.info(f"Executing vector index creation command: {index_creation_query}")
+        try:
+            conn.execute(index_creation_query) # index_creation_query 应该是之前定义的
+            context.log.info("Vector index creation command successfully executed.")
+
+            context.log.info("Verifying created indexes...")
+            show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;") # <--- 修改为不带参数的调用
+            
+            indexes_df = show_indexes_result.get_as_df()
+            context.log.info(f"All indexes in the database:\n{indexes_df.to_string()}") # 打印所有索引以供调试
+
+            # 筛选出针对 ExtractedEntity 表的索引
+            entity_indexes_df = indexes_df[indexes_df['table name'] == 'ExtractedEntity'] # <--- 使用带空格的列名
+            context.log.info(f"Current indexes on ExtractedEntity:\n{entity_indexes_df.to_string()}")
+            
+            if 'entity_embedding_idx' in entity_indexes_df['index name'].tolist(): # <--- 使用带空格的列名
+                context.log.info("SUCCESS: Vector index 'entity_embedding_idx' confirmed to exist on ExtractedEntity.")
+            else:
+                context.log.error("FAILURE: Vector index 'entity_embedding_idx' NOT FOUND on ExtractedEntity after creation attempt.")
+        except Exception as e_create_index:
+            context.log.error(f"Error during vector index creation or verification: {e_create_index}", exc_info=True)
+            raise
 
 # --- 更新 all_processing_assets 列表 ---
 all_processing_assets = [
@@ -4415,63 +4455,138 @@ import dagster as dg
 from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.config import Settings
-from typing import List, Dict, Any, Union, Optional, ContextManager, Iterator,Tuple
-import logging
+from typing import List, Dict, Any, Optional, Iterator
 import httpx
-import asyncio
 import json
-# from neo4j import GraphDatabase, Driver, Result # Neo4j不再直接用于此资源
 import litellm
 import os
 import kuzu # 确保导入 kuzu
 import shutil
-from pydantic import PrivateAttr, Field as PydanticField
 from contextlib import contextmanager
-import portalocker # <--- 重新导入 portalocker
-import time # <--- 导入 time，可能用于短暂等待
+from pydantic import Field as PydanticField
+from pydantic import PrivateAttr
+import asyncio
 
-# --- SentenceTransformerResource ---
-class SentenceTransformerResourceConfig(dg.Config):
-    model_name_or_path: str = "/home/zhz/models/bge-small-zh-v1.5"
+try:
+    from zhz_rag.llm.local_model_handler import LocalModelHandler
+except ImportError as e:
+    print(f"FATAL: Could not import LocalModelHandler from zhz_rag.llm.local_model_handler. "
+          f"Please ensure 'zhz_rag' package is installed and accessible in the Dagster environment's PYTHONPATH. Error: {e}")
+    raise
 
-class SentenceTransformerResource(dg.ConfigurableResource):
-    model_name_or_path: str
-    _model: SentenceTransformer = PrivateAttr(default=None)
+
+# --- 新的 GGUFEmbeddingResource 定义 ---
+class GGUFEmbeddingResourceConfig(dg.Config):
+    embedding_model_path: str = PydanticField(
+        description="Path to the GGUF embedding model file."
+    )
+    n_ctx: int = PydanticField(
+        default=2048,
+        description="Context size for the embedding model."
+    )
+    n_gpu_layers: int = PydanticField(
+        default=0,
+        description="Number of GPU layers to offload for the embedding model."
+    )
+
+class GGUFEmbeddingResource(dg.ConfigurableResource):
+    embedding_model_path: str
+    n_ctx: int
+    n_gpu_layers: int
+
+    _model_handler: LocalModelHandler = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+
+    # --- 添加辅助方法 ---
+    def _run_async_in_new_loop(self, coro):
+        """辅助函数，在当前线程中创建一个新事件循环来运行协程。"""
+        try:
+            # 尝试获取当前线程已有的循环，如果没有则创建一个新的
+            # 这对于 Dagster 这种可能在不同线程中执行资源初始化的场景更稳健
+            loop = asyncio.get_event_loop_policy().new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            loop.close()
+            return result
+        except RuntimeError as e:
+            if "cannot run event loop while another loop is running" in str(e):
+                # 如果当前线程已经有一个正在运行的循环 (理论上 Dagster 资产执行时不会)
+                # 这种情况比较复杂，直接在同步代码中调用异步代码的最佳实践是使用 asyncio.to_thread
+                # 但这里资源方法是被同步资产调用的，我们期望它返回实际结果。
+                # 对于 Dagster 资源，更常见的是资源方法本身是同步的，如果它们需要调用异步操作，
+                # 它们需要自己管理事件循环的运行。
+                self._logger.error(f"GGUFEmbeddingResource: Nested event loop issue in _run_async_in_new_loop: {e}")
+                # 另一种选择是，如果 LocalModelHandler 的方法是纯CPU密集型，
+                # 也许 LocalModelHandler 的方法应该设计成同步的，然后在需要异步的地方用 to_thread。
+                # 但我们之前为了 LlamaCppEmbeddingFunction 的 asyncio.run 改成了 async.
+                # 这里我们先尝试创建一个新的循环。
+            self._logger.error(f"GGUFEmbeddingResource: Error running async task in new loop: {e}", exc_info=True)
+            raise # 将原始错误重新抛出
+    # --- 结束添加 ---
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"Initializing SentenceTransformer model from: {self.model_name_or_path}")
+        self._logger.info(f"Initializing GGUFEmbeddingResource...")
+        
+        if not os.path.exists(self.embedding_model_path):
+            error_msg = f"GGUF embedding model file not found at: {self.embedding_model_path}"
+            self._logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
         try:
-            self._model = SentenceTransformer(self.model_name_or_path)
-            self._logger.info("SentenceTransformer model initialized successfully.")
+            # 只初始化嵌入功能
+            self._model_handler = LocalModelHandler(
+                embedding_model_path=self.embedding_model_path,
+                n_ctx_embed=self.n_ctx,
+                n_gpu_layers_embed=self.n_gpu_layers
+            )
+            if not self._model_handler.embedding_model:
+                raise RuntimeError("Failed to load GGUF embedding model inside LocalModelHandler.")
+            
+            self._logger.info(f"GGUFEmbeddingResource initialized successfully. Model: {self.embedding_model_path}")
         except Exception as e:
-            self._logger.error(f"Failed to initialize SentenceTransformer model: {e}", exc_info=True)
+            self._logger.error(f"Failed to initialize GGUFEmbeddingResource: {e}", exc_info=True)
             raise
 
-    def encode(self, texts: List[str], batch_size: int = 32, normalize_embeddings: bool = True) -> List[List[float]]:
-        if self._model is None:
-            if self._logger:
-                self._logger.error("SentenceTransformer model is not initialized in encode method.")
-            raise RuntimeError("SentenceTransformer model is not initialized.")
+    def encode(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+        """
+        提供与 SentenceTransformer.encode 类似的接口。
+        忽略 kwargs 以保持兼容性。
+        """
+        if not hasattr(self, '_model_handler'):
+            raise RuntimeError("GGUFEmbeddingResource is not initialized. Call setup_for_execution first.")
         
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.debug(f"Encoding {len(texts)} texts. Normalize embeddings: {normalize_embeddings}")
-        
-        embeddings_np = self._model.encode(
-            texts, 
-            batch_size=batch_size, 
-            convert_to_tensor=False, 
-            normalize_embeddings=normalize_embeddings
-        )
-        return [emb.tolist() for emb in embeddings_np]
-    
-    # --- [添加开始] ---
+        logger_instance.debug(f"GGUFEmbeddingResource: Encoding {len(texts)} texts using LocalModelHandler.")
+
+        # --- 修改调用方式 ---
+        # LocalModelHandler.embed_documents 是 async def
+        # GGUFEmbeddingResource.encode 是同步方法，在 Dagster 资产中被同步调用
+        # 我们需要在这里同步地执行异步的 embed_documents 方法
+        try:
+            # 使用辅助方法来运行异步的 embed_documents
+            embeddings = self._run_async_in_new_loop(
+                self._model_handler.embed_documents(texts)
+            )
+            return embeddings
+        except Exception as e:
+             logger_instance.error(f"GGUFEmbeddingResource: Error during encode by calling LocalModelHandler: {e}", exc_info=True)
+             # 根据上游资产的期望，这里可能需要返回一个特定格式的错误，或者让异常传播
+             # 为了简单，我们先让异常传播
+             raise
+        # --- 结束修改 ---
+
+
     def get_embedding_dimension(self) -> int:
         """返回嵌入模型的维度大小。"""
-        if self._model and hasattr(self._model, 'get_sentence_embedding_dimension'):
-            return self._model.get_sentence_embedding_dimension()
-        return 512
+        if not hasattr(self, '_model_handler'):
+            raise RuntimeError("GGUFEmbeddingResource is not initialized.")
+        
+        dimension = self._model_handler.get_embedding_dimension()
+        if dimension is None:
+            raise ValueError("Could not determine embedding dimension from the loaded GGUF model.")
+        return dimension
+
 
 # --- ChromaDBResource ---
 class ChromaDBResourceConfig(dg.Config):
@@ -6260,8 +6375,8 @@ class FusionEngine:
             return # 提前返回
 
         try:
-            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_path_from_env) # <--- 修改后的行
-            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_path_from_env) # <--- 修改后的行
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_path_from_env, trust_remote_code=True) # <--- 添加参数
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_path_from_env, trust_remote_code=True) # <--- 也为模型添加
             self.reranker_model.to(self.reranker_device)
 
             if self.reranker_device == 'cuda' and hasattr(self.reranker_model, 'half'): # 检查是否有half方法
@@ -6562,6 +6677,13 @@ class KGRetriever:
         results_list: List[Dict[str, Any]] = []
         try:
             with self._get_connection() as conn:
+                if "QUERY_VECTOR_INDEX" in query.upper(): # 只在向量查询前执行
+                    try:
+                        conn.execute("LOAD VECTOR;")
+                        kg_logger.debug("LOAD VECTOR executed before QUERY_VECTOR_INDEX in _execute_cypher_query_sync.")
+                    except Exception as e_load_vec_exec:
+                        kg_logger.warning(f"Failed to execute LOAD VECTOR in _execute_cypher_query_sync (continuing anyway): {e_load_vec_exec}")
+
                 actual_params = parameters if parameters else {}
                 query_result = conn.execute(query, parameters=actual_params)
                 if hasattr(query_result, 'get_as_df'):
@@ -6660,13 +6782,15 @@ class KGRetriever:
         all_kuzu_records: List[Dict[str, Any]] = []
         
         # --- Strategy 1: KuzuDB Vector Index Search (Preferred) ---
-        if self._embedder:
+        if self._embedder: # self._embedder 现在是 LocalModelHandler 实例
             try:
-                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}' using LocalModelHandler.")
-                query_vector_list = self._embedder.embed_query(search_text_for_vector) 
-                if not query_vector_list: # LocalModelHandler.embed_query 在失败时可能返回空列表
+                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}' using LocalModelHandler via KGRetriever.")
+                query_vector_list = await self._embedder.embed_query(search_text_for_vector) # <--- 添加 await
+
+                if not query_vector_list: 
                     raise ValueError(f"Embedding generation failed in KGRetriever for vector search text: '{search_text_for_vector}'")
-                vector_search_query = """
+                
+                vector_search_query = """ 
                     CALL QUERY_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', $query_vector, $top_k_param)
                     YIELD node, distance
                     RETURN node.id_prop AS id_prop, node.text AS text, node.label AS label, distance AS _score
@@ -6718,27 +6842,39 @@ class KGRetriever:
 
                     if extracted_info.relation_hint:
                         mapped_rel_type = None
-                        if "工作" in extracted_info.relation_hint and entity_info.label.upper() == "PERSON":
-                            mapped_rel_type = "WorksAt"
-                        elif "分配" in extracted_info.relation_hint and entity_info.label.upper() == "TASK":
-                            mapped_rel_type = "AssignedTo"
-                        
+                        relation_hint_upper = extracted_info.relation_hint.upper() # 确保比较时也用大写
+                        entity_label_upper = entity_info.label.upper()
+
+                        if "WORK" in relation_hint_upper and entity_label_upper == "PERSON":
+                            mapped_rel_type = "WORKS_AT" # <--- 确保是大写
+                        elif ("ASSIGN" in relation_hint_upper or "负责" in extracted_info.relation_hint) and \
+                             (entity_label_upper == "TASK" or entity_label_upper == "PROJECT"): # 扩展适用范围
+                            mapped_rel_type = "ASSIGNED_TO" # <--- 确保是大写
+
+                        # --- 初始化变量 ---
+                        neighbor_query = None
+                        neighbor_params = None
+                        # --- 结束初始化 ---
+
                         if mapped_rel_type:
                             neighbor_query = f"""
-                                MATCH (src:ExtractedEntity {{text: $text, label: $label}})
-                                      -[r:{mapped_rel_type}]->
-                                      (tgt:ExtractedEntity)
-                                RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
-                                       label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score 
-                                LIMIT {top_k} 
-                            """ # 邻居查询的距离更大
-                            neighbor_params = {"text": entity_info.text, "label": entity_info.label.upper()}
-                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}'")
+                            MATCH (src:ExtractedEntity {{text: $text, label: $label}})
+                                  -[r:{mapped_rel_type}]-> 
+                                  (tgt:ExtractedEntity)
+                            RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
+                                   label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score LIMIT $limit_val""" # 原来的查询字符串
+                            neighbor_params = {
+                                "text": entity_info.text, 
+                                "label": entity_label_upper,
+                                "limit_val": top_k 
+                            }
+                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}' with limit_val={top_k}")
+                            # --- 只有在 neighbor_query 被定义时才执行 ---
                             neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
                             if neighbor_results:
                                 all_kuzu_records.extend(neighbor_results)
-                else:
-                    kg_logger.info(f"Skipping template-based Cypher for entity '{entity_info.text}' as LLM did not provide a label for it.")
+                        else:
+                            kg_logger.info(f"No valid relation type mapped for hint '{extracted_info.relation_hint}' and entity '{entity_info.text}'. Skipping neighbor query.")
 
         if not all_kuzu_records:
             kg_logger.info(f"No records retrieved from KuzuDB for query: '{user_query}' after all strategies.")
@@ -6882,10 +7018,12 @@ class ChromaDBRetriever:
         
         try:
             # 1. 将查询文本向量化 (现在通过 LlamaCppEmbeddingFunction)
-            query_embedding = self._embedding_function.embed_query(query_text) # <--- 修改
-            if not query_embedding: # 如果嵌入失败返回空列表
+            logger.debug(f"Calling _embedding_function.embed_query with query: '{query_text[:50]}...'")
+            query_embedding = self._embedding_function.embed_query(query_text) # <--- 确认这里有 (query_text)
+            
+            if not query_embedding: 
                 logger.error(f"Failed to generate embedding for query: {query_text[:100]}")
-                return []
+                return [] # 如果嵌入失败，直接返回空列表
             
             # 2. 在ChromaDB中查询 (include_fields_query 的逻辑不变)
             if include_fields is None:
@@ -6938,6 +7076,63 @@ class ChromaDBRetriever:
         except Exception as e:
             logger.error(f"Error during ChromaDB retrieval: {e}")
             return []
+        
+    def get_texts_by_ids(self, ids: List[str]) -> Dict[str, str]:
+        """
+        根据提供的ID列表从ChromaDB集合中获取文档的文本内容。
+
+        Args:
+            ids (List[str]): 要获取文本的文档ID列表。
+
+        Returns:
+            Dict[str, str]: 一个字典，键是文档ID，值是对应的文本内容。
+                            如果某个ID未找到或其元数据中没有文本，则对应的值可能不存在或为特定提示。
+        """
+        if not self._collection:
+            logger.error("ChromaDBRetriever: Collection is not initialized. Cannot get texts by IDs.")
+            return {id_val: "[Error: Collection not initialized]" for id_val in ids}
+        
+        if not ids:
+            return {}
+            
+        logger.info(f"ChromaDBRetriever: Getting texts for {len(ids)} IDs.")
+        
+        texts_map: Dict[str, str] = {}
+        try:
+            # ChromaDB的get方法可以接收ids列表，并指定包含哪些部分
+            # 我们需要元数据中的 'chunk_text'
+            results = self._collection.get(
+                ids=ids,
+                include=["metadatas"] # 我们只需要元数据来提取 chunk_text
+            )
+            
+            retrieved_ids = results.get("ids", [])
+            retrieved_metadatas = results.get("metadatas", [])
+            
+            if retrieved_ids and retrieved_metadatas and len(retrieved_ids) == len(retrieved_metadatas):
+                for i in range(len(retrieved_ids)):
+                    doc_id = retrieved_ids[i]
+                    metadata = retrieved_metadatas[i]
+                    if metadata and "chunk_text" in metadata:
+                        texts_map[doc_id] = metadata["chunk_text"]
+                    else:
+                        texts_map[doc_id] = f"[Content for chunk_id {doc_id} not found in metadata]"
+                        logger.warning(f"ChromaDBRetriever: Metadata or 'chunk_text' not found for ID: {doc_id}")
+            else:
+                logger.warning(f"ChromaDBRetriever: Mismatch in lengths or empty results from _collection.get(). IDs asked: {len(ids)}, IDs got: {len(retrieved_ids)}")
+                # 为所有请求的ID设置一个未找到的默认值
+                for id_val in ids:
+                    if id_val not in texts_map: # 避免覆盖已可能通过其他方式找到的
+                         texts_map[id_val] = f"[Content for chunk_id {id_val} not found after ChromaDB get()]"
+
+        except Exception as e:
+            logger.error(f"ChromaDBRetriever: Error during get_texts_by_ids: {e}", exc_info=True)
+            # 出错时，为所有请求的ID设置错误提示
+            for id_val in ids:
+                 texts_map[id_val] = f"[Error retrieving content for ID {id_val}]"
+        
+        logger.info(f"ChromaDBRetriever: Returning texts_map with {len(texts_map)} entries.")
+        return texts_map
 
 if __name__ == '__main__':
     # 简单的测试代码
@@ -6982,15 +7177,14 @@ if __name__ == '__main__':
 # 文件: zhz_rag/core_rag/retrievers/embedding_functions.py
 import logging
 from typing import List, TYPE_CHECKING, Optional, Sequence
-import numpy as np # <--- 确保导入 numpy
-
-# ChromaDB 的 EmbeddingFunction 接口通常需要 __call__ 方法
-from chromadb import Documents, Embeddings # 确保导入这些类型
+import numpy as np
+from chromadb import Documents, Embeddings
+import asyncio # 确保 asyncio 已导入
 
 if TYPE_CHECKING:
-    from zhz_rag.llm.local_model_handler import LocalModelHandler # 避免循环导入
+    from zhz_rag.llm.local_model_handler import LocalModelHandler
 
-logger = logging.getLogger(__name__) # 使用模块级 logger
+logger = logging.getLogger(__name__)
 
 def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
     """对一批嵌入向量进行L2归一化。"""
@@ -7006,62 +7200,65 @@ def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
             emb_array = np.array(emb_list, dtype=np.float32)
             norm = np.linalg.norm(emb_array)
             if norm == 0: 
-                # 对于全零向量，归一化后仍然是全零向量，或者根据需求处理
-                # logger.debug("Encountered zero-vector during L2 normalization.")
-                normalized_embeddings.append(emb_list) # 返回原始（全零）向量
+                normalized_embeddings.append(emb_list) 
             else:
                 normalized_embeddings.append((emb_array / norm).tolist())
         except Exception as e_norm:
             logger.error(f"Error during L2 normalization of an embedding: {e_norm}", exc_info=True)
-            normalized_embeddings.append(emb_list) # 出错则返回原始嵌入
+            normalized_embeddings.append(emb_list) 
     return normalized_embeddings
 
 class LlamaCppEmbeddingFunction:
     """
     一个自定义的 ChromaDB 嵌入函数，使用 LocalModelHandler (llama.cpp) 生成嵌入。
+    此类的方法设计为同步的，以符合 ChromaDB EmbeddingFunction 接口的期望。
+    它内部会同步地运行 LocalModelHandler 中的异步嵌入方法。
     """
     def __init__(self, model_handler: 'LocalModelHandler'):
         if model_handler is None or model_handler.embedding_model is None:
             logger.error("LlamaCppEmbeddingFunction initialized with no model_handler or no embedding model in handler.")
             raise ValueError("LocalModelHandler with a loaded embedding model is required.")
         self.model_handler = model_handler
-        self._dimension: Optional[int] = None # 用于缓存维度
+        self._dimension: Optional[int] = None 
         logger.info("LlamaCppEmbeddingFunction initialized.")
 
-    def __call__(self, texts: Documents) -> Embeddings:
-        """
-        ChromaDB 调用此方法来获取文本的嵌入。
-        
-        Args:
-            texts: 一个字符串列表 (ChromaDB 的 Documents 类型)。
-        
-        Returns:
-            一个嵌入列表，其中每个嵌入是浮点数列表 (ChromaDB 的 Embeddings 类型)。
-        """
-        if not isinstance(texts, list):
-            logger.error(f"LlamaCppEmbeddingFunction received texts of type {type(texts)}, expected List[str].")
-            # 尝试处理非列表输入，但这不是ChromaDB的典型用法
-            if isinstance(texts, str):
-                processed_texts_for_handler = [texts + "<|endoftext|>" if texts and not texts.endswith("<|endoftext|>") else texts]
+    def _run_async_in_new_loop(self, coro):
+        """辅助函数，在当前线程中创建一个新事件循环来运行协程。"""
+        # 这种方式适用于在一个不由asyncio管理的线程中调用异步代码（例如由to_thread启动的线程）
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as e:
+            if "cannot run event loop while another loop is running" in str(e):
+                logger.error("LlamaCppEmbeddingFunction: Attempted to run asyncio.run() from within an existing event loop. This is not allowed for this function's design.")
+                # 这种情况下，调用者（例如ChromaDBRetriever.retrieve）应该已经确保此函数在正确的线程中运行
+                # 或者 LocalModelHandler 的方法本身就需要调整为完全同步（但这会阻塞其调用者，如果调用者是异步的）
+                # 鉴于 ChromaDB 的同步接口，这是一个设计上的权衡点。
+                # 目前，我们假设此函数总是在一个可以安全创建新循环的线程中被调用。
+            raise # 将原始错误重新抛出，以便上层能看到
+
+    def __call__(self, input: Documents) -> Embeddings:
+        if not isinstance(input, list):
+            logger.error(f"LlamaCppEmbeddingFunction received input of type {type(input)}, expected List[str].")
+            if isinstance(input, str):
+                processed_texts_for_handler = [input + "<|endoftext|>" if input and not input.endswith("<|endoftext|>") else input]
             else:
-                try: # 尝试迭代，如果不行就返回对应数量的空嵌入
-                    num_texts = len(texts)
-                    return [[] for _ in range(num_texts)]
+                try: 
+                    num_items = len(input)
+                    return [[] for _ in range(num_items)]
                 except TypeError:
                     return [[]] 
-        elif not texts:
-            return [] # 如果输入列表为空，返回空嵌入列表
+        elif not input: 
+            return [] 
         else:
-            # 为每个文本添加 <|endoftext|>
             processed_texts_for_handler: List[str] = []
-            for text_item in texts:
+            for text_item in input:
                 if isinstance(text_item, str):
                     if text_item and not text_item.endswith("<|endoftext|>"):
                         processed_texts_for_handler.append(text_item + "<|endoftext|>")
                     else:
-                        processed_texts_for_handler.append(text_item) # 如果已存在或为空字符串，则直接添加
+                        processed_texts_for_handler.append(text_item) 
                 else:
-                    logger.warning(f"LlamaCppEmbeddingFunction received non-string item in texts list: {type(text_item)}. Converting to string and adding <|endoftext|>.")
+                    logger.warning(f"LlamaCppEmbeddingFunction received non-string item in input list: {type(text_item)}. Converting to string and adding <|endoftext|>.")
                     str_item = str(text_item)
                     processed_texts_for_handler.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
         
@@ -7070,37 +7267,41 @@ class LlamaCppEmbeddingFunction:
             logger.debug(f"LlamaCppEmbeddingFunction: First processed text for embedding: '{processed_texts_for_handler[0][:150]}...'")
 
         try:
-            raw_embeddings_list = self.model_handler.embed_documents(processed_texts_for_handler)
+            # 调用 LocalModelHandler 的异步 embed_documents 方法，并在此处同步运行它
+            raw_embeddings_list = self._run_async_in_new_loop(
+                self.model_handler.embed_documents(processed_texts_for_handler)
+            )
             
-            # L2 归一化
             if raw_embeddings_list:
                 logger.debug("LlamaCppEmbeddingFunction: Normalizing embeddings (L2).")
-                embeddings_list = l2_normalize_embeddings(raw_embeddings_list)
+                embeddings_list = l2_normalize_embeddings(raw_embeddings_list) # l2_normalize_embeddings 是同步的
             else:
                 embeddings_list = []
             
-            # 验证嵌入的维度是否一致
-            if embeddings_list and self._dimension is None and embeddings_list[0]: # 确保第一个嵌入不是空列表
+            if embeddings_list and self._dimension is None and embeddings_list[0]: 
                 self._dimension = len(embeddings_list[0])
                 logger.debug(f"LlamaCppEmbeddingFunction: Cached embedding dimension: {self._dimension}")
-            elif embeddings_list and embeddings_list[0] and len(embeddings_list[0]) != self._dimension: # 也检查第一个嵌入非空
+            elif embeddings_list and embeddings_list[0] and len(embeddings_list[0]) != self._dimension: 
                 logger.warning(f"LlamaCppEmbeddingFunction: Inconsistent embedding dimension detected! "
                                f"Expected {self._dimension}, got {len(embeddings_list[0])}.")
             
             return embeddings_list
         except Exception as e:
             logger.error(f"LlamaCppEmbeddingFunction: Error during embedding generation: {e}", exc_info=True)
-            return [[] for _ in texts] # 在出错时，为每个输入文本返回一个空列表
+            return [[] for _ in input]
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        return self.__call__(list(texts))
+        return self.__call__(input=list(texts))
 
     def embed_query(self, text: str) -> List[float]:
         if not text:
             return []
-        embeddings_list = self.__call__([text])
-        return embeddings_list[0] if embeddings_list and embeddings_list[0] else []
-
+        # 调用 LocalModelHandler 的异步 embed_query 方法，并在此处同步运行它
+        embedding_result = self._run_async_in_new_loop(
+            self.model_handler.embed_query(text)
+        )
+        return embedding_result if embedding_result else []
+    
     def get_dimension(self) -> Optional[int]:
         if self._dimension is None:
             self._dimension = self.model_handler.get_embedding_dimension()
@@ -8414,9 +8615,7 @@ from llama_cpp import Llama
 import asyncio
 import numpy as np
 
-
-logger = logging.getLogger(__name__) # 使用模块级logger
-# 建议在调用此模块的顶层配置日志，例如在 rag_api_service.py
+logger = logging.getLogger(__name__)
 
 def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
     if not embeddings or not isinstance(embeddings, list):
@@ -8438,20 +8637,19 @@ def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
             normalized_embeddings.append(emb_list)
     return normalized_embeddings
 
-
 class LocalModelHandler:
     def __init__(
         self,
-        llm_model_path: Optional[str] = None, # 用于文本生成的LLM模型路径
-        embedding_model_path: Optional[str] = None, # 用于文本嵌入的GGUF模型路径
+        llm_model_path: Optional[str] = None,
+        embedding_model_path: Optional[str] = None,
         n_ctx_llm: int = 4096,
-        n_gpu_layers_llm: int = 0, # 默认为0，表示CPU
-        n_ctx_embed: int = 2048, # 嵌入模型的上下文窗口
-        n_gpu_layers_embed: int = 0 # 默认为0，表示CPU
+        n_gpu_layers_llm: int = 0,
+        n_ctx_embed: int = 2048,
+        n_gpu_layers_embed: int = 0
     ):
         self.llm_model: Optional[Llama] = None
         self.embedding_model: Optional[Llama] = None
-        self.embedding_model_dimension: Optional[int] = None # 用于存储嵌入维度
+        self.embedding_model_dimension: Optional[int] = None
 
         if llm_model_path:
             try:
@@ -8460,7 +8658,7 @@ class LocalModelHandler:
                     model_path=llm_model_path,
                     n_ctx=n_ctx_llm,
                     n_gpu_layers=n_gpu_layers_llm,
-                    verbose=False 
+                    verbose=False
                 )
                 logger.info("LocalModelHandler: LLM model loaded successfully.")
             except Exception as e:
@@ -8473,120 +8671,161 @@ class LocalModelHandler:
                     model_path=embedding_model_path,
                     n_ctx=n_ctx_embed,
                     n_gpu_layers=n_gpu_layers_embed,
-                    embedding=True, # <--- 关键: 必须设置为 True for GGUF embedding models
+                    embedding=True,
                     verbose=False
                 )
                 logger.info("LocalModelHandler: Embedding model loaded successfully.")
-                # 尝试获取嵌入维度
                 try:
-                    test_emb = self.embedding_model.embed("test")
-                    self.embedding_model_dimension = len(test_emb)
-                    logger.info(f"LocalModelHandler: Determined embedding dimension: {self.embedding_model_dimension}")
+                    test_string_for_dimension = "hello world"
+                    test_embedding_vector = self.embedding_model.embed(test_string_for_dimension)
+                    determined_dimension = None
+                    if hasattr(test_embedding_vector, 'shape') and len(test_embedding_vector.shape) == 1:
+                        determined_dimension = test_embedding_vector.shape[0]
+                    elif isinstance(test_embedding_vector, list) and all(isinstance(x, (float, int)) for x in test_embedding_vector):
+                         determined_dimension = len(test_embedding_vector)
+                    
+                    if determined_dimension is None or determined_dimension < 100:
+                        logger.warning(f"LocalModelHandler: Detected embedding dimension as {determined_dimension}, which is too low. Forcing to 1024 for Qwen3-Embedding-0.6B.")
+                        self.embedding_model_dimension = 1024
+                    else:
+                        self.embedding_model_dimension = determined_dimension
+                    logger.info(f"LocalModelHandler: Final embedding dimension set to: {self.embedding_model_dimension}")
                 except Exception as e_dim:
-                    logger.warning(f"LocalModelHandler: Could not automatically determine embedding dimension: {e_dim}. It might need to be set manually or checked later.")
-                    # Qwen3-Embedding-0.6B 的维度是 1024，可以作为后备
-                    # self.embedding_model_dimension = 1024 
-                    # logger.info(f"LocalModelHandler: Assuming embedding dimension 1024 for Qwen3-Embedding-0.6B.")
-
-
+                    logger.warning(f"LocalModelHandler: Could not automatically determine embedding dimension: {e_dim}. Forcing to 1024.")
+                    self.embedding_model_dimension = 1024
+                    logger.info(f"LocalModelHandler: Final embedding dimension set to: {self.embedding_model_dimension}")
             except Exception as e:
                 logger.error(f"LocalModelHandler: Failed to load embedding model from {embedding_model_path}: {e}", exc_info=True)
         
         if not self.llm_model and not self.embedding_model:
             logger.warning("LocalModelHandler initialized without any models loaded.")
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if not self.embedding_model:
-            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed documents.")
-            return [[] for _ in texts] 
-
-        if not texts:
-            return []
-        
-        # --- 添加 <|endoftext|> ---
-        processed_texts: List[str] = []
-        for text_item in texts:
-            if isinstance(text_item, str):
-                if text_item and not text_item.endswith("<|endoftext|>"):
-                    processed_texts.append(text_item + "<|endoftext|>")
-                else:
-                    processed_texts.append(text_item)
-            else:
-                logger.warning(f"LocalModelHandler received non-string item in texts list for embedding: {type(text_item)}.")
-                str_item = str(text_item)
-                processed_texts.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
-        
-        logger.info(f"LocalModelHandler: Embedding {len(processed_texts)} documents...")
+    def _blocking_embed_documents_internal(self, processed_texts_for_block: List[str]) -> List[List[float]]:
+        if not self.embedding_model: return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
         try:
-            raw_embeddings_np_list = self.embedding_model.embed(processed_texts)
-            raw_embeddings_list = [embedding.tolist() for embedding in raw_embeddings_np_list]
-            
-            # --- L2 归一化 ---
-            normalized_embeddings_list = l2_normalize_embeddings(raw_embeddings_list)
-            
-            logger.info(f"LocalModelHandler: Successfully embedded and normalized {len(processed_texts)} documents.")
-            return normalized_embeddings_list
-        except Exception as e:
-            logger.error(f"LocalModelHandler: Error during document embedding: {e}", exc_info=True)
-            return [[] for _ in texts]
+            embedding_results_from_llama = self.embedding_model.embed(processed_texts_for_block)
+            processed_embeddings_for_norm: List[List[float]] = []
 
-    def embed_query(self, text: str) -> List[float]:
+            if not embedding_results_from_llama:
+                logger.warning("LMH (_blocking_embed_docs_internal): embed() returned None or empty for batch.")
+                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
+
+            if isinstance(embedding_results_from_llama, list):
+                if not embedding_results_from_llama:
+                     return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
+
+                for item_idx, item_from_llama in enumerate(embedding_results_from_llama):
+                    # --- 尝试更通用的解包逻辑 ---
+                    current_item_unwrapped = item_from_llama
+                    while isinstance(current_item_unwrapped, list) and len(current_item_unwrapped) == 1 and isinstance(current_item_unwrapped[0], list):
+                        current_item_unwrapped = current_item_unwrapped[0]
+                    
+                    current_embedding_list: List[float] = []
+                    if isinstance(current_item_unwrapped, np.ndarray) and current_item_unwrapped.ndim == 1:
+                        current_embedding_list = current_item_unwrapped.tolist()
+                    elif isinstance(current_item_unwrapped, list) and all(isinstance(x, (float, int)) for x in current_item_unwrapped):
+                        current_embedding_list = [float(x) for x in current_item_unwrapped]
+                    else:
+                        logger.warning(f"LMH (_blocking_embed_docs_internal): Final unwrapped item {item_idx} is not List[float] or 1D np.ndarray. Type: {type(current_item_unwrapped)}. Using zero vector.")
+                    
+                    # --- 后续逻辑不变 ---
+                    if len(current_embedding_list) == self.embedding_model_dimension:
+                        processed_embeddings_for_norm.append(current_embedding_list)
+                    else:
+                        logger.warning(f"LMH (_blocking_embed_docs_internal): Embedding dim mismatch for item {item_idx}. Expected {self.embedding_model_dimension}, got {len(current_embedding_list)}. Using zero vector.")
+                        processed_embeddings_for_norm.append([0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [])
+            else:
+                logger.error(f"LMH (_blocking_embed_docs_internal): Unexpected return type from embed() for batch: {type(embedding_results_from_llama)}. Expected List.")
+                return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block]
+
+            normalized_embeddings_list = l2_normalize_embeddings(processed_embeddings_for_norm)
+            logger.info(f"LMH: Successfully processed {len(normalized_embeddings_list)} document embeddings (sync part).")
+            return normalized_embeddings_list
+        except Exception as e_sync_embed_docs:
+            logger.error(f"LMH: Error during synchronous document embedding: {e_sync_embed_docs}", exc_info=True)
+            return [([0.0] * self.embedding_model_dimension) if self.embedding_model_dimension else [] for _ in processed_texts_for_block] 
+
+    def _blocking_embed_query_internal(self, processed_text: str) -> List[float]:
+        if not self.embedding_model: return [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
+        try:
+            embedding_result = self.embedding_model.embed(processed_text)
+            
+            # --- 尝试更通用的解包逻辑 ---
+            current_embedding = embedding_result
+            while isinstance(current_embedding, list) and len(current_embedding) == 1 and isinstance(current_embedding[0], list):
+                current_embedding = current_embedding[0] # 持续解包，直到不再是单元素列表的列表
+            
+            single_embedding_list: List[float] = []
+            if isinstance(current_embedding, np.ndarray) and current_embedding.ndim == 1:
+                single_embedding_list = current_embedding.tolist()
+            elif isinstance(current_embedding, list) and all(isinstance(x, (float, int)) for x in current_embedding):
+                single_embedding_list = [float(x) for x in current_embedding]
+            else:
+                logger.error(f"LMH (_blocking_embed_query_internal): Final unwrapped embedding is not List[float] or 1D np.ndarray. Type: {type(current_embedding)}. Value: {str(current_embedding)[:100]} for text: '{processed_text[:50]}...'")
+
+            # --- 后续逻辑不变 ---
+            if not single_embedding_list or (self.embedding_model_dimension and len(single_embedding_list) != self.embedding_model_dimension):
+                logger.warning(f"LMH (_blocking_embed_query_internal): Embedding dim mismatch or empty. Expected {self.embedding_model_dimension}, got {len(single_embedding_list) if single_embedding_list else 'empty'}. Using zero vector for text: '{processed_text[:50]}...'")
+                final_embedding = [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
+            else:
+                normalized_embedding_list_of_list = l2_normalize_embeddings([single_embedding_list])
+                final_embedding = normalized_embedding_list_of_list[0] if normalized_embedding_list_of_list and normalized_embedding_list_of_list[0] else []
+            
+            logger.info(f"LMH: Successfully processed query embedding (sync part). Dimension: {len(final_embedding)}")
+            return final_embedding
+        except Exception as e_sync_embed_query:
+            logger.error(f"LMH: Error during synchronous query embedding for '{processed_text[:50]}...': {e_sync_embed_query}", exc_info=True)
+            return [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
+
+    async def embed_query(self, text: str) -> List[float]:
         if not self.embedding_model:
             logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed query.")
             return []
-
-        if not text: # 处理空查询字符串
+        if not text: 
             return []
 
-        # --- 添加 <|endoftext|> ---
-        processed_text = text + "<|endoftext|>" if not text.endswith("<|endoftext|>") else text
-            
-        logger.info(f"LocalModelHandler: Embedding query (first 100 chars): {processed_text[:100]}...")
+        processed_text_for_block = text + "<|endoftext|>" if not text.endswith("<|endoftext|>") else text
+        logger.info(f"LocalModelHandler: Embedding query (async via to_thread, first 100 chars): {processed_text_for_block[:100]}...")
         try:
-            raw_embedding_np = self.embedding_model.embed(processed_text)
-            raw_embedding_list = [raw_embedding_np.tolist()] # embed 单个文本返回单个np数组，包装成列表给 l2_normalize_embeddings
-            
-            # --- L2 归一化 ---
-            normalized_embedding_list_of_list = l2_normalize_embeddings(raw_embedding_list)
-            
-            final_embedding = normalized_embedding_list_of_list[0] if normalized_embedding_list_of_list and normalized_embedding_list_of_list[0] else []
-
-            logger.info(f"LocalModelHandler: Successfully embedded and normalized query.")
-            return final_embedding
-        except Exception as e:
-            logger.error(f"LocalModelHandler: Error during query embedding: {e}", exc_info=True)
-            return []
-
+            return await asyncio.to_thread(self._blocking_embed_query_internal, processed_text_for_block)
+        except Exception as e_async_embed_query:
+            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for query embedding: {e_async_embed_query}", exc_info=True)
+            return [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
+    
     def get_embedding_dimension(self) -> Optional[int]:
-        """获取嵌入模型的输出维度。"""
         if self.embedding_model_dimension:
             return self.embedding_model_dimension
-        
-        # 如果初始化时未能获取，再次尝试
         if self.embedding_model:
             try:
-                test_emb = self.embedding_model.embed("dimension_check")
-                self.embedding_model_dimension = len(test_emb)
-                logger.info(f"LocalModelHandler: Determined embedding dimension on demand: {self.embedding_model_dimension}")
-                return self.embedding_model_dimension
+                # Re-attempt to determine dimension if not set during init
+                test_string_for_dimension = "dimension_check_get"
+                # Need to call the synchronous internal version if this method is called from a sync context
+                # Or, make get_embedding_dimension async too if it needs to run the async embed_query.
+                # For simplicity, assuming it might be called from sync context, we'll call a blocking version.
+                # This part is tricky if get_dimension itself is called from an async context without await.
+                # Let's assume for now it's called from a context where running a blocking call is okay
+                # or that self.embedding_model_dimension was set during __init__.
+                
+                # A safer direct call to the blocking embed for dimension check:
+                processed_text = test_string_for_dimension + "<|endoftext|>"
+                temp_embedding = self._blocking_embed_query_internal(processed_text)
+                if temp_embedding:
+                    self.embedding_model_dimension = len(temp_embedding)
+                    logger.info(f"LocalModelHandler: Determined embedding dimension on demand via get_dimension: {self.embedding_model_dimension}")
+                    return self.embedding_model_dimension
             except Exception as e:
-                logger.warning(f"LocalModelHandler: Could not determine embedding dimension on demand: {e}")
-        return None # 如果还是无法确定
+                logger.warning(f"LocalModelHandler: Could not determine embedding dimension on demand in get_dimension: {e}")
+        logger.warning(f"LocalModelHandler: get_embedding_dimension returning stored dimension: {self.embedding_model_dimension} (may be None or forced 1024)")
+        return self.embedding_model_dimension
+
 
     async def generate_text_with_local_llm(self, messages: List[Dict[str,str]], temperature: float = 0.1, max_tokens: int = 1024, stop: Optional[List[str]]=None) -> Optional[str]:
-        """
-        使用本地加载的LLM模型生成文本。
-        这个方法是异步的，因为它可能在 FastAPI 的异步端点中被调用。
-        但 llama-cpp-python 的调用本身是同步阻塞的，所以我们用 asyncio.to_thread。
-        """
         if not self.llm_model:
             logger.error("LocalModelHandler: LLM model is not loaded. Cannot generate text.")
             return None
         
         logger.info(f"LocalModelHandler: Generating text with local LLM. Message count: {len(messages)}")
         
-        # llama-cpp-python 的调用是同步的，如果在异步函数中直接调用会阻塞事件循环
-        # 所以我们使用 asyncio.to_thread 将其包装起来在单独的线程中运行
         def _blocking_llm_call():
             try:
                 completion_params = {
@@ -8597,7 +8836,7 @@ class LocalModelHandler:
                 if stop:
                     completion_params["stop"] = stop
                 
-                response = self.llm_model.create_chat_completion(**completion_params) # type: ignore
+                response = self.llm_model.create_chat_completion(**completion_params) 
                 
                 if response and response.get("choices") and response["choices"][0].get("message"):
                     content = response["choices"][0]["message"].get("content")
@@ -8608,12 +8847,12 @@ class LocalModelHandler:
                     return None
             except Exception as e_sync:
                 logger.error(f"LocalModelHandler: Error during synchronous LLM call: {e_sync}", exc_info=True)
-                return None # 或者抛出异常由上层捕获
+                return None
 
         try:
             generated_content = await asyncio.to_thread(_blocking_llm_call)
             return generated_content
-        except Exception as e_async: # 捕获 to_thread 可能抛出的其他错误
+        except Exception as e_async:
             logger.error(f"LocalModelHandler: Error in asyncio.to_thread for LLM call: {e_async}", exc_info=True)
             return None
     --- END OF FILE CONTENT ---
@@ -9879,6 +10118,7 @@ Directory: zhz_rag/stored_data/rag_interaction_logs/
   File (skipped, extension not included): rag_interactions_20250607.jsonl
   File (skipped, extension not included): rag_interactions_20250608.jsonl
   File (skipped, extension not included): rag_interactions_20250609.jsonl
+  File (skipped, extension not included): rag_interactions_20250610.jsonl
 
 Directory: zhz_rag/stored_data/evaluation_results_logs/
 
@@ -9894,6 +10134,12 @@ Directory: zhz_rag/stored_data/kuzu_default_db/
 
 Directory: zhz_rag/stored_data/chromadb_index/
   File (skipped, extension not included): chroma.sqlite3
+
+Directory: zhz_rag/stored_data/chromadb_index/353d1f75-b4d4-4a67-9d36-1c7bbcee600d/
+  File (skipped, extension not included): data_level0.bin
+  File (skipped, extension not included): header.bin
+  File (skipped, extension not included): length.bin
+  File (skipped, extension not included): link_lists.bin
 
 Directory: zhz_rag/stored_data/kuzu_test_visibility_db/
   File (skipped, extension not included): .lock
@@ -9928,7 +10174,7 @@ Directory: zhz_rag/stored_data/bm25_index/
 
   File: vocab.index.json
     --- START OF FILE CONTENT ---
-{"处理":0,"给":1,"第二个":2,"张三在":3,"张":4,"分配":5,"二个":6,"任务":7,"技术":8,"自然语言":9,"编写":10,"三":11,"语言":12,"了":13,"。":14,"的":15,"第二":16,"谷歌":17,"Alpha":18,"文档":19,"任务分配":20,"讨论":21,"项目":22,"工作":23,"自然":24,"":25}
+{"分配":0,"第二":1,"文档":2,"语言":3,"张三在":4,"第二个":5,"任务":6,"谷歌":7,"给":8,"的":9,"。":10,"项目":11,"张":12,"三":13,"任务分配":14,"Alpha":15,"讨论":16,"了":17,"编写":18,"处理":19,"技术":20,"二个":21,"自然":22,"自然语言":23,"工作":24,"":25}
     --- END OF FILE CONTENT ---
 
 
@@ -11924,72 +12170,162 @@ app = FastAPI(
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     api_logger.info(f"\n--- Received RAG query: '{query_request.query}' ---")
+
+    CONCURRENT_CPU_OPERATIONS_LIMIT = int(os.getenv("RAG_CPU_CONCURRENCY_LIMIT", "2"))
+    cpu_bound_semaphore = asyncio.Semaphore(CONCURRENT_CPU_OPERATIONS_LIMIT)
+    api_logger.info(f"Using Semaphore with limit: {CONCURRENT_CPU_OPERATIONS_LIMIT} for CPU-bound tasks.")
+
+    async def run_with_semaphore(semaphore: asyncio.Semaphore, coro_or_func_name: str, coro_obj):
+        """执行一个协程，并使用信号量控制并发。"""
+        async with semaphore:
+            api_logger.debug(f"Semaphore acquired for async task: {coro_or_func_name}")
+            result = await coro_obj
+            api_logger.debug(f"Semaphore released for async task: {coro_or_func_name}")
+            return result
     
+    async def run_sync_with_semaphore(semaphore: asyncio.Semaphore, func_name: str, func_obj, *args):
+        """在线程中执行一个同步阻塞函数，并使用信号量控制并发。"""
+        async with semaphore:
+            api_logger.debug(f"Semaphore acquired for sync task: {func_name}")
+            result = await asyncio.to_thread(func_obj, *args)
+            api_logger.debug(f"Semaphore released for sync task: {func_name}")
+            return result
+    # --- 结束添加 ---
+
     app_ctx: RAGAppContext = request.app.state.rag_context
     if not app_ctx:
+        # 这个 HTTPException 会被 FastAPI 框架捕获并返回给客户端
         raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
 
     try:
-        # Note: generate_expanded_queries and generate_answer_from_context
-        # still use the external local_llm_service. We can refactor them later
-        # to use app_ctx.model_handler if we want to merge everything. For now, it's fine.
-        expanded_queries = await generate_expanded_queries(query_request.query)
+        api_logger.info("Acquiring semaphore for 'generate_expanded_queries'...")
+        expanded_queries = await run_with_semaphore(
+            cpu_bound_semaphore,
+            "generate_expanded_queries",
+            generate_expanded_queries(query_request.query)
+        )
+        api_logger.info(f"Query expansion completed. Expanded queries: {expanded_queries}")
         
         retrieval_tasks = []
         for q_text in expanded_queries:
-            retrieval_tasks.append(app_ctx.chroma_retriever.retrieve_async(q_text, query_request.top_k_vector))
-            retrieval_tasks.append(asyncio.to_thread(app_ctx.file_bm25_retriever.retrieve, q_text, query_request.top_k_bm25))
-            retrieval_tasks.append(app_ctx.kg_retriever.retrieve(q_text, query_request.top_k_kg))
+            api_logger.debug(f"Preparing retrieval tasks for query part: '{q_text}'")
+            retrieval_tasks.append(
+                run_sync_with_semaphore(
+                    cpu_bound_semaphore, 
+                    "chroma_retriever.retrieve",
+                    app_ctx.chroma_retriever.retrieve, 
+                    q_text, 
+                    query_request.top_k_vector
+                )
+            )
+            retrieval_tasks.append(
+                run_sync_with_semaphore(
+                    cpu_bound_semaphore,
+                    "file_bm25_retriever.retrieve",
+                    app_ctx.file_bm25_retriever.retrieve, 
+                    q_text, 
+                    query_request.top_k_bm25
+                )
+            )
+            retrieval_tasks.append(
+                run_with_semaphore(
+                    cpu_bound_semaphore,
+                    "kg_retriever.retrieve",
+                    app_ctx.kg_retriever.retrieve(q_text, query_request.top_k_kg)
+                )
+            )
         
+        api_logger.info(f"Gathering {len(retrieval_tasks)} retrieval tasks...")
         results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
+        api_logger.info("All retrieval tasks completed.")
 
         all_retrieved_docs: List[RetrievedDocument] = []
         bm25_results_to_enrich: List[Dict[str, Any]] = []
 
-        for result_group in results_from_gather:
+        for i, result_group in enumerate(results_from_gather):
             if isinstance(result_group, Exception):
-                api_logger.error(f"An error occurred in a retrieval task: {result_group}", exc_info=True)
+                api_logger.error(f"An error occurred in retrieval task {i}: {result_group}", exc_info=result_group)
                 continue
             if not result_group or not isinstance(result_group, list): 
+                api_logger.warning(f"Retrieval task {i} returned empty or non-list result: {result_group}")
                 continue
 
             for item in result_group:
                 if isinstance(item, RetrievedDocument):
                     all_retrieved_docs.append(item)
-                elif isinstance(item, dict) and 'id' in item and 'score' in item:
+                elif isinstance(item, dict) and 'id' in item and 'score' in item and item.get('source_type') != "knowledge_graph_kuzu": # 确保不是KG的结果
+                    # 假设只有BM25会返回这种简单字典格式，需要内容补全
                     bm25_results_to_enrich.append(item)
+                elif isinstance(item, dict) and item.get('source_type') == "knowledge_graph_kuzu": # KG retriever 返回的是字典
+                    try:
+                        all_retrieved_docs.append(RetrievedDocument(**item))
+                    except Exception as e_kg_parse:
+                        api_logger.error(f"Failed to parse KG result into RetrievedDocument: {item}, error: {e_kg_parse}")
+
+        api_logger.info(f"Processed gather results. Total docs before BM25 enrichment: {len(all_retrieved_docs)}. BM25 results to enrich: {len(bm25_results_to_enrich)}")
         
         if bm25_results_to_enrich:
-            # [FIXED] Corrected the typo from bm2s to bm25
             bm25_ids = list(set([res['id'] for res in bm25_results_to_enrich]))
             if bm25_ids:
-                texts_map = app_ctx.chroma_retriever.get_texts_by_ids(bm25_ids)
+                api_logger.info(f"Enriching {len(bm25_ids)} BM25 results by fetching texts from ChromaDB.")
+                # get_texts_by_ids 是同步的，也需要用 to_thread + semaphore
+                texts_map = await run_sync_with_semaphore(
+                    cpu_bound_semaphore,
+                    "chroma_retriever.get_texts_by_ids",
+                    app_ctx.chroma_retriever.get_texts_by_ids,
+                    bm25_ids
+                )
+                api_logger.debug(f"Texts map from ChromaDB for BM25 enrichment: {texts_map}")
                 for res in bm25_results_to_enrich:
                     chunk_id = res['id']
-                    content_text = texts_map.get(chunk_id, f"[Content for chunk_id {chunk_id} not found]")
+                    content_text = texts_map.get(chunk_id, f"[Content for BM25 chunk_id {chunk_id} not found in ChromaDB]")
                     all_retrieved_docs.append(RetrievedDocument(
                         source_type="keyword_bm25s",
                         content=content_text,
                         score=res.get('score'),
                         metadata={"chunk_id": chunk_id}
                     ))
+                api_logger.info(f"BM25 results enriched. Total docs now: {len(all_retrieved_docs)}")
         
         if not all_retrieved_docs:
+             api_logger.info("No documents retrieved from any source after processing all tasks.")
              return HybridRAGResponse(answer=NO_ANSWER_PHRASE_ANSWER_CLEAN, original_query=query_request.query, retrieved_sources=[])
 
-        final_context_docs = await app_ctx.fusion_engine.fuse_results(all_retrieved_docs, query_request.query, query_request.top_k_final)
+        api_logger.info(f"Acquiring semaphore for 'fusion_engine.fuse_results' (total {len(all_retrieved_docs)} docs)...")
+        final_context_docs = await run_with_semaphore(
+            cpu_bound_semaphore,
+            "fusion_engine.fuse_results",
+            app_ctx.fusion_engine.fuse_results(all_retrieved_docs, query_request.query, query_request.top_k_final)
+        )
+        api_logger.info(f"Fusion engine processing completed. Final context docs: {len(final_context_docs)}")
         
         if not final_context_docs:
             final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+            api_logger.info("No relevant context found after fusion. Returning no answer.")
         else:
-            context_strings = [f"Source: {doc.source_type}, Score: {doc.rerank_score or doc.score or 0:.4f}\nContent: {doc.content}" for doc in final_context_docs]
+            context_strings = []
+            for doc in final_context_docs:
+                score_to_display = doc.score # FusionEngine 应该已经统一了score
+                score_str = f"{score_to_display:.4f}" if isinstance(score_to_display, float) else str(score_to_display if score_to_display is not None else 'N/A')
+                context_strings.append(
+                    f"Source Type: {doc.source_type}, Score: {score_str}\nContent: {doc.content}"
+                )
             fused_context = "\n\n---\n\n".join(context_strings)
-            final_answer = await generate_answer_from_context(query_request.query, fused_context) or NO_ANSWER_PHRASE_ANSWER_CLEAN
+            api_logger.info(f"Fused context for LLM (length: {len(fused_context)} chars): {fused_context[:500]}...")
+
+            api_logger.info("Acquiring semaphore for 'generate_answer_from_context'...")
+            final_answer = await run_with_semaphore(
+                cpu_bound_semaphore,
+                "generate_answer_from_context",
+                generate_answer_from_context(query_request.query, fused_context)
+            ) or NO_ANSWER_PHRASE_ANSWER_CLEAN
+            api_logger.info(f"Answer generation completed. Final answer: {final_answer[:200]}...")
 
         return HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs)
 
     except Exception as e:
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
+        # 确保即使在这里出错，也返回一个符合 HybridRAGResponse 结构或至少是FastAPI能处理的HTTPException
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 # --- Main execution block ---
