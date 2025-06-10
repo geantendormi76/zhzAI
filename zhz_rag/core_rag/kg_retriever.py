@@ -269,27 +269,25 @@ class KGRetriever:
                              (entity_label_upper == "TASK" or entity_label_upper == "PROJECT"): # 扩展适用范围
                             mapped_rel_type = "ASSIGNED_TO" # <--- 确保是大写
 
+                        # --- 初始化变量 ---
+                        neighbor_query = None
+                        neighbor_params = None
+                        # --- 结束初始化 ---
+
                         if mapped_rel_type:
-                            neighbor_query = f"""
-                        MATCH (src:ExtractedEntity {{text: $text, label: $label}})
-                              -[r:{mapped_rel_type}]-> 
-                              (tgt:ExtractedEntity)
-                        RETURN tgt.id_prop AS id_prop, tgt.text AS related_text, tgt.label AS related_label, 
-                               label(r) AS relationship_type, src.text AS source_node_text, 101.0 AS _score 
-                        LIMIT $limit_val 
-                    """
-                    neighbor_params = {
-                        "text": entity_info.text, 
-                        "label": entity_label_upper,
-                        "limit_val": top_k # <--- 将 top_k 绑定到 $limit_val
-                    }
-                    # --- 结束修改 ---
-                    kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}' with limit_val={top_k}")
-                    neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
-                    if neighbor_results:
-                        all_kuzu_records.extend(neighbor_results)
-                else:
-                    kg_logger.info(f"Skipping template-based Cypher for entity '{entity_info.text}' as LLM did not provide a label for it.")
+                            neighbor_query = f"""... LIMIT $limit_val """ # 原来的查询字符串
+                            neighbor_params = {
+                                "text": entity_info.text, 
+                                "label": entity_label_upper,
+                                "limit_val": top_k 
+                            }
+                            kg_logger.info(f"Executing template neighbor query for: '{entity_info.text}' via relation '{mapped_rel_type}' with limit_val={top_k}")
+                            # --- 只有在 neighbor_query 被定义时才执行 ---
+                            neighbor_results = self._execute_cypher_query_sync(neighbor_query, neighbor_params)
+                            if neighbor_results:
+                                all_kuzu_records.extend(neighbor_results)
+                        else:
+                            kg_logger.info(f"No valid relation type mapped for hint '{extracted_info.relation_hint}' and entity '{entity_info.text}'. Skipping neighbor query.")
 
         if not all_kuzu_records:
             kg_logger.info(f"No records retrieved from KuzuDB for query: '{user_query}' after all strategies.")

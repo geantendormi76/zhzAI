@@ -381,13 +381,34 @@ def kuzu_vector_index_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db
     context.log.info("--- Starting KuzuDB Vector Index Creation Asset ---")
     with kuzu_readwrite_db.get_connection() as conn:
         try:
-            conn.execute("LOAD VECTOR;")
+            conn.execute("LOAD VECTOR;") # 确保 VECTOR 扩展已加载
             context.log.info("VECTOR extension loaded for index creation.")
         except Exception as e_load_vec:
-            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded): {e_load_vec}")
-        context.log.info("Executing vector index creation command...")
-        conn.execute("CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')")
-        context.log.info("Vector index creation command successfully executed.")
+            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded or Kuzu version handles it differently): {e_load_vec}")
+        
+        index_creation_query = "CALL CREATE_VECTOR_INDEX('ExtractedEntity', 'entity_embedding_idx', 'embedding', metric := 'cosine')"
+        context.log.info(f"Executing vector index creation command: {index_creation_query}")
+        try:
+            conn.execute(index_creation_query) # index_creation_query 应该是之前定义的
+            context.log.info("Vector index creation command successfully executed.")
+
+            context.log.info("Verifying created indexes...")
+            show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;") # <--- 修改为不带参数的调用
+            
+            indexes_df = show_indexes_result.get_as_df()
+            context.log.info(f"All indexes in the database:\n{indexes_df.to_string()}") # 打印所有索引以供调试
+
+            # 筛选出针对 ExtractedEntity 表的索引
+            entity_indexes_df = indexes_df[indexes_df['table name'] == 'ExtractedEntity'] # <--- 使用带空格的列名
+            context.log.info(f"Current indexes on ExtractedEntity:\n{entity_indexes_df.to_string()}")
+            
+            if 'entity_embedding_idx' in entity_indexes_df['index name'].tolist(): # <--- 使用带空格的列名
+                context.log.info("SUCCESS: Vector index 'entity_embedding_idx' confirmed to exist on ExtractedEntity.")
+            else:
+                context.log.error("FAILURE: Vector index 'entity_embedding_idx' NOT FOUND on ExtractedEntity after creation attempt.")
+        except Exception as e_create_index:
+            context.log.error(f"Error during vector index creation or verification: {e_create_index}", exc_info=True)
+            raise
 
 # --- 更新 all_processing_assets 列表 ---
 all_processing_assets = [
