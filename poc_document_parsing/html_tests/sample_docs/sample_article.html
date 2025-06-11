@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>示例文章标题</title>
+    <style>
+        body { font-family: sans-serif; line-height: 1.6; margin: 20px; }
+        nav, footer { background-color: #f0f0f0; padding: 10px; text-align: center; }
+        .sidebar { float: right; width: 20%; background-color: #f9f9f9; padding: 10px; margin-left:15px;}
+        .main-content { width: 75%; }
+        pre { background-color: #eee; padding: 10px; border: 1px solid #ccc; overflow: auto; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>网站主标题 (一般不提取为文档标题)</h1>
+    </header>
+
+    <nav>
+        <a href="#">首页</a> | <a href="#">关于</a> | <a href="#">服务</a> | <a href="#">联系我们</a>
+        <p>这是导航栏内的一些无用文本。</p>
+    </nav>
+
+    <div class="main-content">
+        <article>
+            <h2>文章副标题 / H2标题</h2>
+            <p>这是文章的第一段介绍性文字。它包含一些<strong>重要信息</strong>和<em>强调内容</em>。</p>
+            
+            <h3>核心观点一 / H3标题</h3>
+            <p>详细阐述核心观点一。这里可能有一些链接 <a href="https://example.com">示例链接</a>。</p>
+            <ul>
+                <li>无序列表项1
+                    <ul>
+                        <li>嵌套无序列表项1.1</li>
+                        <li>嵌套无序列表项1.2</li>
+                    </ul>
+                </li>
+                <li>无序列表项2</li>
+            </ul>
+
+            <h3>核心观点二 / H3标题</h3>
+            <p>关于观点二的讨论，下面是一个有序列表：</p>
+            <ol>
+                <li>有序列表第一条。</li>
+                <li>有序列表第二条，包含<code>内联代码</code>。</li>
+            </ol>
+
+            <h4>更深层级的标题 / H4标题</h4>
+            <p>一些更细节的说明。</p>
+
+            <h5>表格示例 / H5标题</h5>
+            <p>以下是一个HTML表格：</p>
+            <table border="1">
+                <caption>表格标题</caption>
+                <thead>
+                    <tr>
+                        <th>姓名</th>
+                        <th>年龄</th>
+                        <th>城市</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>爱丽丝</td>
+                        <td>30</td>
+                        <td>纽约</td>
+                    </tr>
+                    <tr>
+                        <td>鲍勃</td>
+                        <td>24</td>
+                        <td>伦敦</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h6>代码块示例 / H6标题</h6>
+            <p>下面是一个Python代码块：</p>
+            <pre><code class="language-python">
+def greet(name):
+    print(f"Hello, {name}!")
+
+greet("World")
+            </code></pre>
+            
+            <blockquote>
+                <p>这是一个块引用，通常用于引述他人的话或者重要的提示信息。</p>
+                <p>块引用的第二行。</p>
+            </blockquote>
+
+            <p>文章的总结性段落。 <br> 这是一个硬换行。</p>
+            <hr>
+            <p>水平分割线后的内容。</p>
+
+        </article>
+    </div>
+
+    <aside class="sidebar">
+        <h4>相关链接</h4>
+        <ul>
+            <li><a href="#">链接1</a></li>
+            <li><a href="#">链接2</a></li>
+        </ul>
+        <p>这是侧边栏的一些附加信息，通常应被忽略。</p>
+    </aside>
+
+    <div style="clear:both;"></div>
+
+    <footer>
+        <p>© 2025 公司名称。版权所有。</p>
+        <p>页脚的附加信息，通常应被忽略。</p>
+    </footer>
+
+</body>
+</html>

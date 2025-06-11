@@ -1,10 +1,18 @@
 # zhz_rag_pipeline/ingestion_assets.py
 import dagster as dg
 import os
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
 
 # 从我们新建的pydantic模型文件中导入
 from .pydantic_models_dagster import LoadedDocumentOutput, ParsedDocumentOutput
+from .document_parsers import (
+    parse_markdown_to_structured_output,
+    parse_docx_to_structured_output,
+    parse_pdf_to_structured_output,
+    parse_xlsx_to_structured_output,
+    parse_html_to_structured_output 
+)
+
 
 class LoadDocumentsConfig(dg.Config):
     documents_directory: str = "/home/zhz/zhz_agent/data/raw_documents/" # 更新后的原始文档目录
@@ -77,63 +85,97 @@ def load_documents_asset(
 @dg.asset(
     name="parsed_documents",
     description="Parses loaded documents into text and extracts basic structure.",
-    group_name="ingestion"
-    # deps=[load_documents_asset] # <--- 删除这一行，因为依赖已通过函数参数 raw_documents 声明
+    group_name="ingestion",
+    io_manager_key="pydantic_json_io_manager" # <--- 建议为这个资产使用PydanticListJsonIOManager
+                                             # 因为它输出 List[ParsedDocumentOutput]
 )
 def parse_document_asset(
     context: dg.AssetExecutionContext, 
     raw_documents: List[LoadedDocumentOutput] 
-) -> List[ParsedDocumentOutput]:
+) -> List[ParsedDocumentOutput]: # <--- 确认返回类型是 List[ParsedDocumentOutput]
     
-    parsed_docs: List[ParsedDocumentOutput] = []
+    parsed_docs_output_list: List[ParsedDocumentOutput] = []
     context.log.info(f"Received {len(raw_documents)} documents to parse.")
 
     for doc_input in raw_documents:
-        context.log.info(f"Parsing document: {doc_input.document_path} (Type: {doc_input.file_type})")
-        parsed_text_content = ""
+        context.log.info(f"Attempting to parse document: {doc_input.document_path} (Type: {doc_input.file_type})")
         
+        parsed_output: Optional[ParsedDocumentOutput] = None # Or Optional[dict] if Pydantic fails
+        file_ext = doc_input.file_type.lower()
+        file_path = doc_input.document_path # For parsers that need path
+        
+        # Ensure raw_content is string for text-based parsers
+        content_str = ""
+        if isinstance(doc_input.raw_content, bytes):
+            try:
+                content_str = doc_input.raw_content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    content_str = doc_input.raw_content.decode('gbk') # Common fallback for Chinese text
+                except UnicodeDecodeError:
+                    context.log.error(f"Could not decode content for {doc_input.document_path}. Skipping content-based parsing.")
+                    content_str = f"[Unparsable Content: {doc_input.document_path}]"
+        elif isinstance(doc_input.raw_content, str):
+            content_str = doc_input.raw_content
+        
+        # Prepare metadata to pass to parser functions
+        current_original_metadata = doc_input.metadata.copy()
+        current_original_metadata["source_file_path"] = file_path # Ensure path is in metadata
+
         try:
-            if doc_input.file_type == ".txt":
-                if isinstance(doc_input.raw_content, bytes):
-                    parsed_text_content = doc_input.raw_content.decode('utf-8')
-                elif isinstance(doc_input.raw_content, str):
-                    parsed_text_content = doc_input.raw_content
-                else:
-                    # 抛出更具体的错误或记录并跳过
-                    context.log.error(f"Unexpected raw_content type for .txt file: {type(doc_input.raw_content)} in {doc_input.document_path}")
-                    parsed_text_content = f"[Error: Unexpected content type {type(doc_input.raw_content)}]"
+            if file_ext == ".md":
+                parsed_output = parse_markdown_to_structured_output(content_str, current_original_metadata)
+            elif file_ext == ".docx":
+                parsed_output = parse_docx_to_structured_output(file_path, current_original_metadata)
+            elif file_ext == ".pdf":
+                parsed_output = parse_pdf_to_structured_output(file_path, current_original_metadata)
+            elif file_ext == ".xlsx":
+                parsed_output = parse_xlsx_to_structured_output(file_path, current_original_metadata)
+            elif file_ext in [".html", ".htm"]:
+                parsed_output = parse_html_to_structured_output(content_str, current_original_metadata)
+            else: # Fallback for .txt and other unknown types
+                context.log.warning(f"Unsupported file type '{file_ext}' for structured parsing, treating as plain text: {file_path}")
+                # For plain text, elements list will contain a single NarrativeTextElement
+                from .pydantic_models_dagster import NarrativeTextElement # Local import to avoid top-level issues
+                elements = [NarrativeTextElement(text=content_str)]
+                parsed_output = ParsedDocumentOutput(
+                    parsed_text=content_str,
+                    elements=elements, # type: ignore
+                    original_metadata=current_original_metadata
+                )
 
-            # TODO: Add parsers for other file types like .pdf, .docx here
-            # elif doc_input.file_type == ".pdf":
-            #     parsed_text_content = "[PDF parsing not yet implemented]"
-            #     context.log.warning(f"PDF parsing not yet implemented for {doc_input.document_path}")
+            if parsed_output:
+                # Ensure parsed_output is indeed a ParsedDocumentOutput if Pydantic models were loaded
+                # If not (e.g., due to ImportError in document_parsers), it might be a dict.
+                # The io_manager will handle Pydantic models. If it's a dict, PickledObject IO manager will work.
+                parsed_docs_output_list.append(parsed_output) # type: ignore
+                context.log.info(f"Successfully parsed (or created placeholder for): {file_path}")
             else:
-                parsed_text_content = f"[Unsupported file type: {doc_input.file_type}]"
-                context.log.warning(f"Unsupported file type '{doc_input.file_type}' for parsing: {doc_input.document_path}")
+                context.log.error(f"Parser returned None for {file_path}. Adding a fallback error entry.")
+                from .pydantic_models_dagster import NarrativeTextElement
+                elements = [NarrativeTextElement(text=f"[Parsing Error for {file_path}]")]
+                parsed_docs_output_list.append(ParsedDocumentOutput(
+                    parsed_text=f"[Parsing Error for {file_path}]",
+                    elements=elements, # type: ignore
+                    original_metadata=current_original_metadata
+                ))
 
-            parsed_output = ParsedDocumentOutput(
-                parsed_text=parsed_text_content,
-                # document_structure is None by default
-                original_metadata=doc_input.metadata 
-            )
-            parsed_docs.append(parsed_output)
-            context.log.info(f"Successfully (or with placeholder) parsed: {doc_input.document_path}")
-
-        except Exception as e:
-            context.log.error(f"Failed to parse document {doc_input.document_path}: {e}")
-            parsed_output = ParsedDocumentOutput(
-                parsed_text=f"[Error parsing document: {str(e)}]",
-                original_metadata=doc_input.metadata
-            )
-            parsed_docs.append(parsed_output)
-
-    if parsed_docs:
+        except Exception as e_parse_asset:
+            context.log.error(f"Critical error during parsing asset for {file_path}: {e_parse_asset}", exc_info=True)
+            from .pydantic_models_dagster import NarrativeTextElement
+            elements = [NarrativeTextElement(text=f"[Critical Parsing Exception for {file_path}: {str(e_parse_asset)}]")]
+            parsed_docs_output_list.append(ParsedDocumentOutput(
+                parsed_text=f"[Critical Parsing Exception for {file_path}: {str(e_parse_asset)}]",
+                elements=elements, # type: ignore
+                original_metadata=current_original_metadata
+            ))
+            
+    if parsed_docs_output_list:
         context.add_output_metadata(
             metadata={
-                "num_documents_parsed": len(parsed_docs),
-                "first_parsed_doc_filename": parsed_docs[0].original_metadata.get("filename", "N/A") if parsed_docs else "N/A"
+                "num_documents_processed_for_parsing": len(raw_documents),
+                "num_parsed_document_outputs_generated": len(parsed_docs_output_list),
             }
         )
-    return parsed_docs
-
+    return parsed_docs_output_list
 all_ingestion_assets = [load_documents_asset, parse_document_asset]
