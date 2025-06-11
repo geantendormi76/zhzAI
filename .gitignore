@@ -103,5 +103,6 @@ Thumbs.db
 
 local_models/
 stored_data/
+manual_tests
 
-现阶段核心代码.txt
+project_snapshot.txt
