@@ -8,12 +8,14 @@ import httpx
 import json
 import litellm
 import os
-import kuzu # 确保导入 kuzu
 import shutil
 from contextlib import contextmanager
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr
 import asyncio
+import time	
+import gc
+import duckdb
 
 try:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
@@ -317,161 +319,59 @@ class GeminiAPIResource(dg.ConfigurableResource):
             logger_instance.error(f"Error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
         return raw_output_text
 
-
-class KuzuDBReadWriteResource(dg.ConfigurableResource):
-    db_path_str: str = PydanticField(
-        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"), # 这是期望相对于 ZHZ_AGENT_PROJECT_ROOT 的路径
-        description="Path to the KuzuDB database directory."
+class DuckDBResource(dg.ConfigurableResource):
+    db_file_path: str = PydanticField(
+        default=os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "duckdb_knowledge_graph.db"),
+        description="Path to the DuckDB database file for the knowledge graph."
     )
+    # 可以在这里添加其他配置，例如 read_only, vss_persistence 等
 
+    _conn: Optional[duckdb.DuckDBPyConnection] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
-    _resolved_db_path: str = PrivateAttr()
-    _db: Optional[kuzu.Database] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-
-        project_root_from_env = os.getenv("ZHZ_AGENT_PROJECT_ROOT")
-        python_path_env = os.getenv("PYTHONPATH")
+        db_path_to_use = self.db_file_path
         
-        determined_project_root = None
+        # 确保目录存在
+        db_dir = os.path.dirname(db_path_to_use)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            self._logger.info(f"Created directory for DuckDB database: {db_dir}")
 
-        if project_root_from_env and os.path.isdir(os.path.join(project_root_from_env, "zhz_rag")):
-            determined_project_root = project_root_from_env
-            self._logger.info(f"KuzuDBReadWriteResource: Using ZHZ_AGENT_PROJECT_ROOT: {determined_project_root}")
-        elif python_path_env:
-            # PYTHONPATH 可能包含多个路径，用 os.pathsep 分隔 (Linux是':', Windows是';')
-            first_python_path = python_path_env.split(os.pathsep)[0]
-            if os.path.isdir(os.path.join(first_python_path, "zhz_rag")):
-                determined_project_root = first_python_path
-                self._logger.info(f"KuzuDBReadWriteResource: Using first path from PYTHONPATH: {determined_project_root}")
-            else: # Fallback if PYTHONPATH doesn't seem right
-                determined_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-                self._logger.warning(f"KuzuDBReadWriteResource: PYTHONPATH ('{python_path_env}') does not seem to point to project root. Falling back to relative path guess: {determined_project_root}")
-        else: # Fallback if no relevant env var
-            determined_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-            self._logger.warning(f"KuzuDBReadWriteResource: Neither ZHZ_AGENT_PROJECT_ROOT nor PYTHONPATH found for project root. Falling back to relative path guess: {determined_project_root}")
-
-        # 确保我们猜的根目录至少包含 zhz_rag 子目录，这是一个基本检查
-        if not os.path.isdir(os.path.join(determined_project_root, "zhz_rag")):
-            self._logger.error(f"KuzuDBReadWriteResource: CRITICAL - Could not reliably determine project root. Path '{determined_project_root}' does not contain 'zhz_rag'. Please set ZHZ_AGENT_PROJECT_ROOT environment variable to '/home/zhz/zhz_agent'.")
-            # 在这种情况下，后续操作很可能会失败，但我们还是构造一个路径以暴露问题
-        
-        project_root_for_dagster = determined_project_root
-        # --- 修改结束 ---
-        
-        self._logger.info(f"KuzuDBReadWriteResource: Determined project_root_for_dagster: {project_root_for_dagster}")
-
-        if os.path.isabs(self.db_path_str):
-            self._resolved_db_path = self.db_path_str
-        else:
-            self._resolved_db_path = os.path.join(project_root_for_dagster, self.db_path_str)
-        
-        self._logger.info(
-            f"KuzuDBReadWriteResource: FINAL Resolved DB path is '{os.path.abspath(self._resolved_db_path)}'."
-        )
-
-        # --- 确保每次都清理并重建数据库目录 ---
-        if os.path.exists(self._resolved_db_path):
-            shutil.rmtree(self._resolved_db_path)
-            self._logger.info(f"Cleaned up existing database directory: {self._resolved_db_path}")
-        os.makedirs(self._resolved_db_path, exist_ok=True)
-        self._logger.info(f"KuzuDBReadWriteResource: Recreated database directory: {self._resolved_db_path}")
-        # --- 清理逻辑结束 ---
-
-        # --- 添加开始：准备本地扩展 ---
-        manual_extension_source_path = os.getenv("KUZU_VECTOR_EXTENSION_PATH", "/home/zhz/.kuzu/extension/0.10.0/linux_amd64/vector/libvector.kuzu_extension") # 从环境变量读取或使用默认
-        
-        extensions_dir_in_db = os.path.join(self._resolved_db_path, "extensions")
-        os.makedirs(extensions_dir_in_db, exist_ok=True)
-        self._logger.info(f"KuzuDBReadWriteResource: Ensured extensions directory exists: {extensions_dir_in_db}")
-
-        if os.path.exists(manual_extension_source_path):
-            target_path_vector = os.path.join(extensions_dir_in_db, "vector.kuzu_extension")
+        self._logger.info(f"Attempting to connect to DuckDB at: {db_path_to_use}")
+        try:
+            self._conn = duckdb.connect(database=db_path_to_use, read_only=False)
+            self._logger.info(f"Successfully connected to DuckDB: {db_path_to_use}")
+            # 尝试加载vss扩展并开启持久化 (如果vss已通过FORCE INSTALL安装到该DB文件，则LOAD即可)
             try:
-                shutil.copy2(manual_extension_source_path, target_path_vector)
-                self._logger.info(f"KuzuDBReadWriteResource: Copied vector extension to '{target_path_vector}'")
-            except Exception as e_copy:
-                self._logger.error(f"KuzuDBReadWriteResource: ERROR - Could not copy vector extension: {e_copy}")
-        else:
-            self._logger.error(f"KuzuDBReadWriteResource: ERROR - Manual vector extension file not found at '{manual_extension_source_path}'. LOAD VECTOR will likely fail if Kuzu doesn't find it elsewhere.")
-        # --- 添加结束 ---
-
-        try:
-            self._db = kuzu.Database(self._resolved_db_path)
-            self._logger.info(f"Shared kuzu.Database object CREATED successfully for the entire run.")
+                self._conn.execute("LOAD vss;")
+                self._conn.execute("SET hnsw_enable_experimental_persistence=true;")
+                self._logger.info("DuckDB: VSS extension loaded and HNSW persistence enabled.")
+            except Exception as e_vss_setup:
+                self._logger.warning(f"DuckDB: Failed to setup VSS extension on connect: {e_vss_setup}. "
+                                     f"This might be okay if already set or not needed for this operation.")
         except Exception as e:
-            self._logger.error(f"Failed to initialize shared kuzu.Database object: {e}", exc_info=True)
+            self._logger.error(f"Failed to connect to DuckDB at {db_path_to_use}: {e}", exc_info=True)
             raise
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger.info(f"Tearing down KuzuDBReadWriteResource for run...")
-        if self._db is not None:
-            self._db = None # KuzuDB 对象依赖析构函数来关闭数据库和释放锁
-            self._logger.info("Shared kuzu.Database object dereferenced, relying on destructor to close and release lock.")
-        else:
-            self._logger.info("Shared kuzu.Database object was already None during teardown.")
-        self._logger.info("KuzuDBReadWriteResource teardown complete.")
+        if self._conn:
+            self._logger.info(f"Closing DuckDB connection to: {self.db_file_path}")
+            self._conn.close()
+            self._conn = None
+        self._logger.info("DuckDBResource teardown complete.")
 
     @contextmanager
-    def get_connection(self) -> Iterator[kuzu.Connection]:
-        if self._db is None:
-            raise ConnectionError("Shared KuzuDB Database object is not initialized. This should not happen if setup_for_execution was successful.")
+    def get_connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        if not self._conn:
+            # 这种情况下，我们应该在 setup_for_execution 中确保连接已建立
+            # 或者在这里尝试重新连接，但这会使逻辑复杂化。
+            # Dagster 资源通常期望 setup_for_execution 已经准备好了资源。
+            self._logger.error("DuckDB connection not established during setup. Cannot yield connection.")
+            raise ConnectionError("DuckDB connection was not established by setup_for_execution.")
         
-        conn = None
-        try:
-            conn = kuzu.Connection(self._db)
-            self._logger.debug("New kuzu.Connection obtained from shared Database object.")
-            yield conn
-        finally:
-            if conn is not None:
-                self._logger.debug("kuzu.Connection from shared DB object is going out of scope.")
-                
-class KuzuDBReadOnlyResource(dg.ConfigurableResource):
-    db_path_str: str = PydanticField(
-        default=os.path.join("zhz_rag", "stored_data", "kuzu_default_db"),
-        description=(
-            "Path to the KuzuDB database directory for read-only access. "
-            "Can be relative to the project root (if not starting with '/') or absolute."
-        )
-    )
-    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
-    _resolved_db_path: str = PrivateAttr()
-
-    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = context.log
-        if os.path.isabs(self.db_path_str):
-            self._resolved_db_path = self.db_path_str
-        else:
-            self._resolved_db_path = os.path.abspath(self.db_path_str)
-
-        self._logger.info(f"KuzuDBReadOnlyResource setup: resolved_path='{self._resolved_db_path}'")
-        if not os.path.exists(self._resolved_db_path):
-            self._logger.error(f"KuzuDB path {self._resolved_db_path} does not exist for ReadOnly access. Operations will likely fail.")
-
-    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.info("KuzuDBReadOnlyResource teardown complete.")
-
-    @contextmanager
-    def get_readonly_connection(self) -> Iterator[kuzu.Connection]:
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        db_instance: Optional[kuzu.Database] = None
-        logger_instance.info(f"Attempting to open KuzuDB(RO) at {self._resolved_db_path} for readonly session.")
-        
-        if not os.path.exists(self._resolved_db_path):
-            logger_instance.error(f"KuzuDB directory {self._resolved_db_path} not found for read-only access.")
-            raise FileNotFoundError(f"KuzuDB directory {self._resolved_db_path} not found for read-only access.")
-
-        try:
-            db_instance = kuzu.Database(self._resolved_db_path, read_only=True)
-            logger_instance.info(f"KuzuDB(RO) session opened at {self._resolved_db_path}")
-            conn = kuzu.Connection(db_instance)
-            yield conn
-        except Exception as e:
-            logger_instance.error(f"Error during KuzuDB(RO) session: {e}", exc_info=True)
-            raise
-        finally:
-            if db_instance:
-                del db_instance
-                logger_instance.info(f"KuzuDB(RO) Database object for session at {self._resolved_db_path} dereferenced (closed).")
+        # 简单的版本：直接 yield 已经建立的连接
+        # 注意：这种共享连接的方式对于并发的 Dagster ops (如果使用非 in_process_executor) 需要小心
+        # 但对于 in_process_executor 和我们的流水线是安全的。
+        yield self._conn

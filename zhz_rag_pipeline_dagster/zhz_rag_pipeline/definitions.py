@@ -6,55 +6,46 @@ from dagster import (
     define_asset_job,
     Definitions,
     in_process_executor,
-    AssetSelection  # 保持导入以备后用
+    AssetSelection
 )
 
-# 导入所有资产列表
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.ingestion_assets import all_ingestion_assets
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.processing_assets import all_processing_assets
 
-# 导入所有资源和 IO 管理器
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     GGUFEmbeddingResource, GGUFEmbeddingResourceConfig,
     ChromaDBResource, ChromaDBResourceConfig,
     LocalLLMAPIResource, LocalLLMAPIResourceConfig,
-    KuzuDBReadWriteResource,
-    KuzuDBReadOnlyResource,
+    DuckDBResource,
     GeminiAPIResource, GeminiAPIResourceConfig
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.custom_io_managers import PydanticListJsonIOManager
 
-# 1. 定义一个包含项目中所有资产的列表
 all_defined_assets = all_ingestion_assets + all_processing_assets
 
-# 2. [最终的、最简单的作业定义]
-#    直接选择所有资产。因为我们使用了 in_process_executor，
-#    并且 KuzuDB 资源管理现在是正确的，所以即使选择了所有资产，
-#    它们也会被串行执行，不会有并发问题。
-#    当您只想运行 KuzuDB 相关的部分时，可以在 UI 中选择一个子集。
-kuzu_kg_write_job = define_asset_job(
-    name="kuzu_kg_write_job",
-    selection=AssetSelection.all(), # 选择 all_defined_assets 中的所有资产
+# --- 修改作业名称 ---
+# 将 kuzu_kg_write_job 重命名为 duckdb_kg_build_job
+duckdb_kg_build_job = define_asset_job( # <--- 修改变量名
+    name="duckdb_kg_build_job",         # <--- 修改作业的实际名称
+    selection=AssetSelection.all(),
     executor_def=in_process_executor
 )
+# --- 修改结束 ---
 
-# 3. 实例化 IO 管理器
 pydantic_io_manager_instance = PydanticListJsonIOManager()
 
-# 4. 将所有定义组合成最终的 Definitions 对象
 defs = Definitions(
     assets=all_defined_assets,
-    jobs=[kuzu_kg_write_job],
+    jobs=[duckdb_kg_build_job], # <--- 在 jobs 列表中使用新的作业变量名
     resources={
         "embedder": GGUFEmbeddingResource(
-            embedding_model_path=os.getenv("EMBEDDING_MODEL_PATH"), 
+            embedding_model_path=os.getenv("EMBEDDING_MODEL_PATH"),
             n_ctx=int(os.getenv("EMBEDDING_N_CTX", GGUFEmbeddingResourceConfig.model_fields['n_ctx'].default)),
             n_gpu_layers=int(os.getenv("EMBEDDING_N_GPU_LAYERS", GGUFEmbeddingResourceConfig.model_fields['n_gpu_layers'].default))
         ),
         "chroma_db": ChromaDBResource(collection_name=ChromaDBResourceConfig().collection_name, persist_directory=ChromaDBResourceConfig().persist_directory),
         "sglang_api": LocalLLMAPIResource(api_url=LocalLLMAPIResourceConfig().api_url, default_temperature=LocalLLMAPIResourceConfig().default_temperature, default_max_new_tokens=LocalLLMAPIResourceConfig().default_max_new_tokens),
-        "kuzu_readwrite_db": KuzuDBReadWriteResource(),
-        "kuzu_readonly_db": KuzuDBReadOnlyResource(),
+        "duckdb_kg": DuckDBResource(),
         "gemini_api": GeminiAPIResource(model_name=GeminiAPIResourceConfig().model_name, proxy_url=GeminiAPIResourceConfig().proxy_url, default_temperature=GeminiAPIResourceConfig().default_temperature, default_max_tokens=GeminiAPIResourceConfig().default_max_tokens),
         "pydantic_json_io_manager": pydantic_io_manager_instance,
     }

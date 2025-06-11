@@ -224,7 +224,7 @@ class LocalModelHandler:
             logger.error("LocalModelHandler: LLM model is not loaded. Cannot generate text.")
             return None
         
-        logger.info(f"LocalModelHandler: Generating text with local LLM. Message count: {len(messages)}")
+        logger.info(f"LocalModelHandler: Generating text with local ·LLM. Message count: {len(messages)}")
         
         def _blocking_llm_call():
             try:

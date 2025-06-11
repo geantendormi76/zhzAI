@@ -80,41 +80,31 @@ async def lifespan(app: FastAPI):
     embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH")
     chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
     bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
-    kuzu_db_path_env = os.getenv("KUZU_DB_PATH") # <--- 获取环境变量
+    # --- 修改开始 ---
+    # 使用 DUCKDB_KG_FILE_PATH 环境变量
+    duckdb_file_path_for_api = os.getenv("DUCKDB_KG_FILE_PATH") 
+    # --- 修改结束 ---
 
-    if not all([embedding_gguf_model_path, chroma_persist_dir, bm25_index_dir, kuzu_db_path_env]): # <--- 使用 kuzu_db_path_env
-        api_logger.critical("One or more critical paths (embedding, chroma, bm25, kuzu) are not set in environment variables!")
-        app.state.rag_context = None 
-        yield 
+    # --- 修改环境变量检查逻辑 ---
+    required_paths_for_log = {
+        "EMBEDDING_MODEL_PATH": embedding_gguf_model_path,
+        "CHROMA_PERSIST_DIRECTORY": chroma_persist_dir,
+        "BM25_INDEX_DIRECTORY": bm25_index_dir,
+        "DUCKDB_KG_FILE_PATH": duckdb_file_path_for_api
+        # LOCAL_LLM_GGUF_MODEL_PATH 是可选的，如果 LocalModelHandler 只用于嵌入
+        # RERANKER_MODEL_PATH 由 FusionEngine 内部处理
+    }
+    missing_paths = [name for name, path in required_paths_for_log.items() if not path]
+
+    if missing_paths:
+        api_logger.critical(f"Critical environment variables not set: {', '.join(missing_paths)}")
+        for name, path_val in required_paths_for_log.items():
+            api_logger.debug(f"Env check: {name} = {path_val}")
+        app.state.rag_context = None
+        yield
         return
 
     try:
-        # --- 添加开始：准备本地扩展 for RAG API Service ---
-        if kuzu_db_path_env: # 确保路径存在
-            manual_extension_source_path_api = os.getenv("KUZU_VECTOR_EXTENSION_PATH", "/home/zhz/.kuzu/extension/0.10.0/linux_amd64/vector/libvector.kuzu_extension")
-            
-            extensions_dir_in_api_db = os.path.join(kuzu_db_path_env, "extensions") # kuzu_db_path_env 应该是绝对路径
-            os.makedirs(extensions_dir_in_api_db, exist_ok=True)
-            api_logger.info(f"RAG API Service: Ensured extensions directory exists: {extensions_dir_in_api_db}")
-
-            if os.path.exists(manual_extension_source_path_api):
-                target_path_vector_api = os.path.join(extensions_dir_in_api_db, "vector.kuzu_extension")
-                try:
-                    # 只有当目标文件不存在或源文件更新时才复制，避免不必要的IO
-                    if not os.path.exists(target_path_vector_api) or \
-                       os.path.getmtime(manual_extension_source_path_api) > os.path.getmtime(target_path_vector_api):
-                        shutil.copy2(manual_extension_source_path_api, target_path_vector_api)
-                        api_logger.info(f"RAG API Service: Copied/Updated vector extension to '{target_path_vector_api}'")
-                    else:
-                        api_logger.info(f"RAG API Service: Vector extension already up-to-date at '{target_path_vector_api}'")
-                except Exception as e_copy_api:
-                    api_logger.error(f"RAG API Service: ERROR - Could not copy vector extension for API: {e_copy_api}")
-            else:
-                api_logger.error(f"RAG API Service: ERROR - Manual vector extension file not found at '{manual_extension_source_path_api}'. KGRetriever might fail.")
-        else:
-            api_logger.error("RAG API Service: KUZU_DB_PATH not set, cannot prepare local extensions for KGRetriever.")
-        # --- 添加结束 ---
-
         # 1. 初始化 LocalModelHandler
         #    LocalModelHandler 现在负责加载GGUF嵌入模型和可选的GGUF LLM模型
         api_logger.info(f"Initializing LocalModelHandler with Embedding GGUF: {embedding_gguf_model_path}")
@@ -147,15 +137,23 @@ async def lifespan(app: FastAPI):
         api_logger.info(f"Initializing FileBM25Retriever with index_directory: {bm25_index_dir}")
         file_bm25_retriever_instance = FileBM25Retriever(index_directory_path=bm25_index_dir)
 
-        # 5. 初始化 KGRetriever
-        #    KGRetriever 的 __init__ 需要一个 embedder 参数用于其内部的向量搜索。
-        #    我们可以直接将 model_handler 传递给它，KGRetriever 内部应调用 model_handler.embed_query()
-        api_logger.info(f"Initializing KGRetriever with db_path: {kuzu_db_path_env}") # 使用 kuzu_db_path_env
+        # 5. 初始化 KGRetriever (使用 DuckDB)
+        # KGRetriever 现在会从环境变量 DUCKDB_KG_FILE_PATH 或其内部默认值获取路径
+        # 我们需要确保 LocalModelHandler (model_handler) 被正确传递
+        duckdb_file_path_for_api = os.getenv(
+            "DUCKDB_KG_FILE_PATH", 
+            os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "duckdb_knowledge_graph.db")
+        )
+        api_logger.info(f"Initializing KGRetriever (DuckDB) with db_file_path: {duckdb_file_path_for_api}")
+        
+        # 确保 KGRetriever 的 __init__ 现在接受 db_file_path (如果不是仅依赖环境变量)
+        # 并且它内部会进行必要的 DuckDB 连接和 vss 设置检查
         kg_retriever_instance = KGRetriever(
-            db_path=kuzu_db_path_env, # 使用 kuzu_db_path_env
+            db_file_path=duckdb_file_path_for_api, # 显式传递路径，覆盖其内部默认值（如果需要）
             embedder=model_handler 
         )
-
+        api_logger.info("KGRetriever (DuckDB) initialized for RAG API Service.")
+        
         # 6. 初始化 FusionEngine (它内部会从env读取RERANKER_MODEL_PATH)
         api_logger.info("Initializing FusionEngine...")
         fusion_engine_instance = FusionEngine(logger=api_logger)

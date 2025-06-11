@@ -18,9 +18,8 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     GGUFEmbeddingResource,
     ChromaDBResource,
+    DuckDBResource,
     LocalLLMAPIResource,
-    KuzuDBReadWriteResource,
-    KuzuDBReadOnlyResource
 )
 import jieba
 import bm25s
@@ -29,8 +28,6 @@ import numpy as np
 import os
 import time
 
-# --- text_chunks, text_embeddings, vector_store_embeddings, keyword_index 资产定义保持不变 ---
-# (为了保持代码完整，这里包含了所有资产的代码)
 
 class TextChunkerConfig(dg.Config):
     chunk_size: int = 500
@@ -95,7 +92,7 @@ def generate_embeddings_asset(
             chunk_id=chunk_input.chunk_id,
             chunk_text=chunk_input.chunk_text,
             embedding_vector=vectors[i] if i < len(vectors) and vectors[i] else [0.0] * embedder.get_embedding_dimension(), # 提供默认值以防嵌入失败
-            embedding_model_name=model_name_for_log, 
+            embedding_model_name=model_name_for_log,
             original_chunk_metadata=chunk_input.chunk_metadata
         ))
     context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
@@ -261,198 +258,324 @@ async def kg_extraction_asset(
 # --- KuzuDB 构建资产链 ---
 
 @dg.asset(
-    name="kuzu_schema",
-    description="Creates the base schema (node and rel tables) in KuzuDB.",
+    name="duckdb_schema", # <--- 修改资产名称
+    description="Creates the base schema (node and relation tables) in DuckDB.",
     group_name="kg_building",
-    deps=[kg_extraction_asset]
+    # deps=[kg_extraction_asset] # 保持依赖，确保在提取之后创建schema (逻辑上)
+                                 # 虽然schema创建本身不直接使用提取结果，但流水线顺序上合理
 )
-def kuzu_schema_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource, embedder: GGUFEmbeddingResource):
-    context.log.info("--- Starting KuzuDB Schema Creation Asset ---")
-    with kuzu_readwrite_db.get_connection() as conn:
-        EMBEDDING_DIM = embedder.get_embedding_dimension()
-        conn.execute(
-            f"CREATE NODE TABLE IF NOT EXISTS ExtractedEntity (id_prop STRING, text STRING, label STRING, embedding FLOAT[{EMBEDDING_DIM}], PRIMARY KEY (id_prop))"
-        )
-        # --- [核心修复] 将关系表名改为全大写，以匹配后续 MERGE 操作 ---
-        conn.execute("CREATE REL TABLE IF NOT EXISTS WORKS_AT (FROM ExtractedEntity TO ExtractedEntity)")
-        conn.execute("CREATE REL TABLE IF NOT EXISTS ASSIGNED_TO (FROM ExtractedEntity TO ExtractedEntity)")
-        # --- [修复结束] ---
-        context.log.info("KuzuDB Schema DDL commands executed successfully.")
+def duckdb_schema_asset(context: dg.AssetExecutionContext, duckdb_kg: DuckDBResource, embedder: GGUFEmbeddingResource): # <--- 修改函数名和资源参数
+    context.log.info("--- Starting DuckDB Schema Creation Asset ---")
+    
+    # 获取嵌入维度，与KuzuDB时类似
+    EMBEDDING_DIM = embedder.get_embedding_dimension()
+    if not EMBEDDING_DIM:
+        raise ValueError("Could not determine embedding dimension from GGUFEmbeddingResource.")
+
+    node_table_ddl = f"""
+    CREATE TABLE IF NOT EXISTS ExtractedEntity (
+        id_prop VARCHAR PRIMARY KEY,
+        text VARCHAR,
+        label VARCHAR,
+        embedding FLOAT[{EMBEDDING_DIM}]
+    );
+    """
+
+    relation_table_ddl = f"""
+    CREATE TABLE IF NOT EXISTS KGExtractionRelation (
+        relation_id VARCHAR PRIMARY KEY,
+        source_node_id_prop VARCHAR,
+        target_node_id_prop VARCHAR,
+        relation_type VARCHAR
+        -- Optional: FOREIGN KEY (source_node_id_prop) REFERENCES ExtractedEntity(id_prop),
+        -- Optional: FOREIGN KEY (target_node_id_prop) REFERENCES ExtractedEntity(id_prop)
+    );
+    """
+    # 也可以为关系表的 (source, target, type) 创建复合唯一索引或普通索引以加速查询
+    relation_index_ddl = """
+    CREATE INDEX IF NOT EXISTS idx_relation_source_target_type 
+    ON KGExtractionRelation (source_node_id_prop, target_node_id_prop, relation_type);
+    """
+    
+    ddl_commands = [node_table_ddl, relation_table_ddl, relation_index_ddl]
+
+    try:
+        with duckdb_kg.get_connection() as conn:
+            context.log.info("Executing DuckDB DDL commands...")
+            for command_idx, command in enumerate(ddl_commands):
+                context.log.debug(f"Executing DDL {command_idx+1}:\n{command.strip()}")
+                conn.execute(command)
+            context.log.info("DuckDB Schema DDL commands executed successfully.")
+    except Exception as e_ddl:
+        context.log.error(f"Error during DuckDB schema creation: {e_ddl}", exc_info=True)
+        raise
+    context.log.info("--- DuckDB Schema Creation Asset Finished ---")
+
 
 @dg.asset(
-    name="kuzu_nodes",
-    description="Loads all unique extracted entities as nodes into KuzuDB.",
+    name="duckdb_nodes", # <--- 修改资产名称
+    description="Loads all unique extracted entities as nodes into DuckDB.",
     group_name="kg_building",
-    deps=["kuzu_schema", "kg_extractions"] # kuzu_schema 依赖 kg_extractions 是为了保证表存在
+    deps=[duckdb_schema_asset, kg_extraction_asset] # <--- 修改依赖
 )
-def kuzu_nodes_asset(
-    context: dg.AssetExecutionContext, 
-    kg_extractions: List[KGTripleSetOutput], 
-    kuzu_readwrite_db: KuzuDBReadWriteResource, 
-    embedder: GGUFEmbeddingResource 
+def duckdb_nodes_asset(
+    context: dg.AssetExecutionContext,
+    kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset 的输出
+    duckdb_kg: DuckDBResource,               # <--- 修改资源参数
+    embedder: GGUFEmbeddingResource          # 保持对 embedder 的依赖，用于生成嵌入
 ):
-    context.log.info("--- Starting KuzuDB Node Loading Asset (Using MERGE) ---")
+    context.log.info("--- Starting DuckDB Node Loading Asset (Using INSERT ON CONFLICT) ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping node loading.")
         return
 
-    unique_nodes_data_for_merge: List[Dict[str, Any]] = []
-    unique_nodes_keys = set()
+    unique_nodes_data_for_insert: List[Dict[str, Any]] = []
+    unique_nodes_keys = set() # 用于在Python层面去重，避免多次尝试插入相同实体
 
     for kg_set in kg_extractions:
         for entity in kg_set.extracted_entities:
+            # 规范化文本和标签，用于生成唯一键和存储
             normalized_text = normalize_text_for_id(entity.text)
-            normalized_label = entity.label.upper()
-            node_unique_key = (normalized_text, normalized_label)
+            normalized_label = entity.label.upper() # 确保标签大写
+            
+            # 为实体生成唯一ID (基于规范化文本和标签的哈希值)
+            # 注意：如果同一个实体（相同文本和标签）在不同chunk中被提取，它们的id_prop会一样
+            node_id_prop = hashlib.md5(f"{normalized_text}_{normalized_label}".encode('utf-8')).hexdigest()
+            
+            node_unique_key_for_py_dedup = (node_id_prop) # 使用id_prop进行Python层面的去重
 
-            if node_unique_key not in unique_nodes_keys:
-                unique_nodes_keys.add(node_unique_key)
+            if node_unique_key_for_py_dedup not in unique_nodes_keys:
+                unique_nodes_keys.add(node_unique_key_for_py_dedup)
                 
-                embedding_vector_list = embedder.encode([normalized_text]) 
-                final_embedding_for_kuzu: List[float]
+                # 生成嵌入向量 (与KuzuDB时逻辑相同)
+                embedding_vector_list = embedder.encode([normalized_text]) # embedder.encode期望一个列表
+                final_embedding_for_db: List[float]
 
                 if embedding_vector_list and embedding_vector_list[0] and \
                    isinstance(embedding_vector_list[0], list) and \
                    len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
-                    final_embedding_for_kuzu = embedding_vector_list[0]
+                    final_embedding_for_db = embedding_vector_list[0]
                 else:
                     context.log.warning(f"Failed to generate valid embedding for node: {normalized_text} ({normalized_label}). Using zero vector. Embedding result: {embedding_vector_list}")
-                    final_embedding_for_kuzu = [0.0] * embedder.get_embedding_dimension() 
+                    final_embedding_for_db = [0.0] * embedder.get_embedding_dimension()
                     
-                unique_nodes_data_for_merge.append({
-                    "id_prop": hashlib.md5(f"{normalized_text}_{normalized_label}".encode('utf-8')).hexdigest(),
+                unique_nodes_data_for_insert.append({
+                    "id_prop": node_id_prop,
                     "text": normalized_text,
                     "label": normalized_label,
-                    "embedding": final_embedding_for_kuzu 
+                    "embedding": final_embedding_for_db # DuckDB的FLOAT[]可以直接接受Python的List[float]
                 })
 
-    if not unique_nodes_data_for_merge:
-        context.log.warning("No unique nodes found in extractions to load.")
+    if not unique_nodes_data_for_insert:
+        context.log.warning("No unique nodes found in extractions to load into DuckDB.")
         return
 
-    nodes_merged_count = 0
-    nodes_created_count = 0
-    with kuzu_readwrite_db.get_connection() as conn:
-        context.log.info(f"Attempting to MERGE {len(unique_nodes_data_for_merge)} unique nodes into ExtractedEntity table...")
-        for node_data_dict in unique_nodes_data_for_merge:
+    nodes_processed_count = 0
+    nodes_inserted_count = 0
+    nodes_updated_count = 0
 
-            merge_query = """
-            MERGE (e:ExtractedEntity {id_prop: $id_prop})
-            ON CREATE SET e.text = $text, e.label = $label, e.embedding = $embedding
-            ON MATCH SET e.text = $text, e.label = $label, e.embedding = $embedding
-            """
+    upsert_sql = f"""
+    INSERT INTO ExtractedEntity (id_prop, text, label, embedding)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (id_prop) DO UPDATE SET
+        text = excluded.text,
+        label = excluded.label,
+        embedding = excluded.embedding;
+    """
+    # excluded.column_name 用于引用试图插入但导致冲突的值
 
-            try:
-                conn.execute(merge_query, node_data_dict)
-                nodes_merged_count +=1 
-            except Exception as e_merge:
-                context.log.error(f"Error MERGING node with id_prop {node_data_dict.get('id_prop')}: {e_merge}", exc_info=True)
-        
-        context.log.info(f"Successfully MERGED/processed {nodes_merged_count} nodes.")
-        # --- 修改结束 ---
-        conn.execute("CHECKPOINT;")
-        context.log.info("Node processing and CHECKPOINT complete.")
+    try:
+        with duckdb_kg.get_connection() as conn:
+            context.log.info(f"Attempting to UPSERT {len(unique_nodes_data_for_insert)} unique nodes into DuckDB ExtractedEntity table...")
+            
+            # DuckDB 支持 executemany 用于批量操作，但对于 ON CONFLICT，逐条执行或构造大型 VALUES 列表可能更直接
+            # 或者使用 pandas DataFrame + duckdb.register + CREATE TABLE AS / INSERT INTO SELECT
+            # 这里为了清晰，我们先用循环执行，对于几千到几万个节点，性能尚可接受
+            # 如果节点数量非常大 (几十万以上)，应考虑更优化的批量upsert策略
+
+            for node_data_dict in unique_nodes_data_for_insert:
+                params = (
+                    node_data_dict["id_prop"],
+                    node_data_dict["text"],
+                    node_data_dict["label"],
+                    node_data_dict["embedding"]
+                )
+                try:
+                    # conn.execute() 对于 DML (如 INSERT, UPDATE) 不直接返回受影响的行数
+                    # 但我们可以假设它成功了，除非抛出异常
+                    conn.execute(upsert_sql, params)
+                    # 无法直接判断是insert还是update，除非查询前后对比，这里简化处理
+                    nodes_processed_count += 1 
+                except Exception as e_upsert_item:
+                    context.log.error(f"Error UPSERTING node with id_prop {node_data_dict.get('id_prop')} into DuckDB: {e_upsert_item}", exc_info=True)
+            
+            # 我们可以查一下表中的总行数来间接了解情况
+            total_rows_after = conn.execute("SELECT COUNT(*) FROM ExtractedEntity").fetchone()[0]
+            context.log.info(f"Successfully processed {nodes_processed_count} node upsert operations into DuckDB.")
+            context.log.info(f"Total rows in ExtractedEntity table after upsert: {total_rows_after}")
+            # 注意：这里的 nodes_processed_count 不直接等于插入或更新数，而是尝试操作的次数
+            # 如果需要精确计数插入/更新，需要更复杂的逻辑或DuckDB特定功能
+
+    except Exception as e_db_nodes:
+        context.log.error(f"Error during DuckDB node loading: {e_db_nodes}", exc_info=True)
+        raise
+    
+    context.add_output_metadata({
+        "nodes_prepared_for_upsert": len(unique_nodes_data_for_insert),
+        "nodes_processed_by_upsert_statement": nodes_processed_count,
+    })
+    context.log.info("--- DuckDB Node Loading Asset Finished ---")
+
+
 
 @dg.asset(
-    name="kuzu_relations",
-    description="Loads all extracted relationships into KuzuDB.",
+    name="duckdb_relations", # <--- 修改资产名称
+    description="Loads all extracted relationships into DuckDB.",
     group_name="kg_building",
-    deps=["kuzu_nodes"]
+    deps=[duckdb_nodes_asset] # <--- 修改依赖
 )
-def kuzu_relations_asset(context: dg.AssetExecutionContext, kg_extractions: List[KGTripleSetOutput], kuzu_readwrite_db: KuzuDBReadWriteResource):
-    context.log.info("--- Starting KuzuDB Relation Loading Asset ---")
+def duckdb_relations_asset(
+    context: dg.AssetExecutionContext, 
+    kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset
+    duckdb_kg: DuckDBResource                # <--- 修改资源参数
+):
+    context.log.info("--- Starting DuckDB Relation Loading Asset ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping relation loading.")
         return
-    relation_data = []
+
+    relations_to_insert: List[Dict[str, str]] = []
+    unique_relation_keys = set() # 用于在Python层面去重
+
     for kg_set in kg_extractions:
         for rel in kg_set.extracted_relations:
-            head_text_norm = normalize_text_for_id(rel.head_entity_text)
-            head_label_norm = rel.head_entity_label.upper()
-            tail_text_norm = normalize_text_for_id(rel.tail_entity_text)
-            tail_label_norm = rel.tail_entity_label.upper()
-            relation_data.append({
-                "from_id": hashlib.md5(f"{head_text_norm}_{head_label_norm}".encode('utf-8')).hexdigest(),
-                "to_id": hashlib.md5(f"{tail_text_norm}_{tail_label_norm}".encode('utf-8')).hexdigest(),
-                "relation_type": rel.relation_type.upper()
-            })
-    if not relation_data:
-        context.log.warning("No relation data found in extractions to load.")
+            # 从实体文本和标签生成源节点和目标节点的ID (与 duckdb_nodes_asset 中一致)
+            source_node_text_norm = normalize_text_for_id(rel.head_entity_text)
+            source_node_label_norm = rel.head_entity_label.upper()
+            source_node_id = hashlib.md5(f"{source_node_text_norm}_{source_node_label_norm}".encode('utf-8')).hexdigest()
+
+            target_node_text_norm = normalize_text_for_id(rel.tail_entity_text)
+            target_node_label_norm = rel.tail_entity_label.upper()
+            target_node_id = hashlib.md5(f"{target_node_text_norm}_{target_node_label_norm}".encode('utf-8')).hexdigest()
+            
+            relation_type_norm = rel.relation_type.upper()
+
+            # 为关系本身生成一个唯一ID
+            relation_unique_str = f"{source_node_id}_{relation_type_norm}_{target_node_id}"
+            relation_id = hashlib.md5(relation_unique_str.encode('utf-8')).hexdigest()
+
+            if relation_id not in unique_relation_keys:
+                unique_relation_keys.add(relation_id)
+                relations_to_insert.append({
+                    "relation_id": relation_id,
+                    "source_node_id_prop": source_node_id,
+                    "target_node_id_prop": target_node_id,
+                    "relation_type": relation_type_norm
+                })
+    
+    if not relations_to_insert:
+        context.log.warning("No unique relations found in extractions to load into DuckDB.")
         return
-    with kuzu_readwrite_db.get_connection() as conn:
-        all_rels_df = pd.DataFrame(relation_data)
-        for rel_type in all_rels_df['relation_type'].unique():
-            rels_df_for_merge = all_rels_df[all_rels_df['relation_type'] == rel_type]
-            batch_params = rels_df_for_merge.to_dict(orient='records')
-            if not batch_params: continue
-            context.log.info(f"Attempting to MERGE {len(batch_params)} relations of type '{rel_type}'...")
-            merge_query = f"""
-                UNWIND $batch AS rel_item
-                MATCH (from_node:ExtractedEntity {{id_prop: rel_item.from_id}})
-                MATCH (to_node:ExtractedEntity {{id_prop: rel_item.to_id}})
-                MERGE (from_node)-[:`{rel_type}`]->(to_node)
-            """
-            conn.execute(merge_query, {"batch": batch_params})
-            context.log.info(f"Successfully merged relations of type '{rel_type}'.")
-        conn.execute("CHECKPOINT;")
-        context.log.info("Successfully merged all relations and checkpointed.")
+
+    relations_processed_count = 0
+    
+    # 使用 INSERT INTO ... ON CONFLICT DO NOTHING 来避免插入重复的关系 (基于 relation_id)
+    insert_sql = """
+    INSERT INTO KGExtractionRelation (relation_id, source_node_id_prop, target_node_id_prop, relation_type)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (relation_id) DO NOTHING;
+    """
+
+    try:
+        with duckdb_kg.get_connection() as conn:
+            context.log.info(f"Attempting to INSERT {len(relations_to_insert)} unique relations into DuckDB KGExtractionRelation table...")
+            
+            for rel_data_dict in relations_to_insert:
+                params = (
+                    rel_data_dict["relation_id"],
+                    rel_data_dict["source_node_id_prop"],
+                    rel_data_dict["target_node_id_prop"],
+                    rel_data_dict["relation_type"]
+                )
+                try:
+                    conn.execute(insert_sql, params)
+                    # DuckDB的execute对于INSERT ON CONFLICT DO NOTHING不直接返回是否插入
+                    # 但我们可以假设它成功处理了（要么插入，要么忽略）
+                    relations_processed_count += 1
+                except Exception as e_insert_item:
+                    context.log.error(f"Error INSERTING relation with id {rel_data_dict.get('relation_id')} into DuckDB: {e_insert_item}", exc_info=True)
+            
+            total_rels_after = conn.execute("SELECT COUNT(*) FROM KGExtractionRelation").fetchone()[0]
+            context.log.info(f"Successfully processed {relations_processed_count} relation insert (ON CONFLICT DO NOTHING) operations.")
+            context.log.info(f"Total rows in KGExtractionRelation table after inserts: {total_rels_after}")
+
+    except Exception as e_db_rels:
+        context.log.error(f"Error during DuckDB relation loading: {e_db_rels}", exc_info=True)
+        raise
+        
+    context.add_output_metadata({
+        "relations_prepared_for_insert": len(relations_to_insert),
+        "relations_processed_by_insert_statement": relations_processed_count,
+    })
+    context.log.info("--- DuckDB Relation Loading Asset Finished ---")
+
+
 
 @dg.asset(
-    name="kuzu_vector_index",
-    description="Creates the vector index on the ExtractedEntity table.", # 保持原始描述
+    name="duckdb_vector_index", # <--- 修改资产名称
+    description="Creates the HNSW vector index on the embedding column in DuckDB.",
     group_name="kg_building",
-    deps=["kuzu_relations"] 
+    deps=[duckdb_relations_asset]  # <--- 修改依赖
 )
-def kuzu_vector_index_asset(context: dg.AssetExecutionContext, kuzu_readwrite_db: KuzuDBReadWriteResource):
-    context.log.info("--- Starting KuzuDB Vector Index Creation Asset ---")
-    index_name_to_create = "entity_embedding_idx"
+def duckdb_vector_index_asset(
+    context: dg.AssetExecutionContext, 
+    duckdb_kg: DuckDBResource # <--- 修改资源参数
+):
+    context.log.info("--- Starting DuckDB Vector Index Creation Asset ---")
+    
     table_to_index = "ExtractedEntity"
-    property_to_index = "embedding"
+    column_to_index = "embedding"
+    # 索引名可以自定义，通常包含表名、列名和类型
+    index_name = f"{table_to_index}_{column_to_index}_hnsw_idx"
+    metric_type = "l2sq" # 欧氏距离的平方，与我们测试时一致
 
-    with kuzu_readwrite_db.get_connection() as conn:
-        try:
-            conn.execute("LOAD VECTOR;") 
-            context.log.info("VECTOR extension loaded for index creation.")
-        except Exception as e_load_vec:
-            context.log.warning(f"Could not explicitly LOAD VECTOR (might be already loaded or Kuzu version handles it differently): {e_load_vec}")
-        
-        # 直接尝试创建索引，不预先检查。
-        # 如果我们之前的假设是正确的（即Dagster每次运行时KuzuDBReadWriteResource会清理并重建数据库），
-        # 那么这里不应该出现 "already exists" 的错误。
-        # 如果我们保留了不清空数据库的KuzuDBReadWriteResource，并且此资产重复运行，则此处可能会失败。
-        # 我们当前的目标是验证一次完整、干净的创建流程。
-        
-        index_creation_query = f"CALL CREATE_VECTOR_INDEX('{table_to_index}', '{index_name_to_create}', '{property_to_index}', metric := 'cosine')"
-        context.log.info(f"Executing vector index creation command: {index_creation_query}")
-        try:
-            conn.execute(index_creation_query)
-            context.log.info("Vector index creation command successfully executed.")
+    # DuckDB 的 CREATE INDEX ... USING HNSW 语句
+    # IF NOT EXISTS 确保了幂等性
+    index_creation_sql = f"""
+    CREATE INDEX IF NOT EXISTS {index_name} 
+    ON {table_to_index} USING HNSW ({column_to_index}) 
+    WITH (metric='{metric_type}');
+    """
 
-            context.log.info("Verifying created indexes...")
-            show_indexes_result = conn.execute("CALL SHOW_INDEXES() RETURN *;")
-            
-            indexes_df = pd.DataFrame(show_indexes_result.get_as_df())
-            context.log.info(f"All indexes in the database:\n{indexes_df.to_string()}") 
+    try:
+        with duckdb_kg.get_connection() as conn:
+            # 在创建索引前，确保vss扩展已加载且持久化已开启 (虽然DuckDBResource的setup已做)
+            try:
+                conn.execute("LOAD vss;")
+                conn.execute("SET hnsw_enable_experimental_persistence=true;")
+                context.log.info("DuckDB: VSS extension loaded and HNSW persistence re-confirmed for index creation asset.")
+            except Exception as e_vss_setup_idx:
+                context.log.warning(f"DuckDB: Failed to re-confirm VSS setup for index asset: {e_vss_setup_idx}. "
+                                     "Proceeding, assuming it was set by DuckDBResource.")
 
-            # 筛选出针对 ExtractedEntity 表的索引
-            # 使用 show_indexes_result.get_as_df() 返回的实际列名进行筛选
-            # 通常列名是 'table name' 和 'index name'
-            if not indexes_df.empty and 'table name' in indexes_df.columns and 'index name' in indexes_df.columns:
-                entity_indexes_df = indexes_df[indexes_df['table name'] == table_to_index]
-                context.log.info(f"Current indexes on {table_to_index}:\n{entity_indexes_df.to_string()}")
-                
-                if index_name_to_create in entity_indexes_df['index name'].tolist():
-                    context.log.info(f"SUCCESS: Vector index '{index_name_to_create}' confirmed to exist on {table_to_index}.")
-                else:
-                    context.log.error(f"FAILURE: Vector index '{index_name_to_create}' NOT FOUND on {table_to_index} after creation attempt.")
-            elif indexes_df.empty:
-                context.log.error(f"FAILURE: No indexes found in the database after creation attempt.")
-            else:
-                context.log.error(f"FAILURE: Could not verify index. 'table name' or 'index name' column missing in SHOW_INDEXES output. Columns: {indexes_df.columns.tolist()}")
+            context.log.info(f"Executing DuckDB vector index creation command:\n{index_creation_sql.strip()}")
+            conn.execute(index_creation_sql)
+            context.log.info(f"DuckDB vector index '{index_name}' creation command executed successfully (or index already existed).")
 
-        except Exception as e_create_index:
-            context.log.error(f"Error during vector index creation or verification: {e_create_index}", exc_info=True)
-            raise # 将异常抛出，以便 Dagster 捕获并标记资产失败
+            # 验证索引是否已创建 (可选，但有助于确认)
+            # DuckDB 中查看索引的命令可能不像 KuzuDB 那样直接，
+            # 通常，如果 CREATE INDEX 没有报错，就表示成功了。
+            # 我们可以尝试查询 pg_indexes 或 duckdb_indexes() (如果 DuckDB 版本支持)
+            # 或者简单地依赖 CREATE INDEX IF NOT EXISTS 的行为。
+            # 为了简化，我们这里先不加复杂的验证查询。
+            # 如果需要验证，可以查询 PRAGMA show_indexes('ExtractedEntity'); 但解析其输出较麻烦。
+
+    except Exception as e_index_asset:
+        context.log.error(f"Error during DuckDB vector index creation: {e_index_asset}", exc_info=True)
+        raise
+    
+    context.log.info("--- DuckDB Vector Index Creation Asset Finished ---")
+
 
 # --- 更新 all_processing_assets 列表 ---
 all_processing_assets = [
@@ -461,8 +584,8 @@ all_processing_assets = [
     vector_storage_asset,
     keyword_index_asset,
     kg_extraction_asset,
-    kuzu_schema_asset,
-    kuzu_nodes_asset, # 应为使用 MERGE 的版本
-    kuzu_relations_asset,
-    kuzu_vector_index_asset, # 当前修改的这个
+    duckdb_schema_asset,
+    duckdb_nodes_asset,
+    duckdb_relations_asset,
+    duckdb_vector_index_asset,
 ]
