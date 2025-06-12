@@ -1,7 +1,8 @@
-# 文件: zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
+#  文件: zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
 
+import re
 import dagster as dg
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import uuid
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import hashlib
@@ -13,7 +14,19 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.pydantic_models_dagster import (
     EmbeddingOutput,
     KGTripleSetOutput,
     ExtractedEntity,
-    ExtractedRelation
+    ExtractedRelation,
+    # --- 添加导入我们需要的元素类型 ---
+    TitleElement,
+    NarrativeTextElement,
+    ListItemElement,
+    TableElement,
+    CodeBlockElement,
+    ImageElement,
+    PageBreakElement,
+    HeaderElement,
+    FooterElement,
+    DocumentElementMetadata
+    # --- 结束添加 ---
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     GGUFEmbeddingResource,
@@ -29,13 +42,202 @@ import os
 import time
 
 
+_PYDANTIC_AVAILABLE = False
+try:
+    from .pydantic_models_dagster import ( # 使用相对导入
+        ChunkOutput,
+        ParsedDocumentOutput,
+        EmbeddingOutput,
+        KGTripleSetOutput,
+        ExtractedEntity,
+        ExtractedRelation,
+        TitleElement,
+        NarrativeTextElement,
+        ListItemElement,
+        TableElement,
+        CodeBlockElement,
+        ImageElement,
+        PageBreakElement,
+        HeaderElement,
+        FooterElement,
+        DocumentElementMetadata # <--- 确保这里导入了 DocumentElementMetadata
+    )
+    _PYDANTIC_AVAILABLE = True
+    # 如果 Pydantic 可用，我们也可以直接从模型中获取 DocumentElementType
+    # from .pydantic_models_dagster import DocumentElementType # 如果需要更精确的类型提示
+except ImportError:
+    # 定义占位符
+    class BaseModel: pass
+    class ChunkOutput(BaseModel): pass
+    class ParsedDocumentOutput(BaseModel): pass
+    class EmbeddingOutput(BaseModel): pass
+    class KGTripleSetOutput(BaseModel): pass
+    class ExtractedEntity(BaseModel): pass
+    class ExtractedRelation(BaseModel): pass
+    class TitleElement(BaseModel): pass
+    class NarrativeTextElement(BaseModel): pass
+    class ListItemElement(BaseModel): pass
+    class TableElement(BaseModel): pass
+    class CodeBlockElement(BaseModel): pass
+    class ImageElement(BaseModel): pass
+    class PageBreakElement(BaseModel): pass
+    class HeaderElement(BaseModel): pass
+    class FooterElement(BaseModel): pass
+    class DocumentElementMetadata(BaseModel): pass # <--- 定义占位符
+    DocumentElementType = Any # type: ignore
+# --- 结束 Pydantic 模型导入 ---
+
+
 class TextChunkerConfig(dg.Config):
-    chunk_size: int = 500
-    chunk_overlap: int = 50
+    chunk_size: int = 1000 
+    chunk_overlap: int = 100
+    max_element_text_length_before_split: int = 1200 # 一个1200字符的段落如果语义连贯，可以考虑不切分。
+    target_sentence_split_chunk_size: int = 600    # 略微增大子块的目标大小，使其包含更多上下文。
+    sentence_split_chunk_overlap_sentences: int = 2  # 增加到2句重叠，以期在子块之间提供更好的语义连接。
+    # --- 合并策略参数 ---
+    min_chunk_length_to_avoid_merge: int = 250
+    max_merged_chunk_size: int = 750
+
+
+def split_text_into_sentences(text: str) -> List[str]:
+    """
+    Splits text into sentences using a regex-based approach.
+    Handles common sentence terminators and aims to preserve meaningful units.
+    """
+    if not text:
+        return []
+    # 改进的句子分割正则表达式，考虑了中英文句号、问号、感叹号
+    # 并尝试处理省略号和一些特殊情况。
+    # (?<=[。？！\.!\?]) 会匹配这些标点符号后面的位置 (lookbehind)
+    # \s* 匹配标点后的任意空格
+    # (?!$) 确保不是字符串末尾 (避免在末尾标点后产生空句子)
+    # 对于中文，句号、问号、感叹号通常直接结束句子。
+    # 对于英文，. ! ? 后面通常有空格或换行。
+    
+    # 一个更简单的版本，直接按标点分割，然后清理
+    sentences = re.split(r'([。？！\.!\?])', text)
+    result = []
+    current_sentence = ""
+    for i in range(0, len(sentences), 2):
+        part = sentences[i]
+        terminator = sentences[i+1] if i+1 < len(sentences) else ""
+        current_sentence = part + terminator
+        if current_sentence.strip():
+            result.append(current_sentence.strip())
+    
+    # 如果上面的分割不理想，可以尝试更复杂的，但这个简单版本通常够用
+    # 例如：
+    # sentences = re.split(r'(?<=[。？！\.!\?])\s*', text)
+    # sentences = [s.strip() for s in sentences if s.strip()]
+    return result if result else [text] # 如果无法分割，返回原文本作为一个句子
+
+
+def split_markdown_table_by_rows(
+    markdown_table_text: str,
+    target_chunk_size: int,
+    max_chunk_size: int,
+    context: Optional[dg.AssetExecutionContext] = None
+) -> List[Dict[str, Any]]: # <--- 修改返回类型
+    """
+    Splits a Markdown table string by its data rows.
+    Returns a list of dictionaries, each containing 'text', 'start_row_index', and 'end_row_index'.
+    Indices are 0-based relative to the start of data_rows.
+    """
+    sub_chunks_data: List[Dict[str, Any]] = [] # <--- 修改变量名和类型
+    lines = markdown_table_text.strip().split('\n')
+    
+    if len(lines) < 2: # 至少需要表头和分隔行
+        if context: context.log.warning(f"Markdown table has less than 2 lines ({len(lines)}). Cannot process for row splitting. Returning as single chunk.")
+        # 对于无法按预期处理的表格，返回原始文本及无效的行索引
+        return [{"text": markdown_table_text, "start_row_index": -1, "end_row_index": -1}]
+
+
+    header_row = lines[0]
+    separator_row = lines[1]
+    data_rows = lines[2:]
+
+    if not data_rows:
+        if context: context.log.warning("Markdown table has no data rows. Returning header and separator as single chunk.")
+        return [{"text": f"{header_row}\n{separator_row}", "start_row_index": -1, "end_row_index": -1}]
+
+    if not (separator_row.strip().startswith('|') and separator_row.strip().endswith('|') and '-' in separator_row):
+        if context: context.log.warning(f"Markdown table separator row looks non-standard: '{separator_row}'. Row splitting might be unreliable.")
+        # 即使分隔符不标准，也尝试继续，但标记行索引为不可靠
+        # 或者直接返回整个表作为一个块，标记行索引无效
+        # 为简单起见，我们先尝试，但如果这个情况频繁且导致问题，应返回整个表
+        # return [{"text": markdown_table_text, "start_row_index": -2, "end_row_index": -2}] # -2 表示分隔符问题
+
+    current_sub_chunk_lines = [header_row, separator_row]
+    current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1
+    current_sub_chunk_start_row_idx = 0 # 记录当前子块数据行的起始索引
+
+    for i, data_row in enumerate(data_rows):
+        row_len = len(data_row)
+        if not data_row.strip():
+            if i == current_sub_chunk_start_row_idx and len(current_sub_chunk_lines) == 2 : # 如果是新块的第一个数据行就是空的，则递增起始行索引
+                current_sub_chunk_start_row_idx +=1
+            continue # 跳过空数据行
+
+        # 条件：1. 当前块只有表头；2. 加入新行不超过目标大小；3. 当前块只有表头且加入第一行数据即使超目标大小但不超最大大小
+        should_add_to_current = (
+            len(current_sub_chunk_lines) == 2 or
+            (current_sub_chunk_char_count + row_len + 1 <= target_chunk_size) or
+            (len(current_sub_chunk_lines) == 2 and (current_sub_chunk_char_count + row_len + 1 > target_chunk_size) and (current_sub_chunk_char_count + row_len + 1 <= max_chunk_size))
+        )
+
+        if should_add_to_current and (current_sub_chunk_char_count + row_len + 1 <= max_chunk_size):
+            current_sub_chunk_lines.append(data_row)
+            current_sub_chunk_char_count += row_len + 1
+        else:
+            # 完成当前子块
+            if len(current_sub_chunk_lines) > 2: # 确保至少有一行数据
+                sub_chunks_data.append({
+                    "text": "\n".join(current_sub_chunk_lines),
+                    "start_row_index": current_sub_chunk_start_row_idx,
+                    "end_row_index": i - 1 # 上一行是这个块的结束行
+                })
+                if context: context.log.debug(f"  Table sub-chunk created: rows {current_sub_chunk_start_row_idx}-{i-1}")
+
+            # 开始新的子块
+            current_sub_chunk_lines = [header_row, separator_row, data_row] # 当前行是新块的第一行数据
+            current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1 + len(data_row) + 1
+            current_sub_chunk_start_row_idx = i
+            
+            # 如果当前行（作为新块的第一行）自己就超长了（非常罕见，除非max_chunk_size很小）
+            if current_sub_chunk_char_count > max_chunk_size:
+                if context: context.log.warning(f"  Single data row (original index {i}) with header exceeds max_chunk_size. Creating chunk for this row anyway.")
+                # 即使超长，也为这一行创建一个块
+                sub_chunks_data.append({
+                    "text": "\n".join(current_sub_chunk_lines), # 包含表头、分隔符和这一超长行
+                    "start_row_index": i,
+                    "end_row_index": i 
+                })
+                if context: context.log.debug(f"  Table sub-chunk created for single very long row: {i}-{i}")
+                # 重置，准备下一个数据行（如果有的话）
+                current_sub_chunk_lines = [header_row, separator_row]
+                current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1
+                current_sub_chunk_start_row_idx = i + 1
+
+
+    # 添加最后一个正在构建的子块
+    if len(current_sub_chunk_lines) > 2:
+        sub_chunks_data.append({
+            "text": "\n".join(current_sub_chunk_lines),
+            "start_row_index": current_sub_chunk_start_row_idx,
+            "end_row_index": len(data_rows) - 1 # 最后的数据行
+        })
+        if context: context.log.debug(f"  Table sub-chunk created (last): rows {current_sub_chunk_start_row_idx}-{len(data_rows)-1}")
+
+    if not sub_chunks_data and markdown_table_text:
+        if context: context.log.warning("Markdown table splitting by row resulted in no sub-chunks. Returning original table as one.")
+        return [{"text": markdown_table_text, "start_row_index": 0, "end_row_index": len(data_rows) -1 if data_rows else -1}]
+        
+    return sub_chunks_data
+
 
 @dg.asset(
     name="text_chunks",
-    description="Cleans and chunks parsed documents into smaller text segments.",
+    description="Cleans and chunks parsed documents. Splits long elements and merges short ones.", # 更新描述
     group_name="processing",
     deps=["parsed_documents"]
 )
@@ -44,30 +246,359 @@ def clean_chunk_text_asset(
     config: TextChunkerConfig,
     parsed_documents: List[ParsedDocumentOutput]
 ) -> List[ChunkOutput]:
-    all_chunks: List[ChunkOutput] = []
-    context.log.info(f"Received {len(parsed_documents)} parsed documents to clean and chunk.")
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config.chunk_size,
-        chunk_overlap=config.chunk_overlap,
-    )
-    for parsed_doc in parsed_documents:
-        doc_id_from_meta = parsed_doc.original_metadata.get("filename", str(uuid.uuid4()))
-        context.log.info(f"Processing document: {doc_id_from_meta}")
-        cleaned_text = parsed_doc.parsed_text.strip()
-        if not cleaned_text:
-            context.log.warning(f"Document {doc_id_from_meta} has no valid content, skipping.")
+    initial_chunks: List[ChunkOutput] = [] # 先收集初步处理的块
+    context.log.info(f"Received {len(parsed_documents)} parsed documents for initial chunking.")
+    context.log.info(f"Initial chunking config: MaxElemLen={config.max_element_text_length_before_split}, "
+                     f"TargetSubChunkSize={config.target_sentence_split_chunk_size}, "
+                     f"SentenceOverlap={config.sentence_split_chunk_overlap_sentences}")
+
+    for doc_idx, parsed_doc in enumerate(parsed_documents):
+        doc_id_from_meta = parsed_doc.original_metadata.get("filename", f"doc_{doc_idx}_{str(uuid.uuid4())}")
+        context.log.info(f"Processing document for initial chunks: {doc_id_from_meta}")
+
+        if not parsed_doc.elements:
+            context.log.warning(f"Document {doc_id_from_meta} has no structured elements.")
+            if parsed_doc.parsed_text and parsed_doc.parsed_text.strip():
+                context.log.info(f"  Fallback: Document {doc_id_from_meta} has no elements, but has parsed_text. "
+                                 f"Applying RecursiveCharacterTextSplitter to parsed_text.")
+                from langchain_text_splitters import RecursiveCharacterTextSplitter
+                text_splitter_fallback = RecursiveCharacterTextSplitter(
+                    chunk_size=config.chunk_size,
+                    chunk_overlap=config.chunk_overlap,
+                    length_function=len
+                )
+                try:
+                    chunks_text_list = text_splitter_fallback.split_text(parsed_doc.parsed_text.strip())
+                    for i, chunk_text_content in enumerate(chunks_text_list):
+                        chunk_meta = parsed_doc.original_metadata.copy()
+                        chunk_meta.update({
+                            "chunk_number_in_doc": len(initial_chunks) + 1, # 全局chunk编号
+                            "sub_chunk_sequence": i + 1,
+                            "total_sub_chunks": len(chunks_text_list),
+                            "chunking_strategy": "fallback_recursive_char_split_on_parsed_text",
+                            "original_element_text_length": len(parsed_doc.parsed_text.strip()),
+                            "is_merged_chunk": False, # 新增标记
+                        })
+                        initial_chunks.append(ChunkOutput(
+                            chunk_text=chunk_text_content,
+                            source_document_id=doc_id_from_meta,
+                            chunk_metadata=chunk_meta
+                        ))
+                except Exception as e_fallback_split:
+                    context.log.error(f"  Error during fallback splitting for {doc_id_from_meta}: {e_fallback_split}")
             continue
-        try:
-            chunks_text_list = text_splitter.split_text(cleaned_text)
-            context.log.info(f"Document {doc_id_from_meta} split into {len(chunks_text_list)} chunks.")
-            for i, chunk_text_content in enumerate(chunks_text_list):
+
+        doc_internal_chunk_counter = 0
+
+        for element_idx, element in enumerate(parsed_doc.elements):
+            element_text_content = ""
+            element_type_str = "unknown"
+            source_element_metadata_from_element_obj = {}
+
+            # --- 根据元素类型提取文本和元数据 (保持不变) ---
+            if isinstance(element, TitleElement) or (isinstance(element, dict) and element.get("element_type") == "title"):
+                element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
+                element_type_str = "title"
+                source_element_metadata_from_element_obj["level"] = element.level if hasattr(element, 'level') else element.get("level")
+            elif isinstance(element, NarrativeTextElement) or (isinstance(element, dict) and element.get("element_type") == "narrative_text"):
+                element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
+                element_type_str = "narrative_text"
+            elif isinstance(element, ListItemElement) or (isinstance(element, dict) and element.get("element_type") == "list_item"):
+                element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
+                element_type_str = "list_item"
+                source_element_metadata_from_element_obj["item_level"] = element.level if hasattr(element, 'level') else element.get("level")
+                source_element_metadata_from_element_obj["ordered"] = element.ordered if hasattr(element, 'ordered') else element.get("ordered")
+                source_element_metadata_from_element_obj["item_number"] = element.item_number if hasattr(element, 'item_number') else element.get("item_number")
+            elif isinstance(element, TableElement) or (isinstance(element, dict) and element.get("element_type") == "table"):
+                if hasattr(element, 'markdown_representation') and element.markdown_representation:
+                    element_text_content = element.markdown_representation
+                elif hasattr(element, 'text_representation') and element.text_representation:
+                    element_text_content = element.text_representation
+                elif isinstance(element, dict):
+                    element_text_content = element.get("markdown_representation") or element.get("text_representation", "")
+                element_type_str = "table"
+                source_element_metadata_from_element_obj["caption"] = element.caption if hasattr(element, 'caption') else element.get("caption")
+            elif isinstance(element, CodeBlockElement) or (isinstance(element, dict) and element.get("element_type") == "code_block"):
+                element_text_content = element.code if hasattr(element, 'code') else element.get("code", "")
+                element_type_str = "code_block"
+                source_element_metadata_from_element_obj["language"] = element.language if hasattr(element, 'language') else element.get("language")
+            elif isinstance(element, PageBreakElement) or (isinstance(element, dict) and element.get("element_type") == "page_break"):
+                element_type_str = "page_break"
+            # --- 结束元素类型判断 ---
+
+            element_text_content = element_text_content.strip() if element_text_content else ""
+
+            if not element_text_content:
+                context.log.debug(f"  Element {element_idx} (type: {element_type_str}) in {doc_id_from_meta} has no text content, skipping.")
+                continue
+            
+            # --- 长元素分割逻辑 (保持不变) ---
+            if len(element_text_content) > config.max_element_text_length_before_split:
+
+                # --- 修改：表格类型的特殊分割处理 ---
+                if element_type_str == "table" and hasattr(element, 'markdown_representation') and element.markdown_representation:
+                    context.log.info(f"  Table Element {element_idx} (markdown_len: {len(element.markdown_representation)}) in {doc_id_from_meta} is too long. Attempting row-based splitting.")
+                    
+                    table_sub_chunks_data = split_markdown_table_by_rows(
+                        element.markdown_representation,
+                        config.target_sentence_split_chunk_size,
+                        config.max_merged_chunk_size, # 使用这个作为单行如果超长时的硬限制
+                        context
+                    )
+                    
+                    # 检查分割是否有效并且产生了与原始不同的块
+                    # (例如，原始表格只有一个数据行但被正确包装，或者分割成了多个块)
+                    # 或者 start_row_index != -1 (表示成功处理)
+                    if table_sub_chunks_data and \
+                       (len(table_sub_chunks_data) > 1 or 
+                        (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["text"] != element.markdown_representation) or
+                        (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["start_row_index"] != -1) ): # -1 表示原始表格无法按行分割
+                        
+                        context.log.info(f"    Successfully split/processed table into {len(table_sub_chunks_data)} sub-chunk(s) by row.")
+                        for sub_idx, chunk_data_dict in enumerate(table_sub_chunks_data):
+                            sub_chunk_text = chunk_data_dict["text"]
+                            start_row = chunk_data_dict["start_row_index"]
+                            end_row = chunk_data_dict["end_row_index"]
+                            
+                            doc_internal_chunk_counter += 1
+                            chunk_meta = parsed_doc.original_metadata.copy()
+                            chunk_meta.update({
+                                "chunk_number_in_doc": doc_internal_chunk_counter,
+                                "source_element_index": element_idx,
+                                "source_element_type": "table_row_chunk", # 保持这个类型
+                                "chunking_strategy": "table_split_by_row_v1",
+                                "is_split_from_long_element": True,
+                                "original_element_text_length": len(element.markdown_representation), # 原始表格markdown总长度
+                                "sub_chunk_sequence_in_element": sub_idx + 1,
+                                "total_sub_chunks_from_element": len(table_sub_chunks_data),
+                                "is_merged_chunk": False,
+                                "table_original_start_row": start_row, # 新增元数据
+                                "table_original_end_row": end_row,     # 新增元数据
+                            })
+                            if source_element_metadata_from_element_obj: # 如 caption
+                                chunk_meta.update(source_element_metadata_from_element_obj)
+                            
+                            initial_chunks.append(ChunkOutput(
+                                chunk_text=sub_chunk_text,
+                                source_document_id=doc_id_from_meta,
+                                chunk_metadata=chunk_meta
+                            ))
+                        continue # 处理完表格，跳过后续的通用句子分割
+                    else:
+                        context.log.warning(f"    Row-based splitting of table (idx {element_idx}) did not result in valid sub-chunks or was not applicable. Falling back to sentence splitting for the entire table markdown.")
+                # --- 结束修改的表格处理 ---
+
+                context.log.info(f"  Element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting sentence splitting.")
+                sentences = split_text_into_sentences(element_text_content)
+                if not sentences:
+                    context.log.warning(f"    Could not split element {element_idx} into sentences. Using RecursiveCharacterTextSplitter as fallback.")
+                    from langchain_text_splitters import RecursiveCharacterTextSplitter
+                    char_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=config.chunk_size, 
+                        chunk_overlap=config.chunk_overlap,
+                        length_function=len
+                    )
+                    sub_chunks_texts = char_splitter.split_text(element_text_content)
+                    for sub_idx, sub_chunk_text in enumerate(sub_chunks_texts):
+                        doc_internal_chunk_counter += 1
+                        chunk_meta = parsed_doc.original_metadata.copy()
+                        chunk_meta.update({
+                            "chunk_number_in_doc": doc_internal_chunk_counter,
+                            "source_element_index": element_idx,
+                            "source_element_type": element_type_str,
+                            "chunking_strategy": "element_char_split_due_to_no_sentence_split_v1",
+                            "is_split_from_long_element": True,
+                            "original_element_text_length": len(element_text_content),
+                            "sub_chunk_sequence_in_element": sub_idx + 1,
+                            "total_sub_chunks_from_element": len(sub_chunks_texts),
+                            "is_merged_chunk": False, # 新增标记
+                        })
+                        if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
+                        element_specific_meta = None
+                        if hasattr(element, 'metadata') and element.metadata:
+                            if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
+                            elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
+                        elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
+                        if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
+                        initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
+                        context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_texts)} (char_split) from element {element_idx} for {doc_id_from_meta}")
+                else: 
+                    current_sub_chunk_sentences = []
+                    current_sub_chunk_length = 0
+                    sub_chunks_generated_for_element = []
+                    for i, sentence in enumerate(sentences):
+                        sentence_len = len(sentence)
+                        if not current_sub_chunk_sentences or \
+                           (current_sub_chunk_length + sentence_len + (1 if current_sub_chunk_sentences else 0) <= config.target_sentence_split_chunk_size):
+                            current_sub_chunk_sentences.append(sentence)
+                            current_sub_chunk_length += sentence_len + (1 if len(current_sub_chunk_sentences) > 1 else 0)
+                        else:
+                            sub_chunks_generated_for_element.append(" ".join(current_sub_chunk_sentences))
+                            overlap_count = config.sentence_split_chunk_overlap_sentences
+                            start_index_for_new_chunk = max(0, len(current_sub_chunk_sentences) - overlap_count)
+                            current_sub_chunk_sentences = current_sub_chunk_sentences[start_index_for_new_chunk:]
+                            current_sub_chunk_sentences.append(sentence)
+                            current_sub_chunk_length = len(" ".join(current_sub_chunk_sentences))
+                    if current_sub_chunk_sentences: sub_chunks_generated_for_element.append(" ".join(current_sub_chunk_sentences))
+                    for sub_idx, sub_chunk_text in enumerate(sub_chunks_generated_for_element):
+                        doc_internal_chunk_counter += 1
+                        chunk_meta = parsed_doc.original_metadata.copy()
+                        chunk_meta.update({
+                            "chunk_number_in_doc": doc_internal_chunk_counter,
+                            "source_element_index": element_idx,
+                            "source_element_type": element_type_str,
+                            "chunking_strategy": "element_split_by_sentence_v1",
+                            "is_split_from_long_element": True,
+                            "original_element_text_length": len(element_text_content),
+                            "sub_chunk_sequence_in_element": sub_idx + 1,
+                            "total_sub_chunks_from_element": len(sub_chunks_generated_for_element),
+                            "is_merged_chunk": False, # 新增标记
+                        })
+                        if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
+                        element_specific_meta = None
+                        if hasattr(element, 'metadata') and element.metadata:
+                            if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
+                            elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
+                        elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
+                        if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
+                        initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
+                        context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_generated_for_element)} (sentence_split) from element {element_idx} for {doc_id_from_meta}")
+            else: 
+                doc_internal_chunk_counter += 1
                 chunk_meta = parsed_doc.original_metadata.copy()
-                chunk_meta.update({"chunk_number": i + 1, "total_chunks_for_doc": len(chunks_text_list)})
-                all_chunks.append(ChunkOutput(chunk_text=chunk_text_content, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
-        except Exception as e:
-            context.log.error(f"Failed to chunk document {doc_id_from_meta}: {e}")
-    context.add_output_metadata(metadata={"total_chunks_generated": len(all_chunks)})
-    return all_chunks
+                chunk_meta.update({
+                    "chunk_number_in_doc": doc_internal_chunk_counter,
+                    "source_element_index": element_idx,
+                    "source_element_type": element_type_str,
+                    "chunking_strategy": "element_as_chunk_v1",
+                    "is_split_from_long_element": False,
+                    "original_element_text_length": len(element_text_content),
+                    "is_merged_chunk": False, # 新增标记
+                })
+                if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
+                element_specific_meta = None
+                if hasattr(element, 'metadata') and element.metadata:
+                    if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
+                    elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
+                elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
+                if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
+                initial_chunks.append(ChunkOutput(chunk_text=element_text_content, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
+                context.log.info(f"  Created chunk from element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} (not split).")
+
+    # --- 开始合并短块的逻辑 ---
+    if not initial_chunks:
+        context.log.info("No initial chunks to process for merging.")
+        return []
+
+    context.log.info(f"Starting short chunk merging process. Initial chunks: {len(initial_chunks)}")
+    context.log.info(f"Merging config: MinLenToAvoidMerge={config.min_chunk_length_to_avoid_merge}, MaxMergedSize={config.max_merged_chunk_size}")
+
+    merged_chunks: List[ChunkOutput] = []
+    i = 0
+    while i < len(initial_chunks):
+        current_chunk = initial_chunks[i]
+        
+        # 检查当前块是否适合作为合并的起点 (自身较短)
+        if len(current_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge:
+            # 尝试向后合并
+            chunks_to_merge = [current_chunk]
+            current_merged_text = current_chunk.chunk_text
+            current_merged_len = len(current_merged_text)
+            
+            j = i + 1
+            while j < len(initial_chunks):
+                next_chunk = initial_chunks[j]
+                
+                # 合并条件检查
+                can_merge = False
+                
+                # 规则1：合并来自同一父元素（因过长而被分割）的相邻短子块
+                if current_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                   next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                   current_chunk.source_document_id == next_chunk.source_document_id and \
+                   current_chunk.chunk_metadata.get("source_element_index") == next_chunk.chunk_metadata.get("source_element_index"):
+                    can_merge = True
+                    merge_reason = "same_parent_split"
+                
+                # 规则2：合并来自原始文档中结构上紧邻且类型相同的短元素块
+                elif not current_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                     not next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                     current_chunk.source_document_id == next_chunk.source_document_id and \
+                     current_chunk.chunk_metadata.get("source_element_type") == next_chunk.chunk_metadata.get("source_element_type") and \
+                     current_chunk.chunk_metadata.get("source_element_index") + 1 == next_chunk.chunk_metadata.get("source_element_index"):
+                    can_merge = True
+                    merge_reason = "adjacent_same_type_short"
+
+                if can_merge:
+                    # 检查合并后是否会超过最大长度
+                    # 对于列表项等，合并时中间最好加换行符
+                    separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
+                    potential_new_len = current_merged_len + len(separator) + len(next_chunk.chunk_text)
+                    
+                    if potential_new_len <= config.max_merged_chunk_size:
+                        chunks_to_merge.append(next_chunk)
+                        current_merged_text += separator + next_chunk.chunk_text
+                        current_merged_len = len(current_merged_text)
+                        j += 1 # 继续尝试合并下一个
+                    else:
+                        # 超过长度，停止这个方向的合并
+                        context.log.debug(f"  Cannot merge next chunk (idx {j}, len {len(next_chunk.chunk_text)}) with current merged (len {current_merged_len}) due to max_merged_chunk_size ({config.max_merged_chunk_size}). Reason: {merge_reason}")
+                        break 
+                else:
+                    # 不符合合并条件，停止这个方向的合并
+                    context.log.debug(f"  Next chunk (idx {j}) does not meet merge criteria with current merged block (idx {i}).")
+                    break
+            
+            if len(chunks_to_merge) > 1:
+                # 执行合并
+                first_merged_chunk = chunks_to_merge[0]
+                last_merged_chunk = chunks_to_merge[-1]
+                
+                merged_meta = first_merged_chunk.chunk_metadata.copy() # 以第一个块的元数据为基础
+                merged_meta["chunking_strategy"] = f"merged_{merge_reason}_v1"
+                merged_meta["is_merged_chunk"] = True
+                merged_meta["original_chunk_ids_merged"] = [c.chunk_id for c in chunks_to_merge]
+                merged_meta["original_texts_lengths_merged"] = [len(c.chunk_text) for c in chunks_to_merge]
+                
+                # 更新元素索引范围 (如果适用)
+                if merge_reason == "adjacent_same_type_short":
+                    merged_meta["source_element_index_range"] = [
+                        first_merged_chunk.chunk_metadata.get("source_element_index"),
+                        last_merged_chunk.chunk_metadata.get("source_element_index")
+                    ]
+                elif merge_reason == "same_parent_split":
+                     merged_meta["sub_chunk_sequence_in_element_range"] = [
+                        first_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element"),
+                        last_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element")
+                    ]
+                
+                # 其他元数据如页码等，可以简单取第一个，或实现更复杂的合并逻辑
+                # merged_meta["page_number"] = first_merged_chunk.chunk_metadata.get("page_number") 
+
+                merged_chunk_output = ChunkOutput(
+                    chunk_text=current_merged_text,
+                    source_document_id=first_merged_chunk.source_document_id,
+                    chunk_metadata=merged_meta
+                )
+                merged_chunks.append(merged_chunk_output)
+                context.log.info(f"  Merged {len(chunks_to_merge)} chunks (indices {i} to {j-1}) into one. New len: {current_merged_len}. Strategy: {merged_meta['chunking_strategy']}.")
+                i = j # 跳过已经被合并的块
+            else:
+                # 当前块虽然短，但未能与后续块合并
+                merged_chunks.append(current_chunk)
+                i += 1
+        else:
+            # 当前块本身不短，直接保留
+            merged_chunks.append(current_chunk)
+            i += 1
+            
+    context.log.info(f"Merging process finished. Total chunks after merging: {len(merged_chunks)}")
+    # 后续可以考虑是否需要对 merged_chunks 重新编号 chunk_number_in_doc
+
+    context.add_output_metadata(metadata={"total_chunks_generated_after_merge": len(merged_chunks)})
+    return merged_chunks
+
+
 
 @dg.asset(
     name="text_embeddings",
@@ -98,6 +629,7 @@ def generate_embeddings_asset(
     context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
     return all_embeddings
 
+
 @dg.asset(
     name="vector_store_embeddings",
     description="Stores text embeddings into a ChromaDB vector store.",
@@ -119,6 +651,7 @@ def vector_storage_asset(
         meta["chunk_text"] = emb.chunk_text
     chroma_db.add_embeddings(ids=ids_to_store, embeddings=embeddings_to_store, metadatas=metadatas_to_store)
     context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
+
 
 class BM25IndexConfig(dg.Config):
     index_file_path: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index/"

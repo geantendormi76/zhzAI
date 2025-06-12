@@ -94,6 +94,9 @@ def load_documents_asset(
     return loaded_docs
 
 
+
+
+
 @dg.asset(
     name="parsed_documents",
     description="Parses loaded documents into text and extracts basic structure using a dispatcher.",
@@ -101,119 +104,120 @@ def load_documents_asset(
     io_manager_key="pydantic_json_io_manager"
 )
 def parse_document_asset(
-    context: dg.AssetExecutionContext, 
-    raw_documents: List[Any]  # <--- 修改: 参数类型注解改为 List[Any]
-) -> List[Any]: # <--- 修改: 返回类型注解改为 List[Any]
-    
-    parsed_docs_output_list: List[Any] = [] # <--- 修改: 变量类型注解改为 List[Any]
+    context: dg.AssetExecutionContext,
+    raw_documents: List[Any]
+) -> List[Any]:
+    parsed_docs_output_list: List[Any] = []
     context.log.info(f"Received {len(raw_documents)} documents to parse.")
 
-    for doc_input_any in raw_documents: # <--- 修改变量名以反映其类型是 Any
-        # Pydantic和字典访问的兼容性处理
-        # 我们需要先判断 doc_input_any 的实际类型
+    for doc_input_any in raw_documents:
         doc_path: str
         file_ext: str
-        raw_content: Union[str, bytes] # 保持 Union 类型
+        raw_content_bytes: Optional[bytes] = None # 将用于文本文件解码
         original_metadata: Dict[str, Any]
 
         if _PYDANTIC_AVAILABLE and isinstance(doc_input_any, LoadedDocumentOutput):
             doc_path = doc_input_any.document_path
             file_ext = doc_input_any.file_type.lower()
-            raw_content = doc_input_any.raw_content
+            if isinstance(doc_input_any.raw_content, bytes): # 确保是字节
+                raw_content_bytes = doc_input_any.raw_content
             original_metadata = doc_input_any.metadata.copy()
-        elif isinstance(doc_input_any, dict): # 如果是字典 (Pydantic不可用时的回退)
+        elif isinstance(doc_input_any, dict):
             doc_path = doc_input_any.get('document_path', '')
             file_ext = doc_input_any.get('file_type', '').lower()
-            raw_content = doc_input_any.get('raw_content', b'') # 默认为空字节串
+            raw_content_value = doc_input_any.get('raw_content')
+            if isinstance(raw_content_value, bytes):
+                raw_content_bytes = raw_content_value
             original_metadata = doc_input_any.get('metadata', {}).copy()
         else:
             context.log.error(f"Skipping document with unexpected type: {type(doc_input_any)}")
             continue
+        
         context.log.info(f"Attempting to parse document: {doc_path} (Type: {file_ext})")
         
+        current_original_metadata = original_metadata.copy() # 使用副本以防修改影响其他迭代
+        current_original_metadata["source_file_path"] = doc_path # 确保路径在元数据中
+
         parsed_output: Optional[Any] = None
-        
-        content_str = ""
-        if isinstance(raw_content, bytes):
-            try:
-                content_str = raw_content.decode('utf-8')
-            except UnicodeDecodeError:
+        input_for_parser: Union[str, bytes] # 将传递给 dispatch_parsing 的内容
+
+        # --- 修改：只对文本类型文件尝试解码 ---
+        if file_ext in [".md", ".html", ".htm", ".txt"]:
+            content_str = ""
+            if raw_content_bytes:
                 try:
-                    content_str = raw_content.decode('gbk')
+                    content_str = raw_content_bytes.decode('utf-8')
                 except UnicodeDecodeError:
-                    context.log.error(f"Could not decode content for {doc_path}. Skipping content-based parsing.")
-                    content_str = f"[Unparsable Content: {doc_path}]"
-        elif isinstance(raw_content, str):
-            content_str = raw_content
+                    try:
+                        content_str = raw_content_bytes.decode('gbk', errors='replace') # 使用replace以避免失败
+                        context.log.warning(f"Decoded {doc_path} with GBK (UTF-8 failed).")
+                    except Exception as e_decode_gbk:
+                        context.log.error(f"Could not decode content for text file {doc_path} with UTF-8 or GBK: {e_decode_gbk}")
+                        content_str = f"[Unreadable Text Content: {doc_path}]"
+            else: # 如果 raw_content_bytes 为 None 或空
+                context.log.warning(f"No raw_content (bytes) found for text file {doc_path}. Treating as empty.")
+            input_for_parser = content_str
+        else: # 对于二进制文件 (docx, pdf, xlsx)，直接传递路径
+            input_for_parser = doc_path
         
-        current_original_metadata = original_metadata
-        current_original_metadata["source_file_path"] = doc_path
-
         try:
-            # --- 修改：使用分发器 ---
-            # 决定是传递路径还是内容字符串
-            # 对于md, html, txt，我们传递content_str
-            # 对于docx, pdf, xlsx，我们传递doc_path
-            input_for_parser = content_str if file_ext in [".md", ".html", ".htm", ".txt"] else doc_path
-            
             parsed_output = dispatch_parsing(file_ext, input_for_parser, current_original_metadata)
-            # --- 修改结束 ---
 
-            if not parsed_output and file_ext != ".txt": # 如果特定解析器失败，但不是txt，尝试纯文本
-                context.log.warning(f"Specific parser for '{file_ext}' failed or returned None for {doc_path}. Falling back to plain text.")
+            # --- 修改：回退逻辑调整 ---
+            if not parsed_output:
+                context.log.warning(f"Parser for '{file_ext}' returned no output for {doc_path}.")
+                fallback_text = ""
+                if file_ext in [".md", ".html", ".htm", ".txt"] and isinstance(input_for_parser, str):
+                    # 对于文本文件，如果解析器失败，原始解码的字符串是最好的回退
+                    fallback_text = input_for_parser 
+                    context.log.info(f"Using raw decoded text as fallback for {doc_path}.")
+                else:
+                    # 对于二进制文件或其他解析失败的情况，标记为无法解析
+                    fallback_text = f"[Content Not Parsed by Specific Parser: {doc_path}]"
+                    context.log.warning(f"Binary or complex file {doc_path} could not be parsed by its specific parser.")
+
                 if _PYDANTIC_AVAILABLE:
-                    elements = [NarrativeTextElement(text=content_str)]
+                    elements = [NarrativeTextElement(text=fallback_text)] if fallback_text else []
                     parsed_output = ParsedDocumentOutput(
-                        parsed_text=content_str, elements=elements, original_metadata=current_original_metadata
+                        parsed_text=fallback_text, 
+                        elements=elements, 
+                        original_metadata=current_original_metadata
                     )
                 else:
-                    elements = [{"element_type":"narrative_text", "text":content_str}]
-                    parsed_output = {"parsed_text":content_str, "elements":elements, "original_metadata":current_original_metadata}
-
-            if file_ext == ".txt" and not parsed_output: # TXT 的特定回退逻辑
-                context.log.info(f"Treating .txt file as plain text: {doc_path}")
-                if _PYDANTIC_AVAILABLE:
-                    elements = [NarrativeTextElement(text=content_str)]
-                    parsed_output = ParsedDocumentOutput(
-                        parsed_text=content_str, elements=elements, original_metadata=current_original_metadata
-                    )
-                else:
-                    elements = [{"element_type":"narrative_text", "text":content_str}]
-                    parsed_output = {"parsed_text":content_str, "elements":elements, "original_metadata":current_original_metadata}
-
+                    elements = [{"element_type": "narrative_text", "text": fallback_text}] if fallback_text else []
+                    parsed_output = {
+                        "parsed_text": fallback_text, 
+                        "elements": elements, 
+                        "original_metadata": current_original_metadata
+                    }
+            
             if parsed_output:
-                # 确保 parsed_output 是 ParsedDocumentOutput 实例或可接受的字典
                 if _PYDANTIC_AVAILABLE and not isinstance(parsed_output, ParsedDocumentOutput) and isinstance(parsed_output, dict):
                     try:
-                        # 尝试将来自解析器回退的字典转换为Pydantic模型
                         parsed_output = ParsedDocumentOutput(**parsed_output)
                     except Exception as e_cast:
                         context.log.error(f"Failed to cast parsed_output dict to Pydantic model for {doc_path}: {e_cast}")
-                        # 回退到错误表示
-                        elements = [NarrativeTextElement(text=f"[Casting Error for {doc_path}]")] if _PYDANTIC_AVAILABLE else [{"element_type":"narrative_text", "text":f"[Casting Error for {doc_path}]"}]
-                        parsed_output = ParsedDocumentOutput(parsed_text=f"[Casting Error for {doc_path}]", elements=elements, original_metadata=current_original_metadata) if _PYDANTIC_AVAILABLE else {"parsed_text":f"[Casting Error for {doc_path}]", "elements":elements, "original_metadata":current_original_metadata}
+                        error_text_cast = f"[Casting Error for {doc_path}]"
+                        elements_cast = [NarrativeTextElement(text=error_text_cast)] if _PYDANTIC_AVAILABLE else [{"element_type":"narrative_text", "text":error_text_cast}]
+                        parsed_output = ParsedDocumentOutput(parsed_text=error_text_cast, elements=elements_cast, original_metadata=current_original_metadata) if _PYDANTIC_AVAILABLE else {"parsed_text":error_text_cast, "elements":elements_cast, "original_metadata":current_original_metadata}
                 
-                parsed_docs_output_list.append(parsed_output) # type: ignore
-                context.log.info(f"Successfully parsed (or created fallback for): {doc_path}")
+                parsed_docs_output_list.append(parsed_output)
+                context.log.info(f"Successfully processed (parsed or created fallback for): {doc_path}")
 
         except Exception as e_parse_asset:
             context.log.error(f"Critical error during parsing asset for {doc_path}: {e_parse_asset}", exc_info=True)
-            error_text = f"[Critical Parsing Exception for {doc_path}: {str(e_parse_asset)}]"
+            error_text_critical = f"[Critical Parsing Exception for {doc_path}: {str(e_parse_asset)}]"
             if _PYDANTIC_AVAILABLE:
-                elements = [NarrativeTextElement(text=error_text)]
+                elements_critical = [NarrativeTextElement(text=error_text_critical)]
                 error_output = ParsedDocumentOutput(
-                    parsed_text=error_text,
-                    elements=elements, # type: ignore
-                    original_metadata=current_original_metadata
+                    parsed_text=error_text_critical, elements=elements_critical, original_metadata=current_original_metadata
                 )
             else:
-                elements = [{"element_type": "narrative_text", "text": error_text}]
+                elements_critical = [{"element_type": "narrative_text", "text": error_text_critical}]
                 error_output = {
-                    "parsed_text": error_text,
-                    "elements": elements,
-                    "original_metadata": current_original_metadata
+                    "parsed_text": error_text_critical, "elements": elements_critical, "original_metadata": current_original_metadata
                 }
-            parsed_docs_output_list.append(error_output) # type: ignore
+            parsed_docs_output_list.append(error_output)
             
     if parsed_docs_output_list:
         context.add_output_metadata(
@@ -223,5 +227,7 @@ def parse_document_asset(
             }
         )
     return parsed_docs_output_list
+
+
 
 all_ingestion_assets = [load_documents_asset, parse_document_asset]
