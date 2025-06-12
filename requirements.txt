@@ -21,6 +21,9 @@ torch==2.7.0                 # 您 freeze 输出中的版本
 numpy==2.2.6                 # 您 freeze 输出中的版本 (注意：如果导致问题，可能需要回退到 <2.0)
 kuzu # 让 uv 选择最新兼容版，或根据 Dagster 需求指定
 portalocker # KuzuDB 可能需要
+unstructured[docx]==0.14.10 # 固定一个较新且稳定的版本
+markdownify==0.12.1       # 用于HTML转Markdown
+
 
 # --- Dagster Workflow ---
 dagster==1.10.17             # 您当前使用的版本，假设兼容 Pydantic V2

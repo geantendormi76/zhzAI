@@ -2,7 +2,21 @@
 import os
 from markdown_it import MarkdownIt
 import logging
-from typing import List, Dict, Any, Optional, Union # Literal for Pydantic models if defined here
+from typing import List, Dict, Any, Optional, Union, Literal 
+
+# --- 添加 Unstructured 的导入 ---
+try:
+    from unstructured.partition.docx import partition_docx
+    from unstructured.documents.elements import Element as UnstructuredElement # 用于类型提示
+    # 如果需要更细致的Unstructured元素类型，也可以导入，例如：
+    # from unstructured.documents.elements import Title as UnstructuredTitle, NarrativeText as UnstructuredNarrativeText, etc.
+    _UNSTRUCTURED_AVAILABLE = True
+    print("INFO (document_parsers.py): Successfully imported Unstructured for DOCX.")
+except ImportError:
+    print("WARNING (document_parsers.py): Unstructured library not found. DOCX parsing will be a placeholder.")
+    _UNSTRUCTURED_AVAILABLE = False
+    class UnstructuredElement: pass # Dummy
+# --- 结束添加 ---
 
 # --- 导入我们定义的Pydantic模型 ---
 # 假设这个文件和 pydantic_models_dagster.py 在同一个包下或能通过PYTHONPATH找到
@@ -37,6 +51,8 @@ except ImportError:
 logger = logging.getLogger(__name__) # 每个模块用自己的logger
 
 # --- Markdown 解析逻辑 (从 poc_md_markdown_it.py 迁移并封装) ---
+
+
 
 def _get_text_from_md_inline(inline_tokens: Optional[List[Any]]) -> str:
     # (这里是 get_text_from_inline_tokens 函数的完整代码)
