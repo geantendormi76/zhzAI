@@ -39,8 +39,7 @@ import bm25s
 import pickle
 import numpy as np
 import os
-import time
-
+from zhz_rag.utils.common_utils import normalize_text_for_id
 
 _PYDANTIC_AVAILABLE = False
 try:
@@ -87,6 +86,16 @@ except ImportError:
     DocumentElementType = Any # type: ignore
 # --- 结束 Pydantic 模型导入 ---
 
+import logging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG) # <--- 确保是 DEBUG
+    logger.info(f"Logger for {__name__} (processing_assets) configured with DEBUG level.")
+
 
 class TextChunkerConfig(dg.Config):
     chunk_size: int = 1000 
@@ -130,6 +139,7 @@ def split_text_into_sentences(text: str) -> List[str]:
     # sentences = re.split(r'(?<=[。？！\.!\?])\s*', text)
     # sentences = [s.strip() for s in sentences if s.strip()]
     return result if result else [text] # 如果无法分割，返回原文本作为一个句子
+
 
 
 def split_markdown_table_by_rows(
@@ -235,9 +245,101 @@ def split_markdown_table_by_rows(
     return sub_chunks_data
 
 
+
+def split_code_block_by_blank_lines(
+    code_text: str,
+    target_chunk_size: int, # 复用配置，但对于代码块，这个更像是一个上限指导
+    max_chunk_size: int,    # 作为硬上限
+    context: Optional[dg.AssetExecutionContext] = None
+) -> List[str]:
+    """
+    Splits a code block string by blank lines (one or more empty lines).
+    Tries to keep resulting chunks from exceeding max_chunk_size.
+    """
+    if not code_text.strip():
+        return []
+
+    # 使用正则表达式匹配一个或多个连续的空行作为分隔符
+    # \n\s*\n 匹配一个换行符，后跟零或多个空白字符，再跟一个换行符
+    potential_splits = re.split(r'(\n\s*\n)', code_text) # 保留分隔符以便后续处理
+    
+    sub_chunks = []
+    current_chunk_lines = []
+    current_chunk_char_count = 0
+
+    # 第一个块总是从头开始
+    if potential_splits:
+        first_part = potential_splits.pop(0).strip()
+        if first_part:
+            current_chunk_lines.append(first_part)
+            current_chunk_char_count += len(first_part)
+
+    while potential_splits:
+        delimiter = potential_splits.pop(0) # 这是分隔符 \n\s*\n
+        if not potential_splits: # 没有更多内容了
+            if delimiter.strip(): # 如果分隔符本身不是纯空白，也算内容
+                 current_chunk_lines.append(delimiter.rstrip()) # 保留末尾的换行
+                 current_chunk_char_count += len(delimiter.rstrip())
+            break 
+        
+        next_part = potential_splits.pop(0).strip()
+        if not next_part: # 如果下一个部分是空的，只处理分隔符
+            if delimiter.strip():
+                current_chunk_lines.append(delimiter.rstrip())
+                current_chunk_char_count += len(delimiter.rstrip())
+            continue
+
+        # 检查加入 delimiter 和 next_part 是否会超长
+        # 对于代码，我们通常希望在逻辑断点（空行）处分割，即使块较小
+        # 但如果单个由空行分隔的块本身就超过 max_chunk_size，则需要进一步处理（目前简单截断或接受）
+        
+        # 简化逻辑：如果当前块非空，并且加入下一个部分（包括分隔的空行）会超过目标大小，
+        # 或者严格超过最大大小，则结束当前块。
+        # 这里的分隔符（空行）本身也应该被视为块的一部分，或者作为块的自然结束。
+
+        # 更简单的策略：每个由 re.split 分割出来的非空部分（即代码段）自成一块
+        # 如果代码段本身过长，则接受它，或者未来再细分
+        if current_chunk_lines: # 如果当前块有内容
+            # 检查如果加上 next_part 是否会超长（这里可以简化，因为空行分割通常意味着逻辑单元）
+            # 我们先假设每个由空行分割的块都是一个独立的单元
+            sub_chunks.append("\n".join(current_chunk_lines))
+            if context: context.log.debug(f"  Code sub-chunk created (blank line split), len: {current_chunk_char_count}")
+            current_chunk_lines = []
+            current_chunk_char_count = 0
+        
+        if next_part: # 开始新的块
+            current_chunk_lines.append(next_part)
+            current_chunk_char_count += len(next_part)
+
+    # 添加最后一个正在构建的子块
+    if current_chunk_lines:
+        sub_chunks.append("\n".join(current_chunk_lines))
+        if context: context.log.debug(f"  Code sub-chunk created (blank line split, last), len: {current_chunk_char_count}")
+
+    if not sub_chunks and code_text: # 如果完全没分割出任何东西（例如代码没有空行）
+        if context: context.log.warning("Code block splitting by blank lines resulted in no sub-chunks. Returning original code block.")
+        # 对于这种情况，我们可能需要一个字符分割器作为最终回退
+        # 但为了简单起见，我们先返回原始代码块
+        # 如果原始代码块 > max_chunk_size，它仍然会是一个大块
+        if len(code_text) > max_chunk_size:
+            if context: context.log.warning(f"  Original code block (len: {len(code_text)}) exceeds max_chunk_size ({max_chunk_size}) and was not split by blank lines. Consider character splitting as fallback.")
+            # 这里可以插入 RecursiveCharacterTextSplitter 逻辑
+            # from langchain_text_splitters import RecursiveCharacterTextSplitter
+            # char_splitter = RecursiveCharacterTextSplitter(chunk_size=max_chunk_size, chunk_overlap=0, separators=["\n", " ", ""])
+            # sub_chunks = char_splitter.split_text(code_text)
+            # if context: context.log.info(f"    Fallback: Code block character split into {len(sub_chunks)} parts.")
+            # return sub_chunks
+        return [code_text] # 暂时返回原块
+
+    # 过滤掉完全是空字符串的块 (re.split 可能产生)
+    final_sub_chunks = [chunk for chunk in sub_chunks if chunk.strip()]
+    return final_sub_chunks if final_sub_chunks else [code_text]
+
+
+
 @dg.asset(
     name="text_chunks",
-    description="Cleans and chunks parsed documents. Splits long elements and merges short ones.", # 更新描述
+    description="Cleans/chunks documents. Splits long elements, merges short ones, enriches with contextual metadata.",
     group_name="processing",
     deps=["parsed_documents"]
 )
@@ -246,7 +348,7 @@ def clean_chunk_text_asset(
     config: TextChunkerConfig,
     parsed_documents: List[ParsedDocumentOutput]
 ) -> List[ChunkOutput]:
-    initial_chunks: List[ChunkOutput] = [] # 先收集初步处理的块
+    initial_chunks: List[ChunkOutput] = []
     context.log.info(f"Received {len(parsed_documents)} parsed documents for initial chunking.")
     context.log.info(f"Initial chunking config: MaxElemLen={config.max_element_text_length_before_split}, "
                      f"TargetSubChunkSize={config.target_sentence_split_chunk_size}, "
@@ -255,6 +357,8 @@ def clean_chunk_text_asset(
     for doc_idx, parsed_doc in enumerate(parsed_documents):
         doc_id_from_meta = parsed_doc.original_metadata.get("filename", f"doc_{doc_idx}_{str(uuid.uuid4())}")
         context.log.info(f"Processing document for initial chunks: {doc_id_from_meta}")
+
+        current_title_hierarchy: Dict[int, str] = {}
 
         if not parsed_doc.elements:
             context.log.warning(f"Document {doc_id_from_meta} has no structured elements.")
@@ -272,12 +376,13 @@ def clean_chunk_text_asset(
                     for i, chunk_text_content in enumerate(chunks_text_list):
                         chunk_meta = parsed_doc.original_metadata.copy()
                         chunk_meta.update({
-                            "chunk_number_in_doc": len(initial_chunks) + 1, # 全局chunk编号
+                            "chunk_number_in_doc": len(initial_chunks) + 1,
                             "sub_chunk_sequence": i + 1,
                             "total_sub_chunks": len(chunks_text_list),
                             "chunking_strategy": "fallback_recursive_char_split_on_parsed_text",
                             "original_element_text_length": len(parsed_doc.parsed_text.strip()),
-                            "is_merged_chunk": False, # 新增标记
+                            "title_hierarchy": {},
+                            "is_merged_chunk": False,
                         })
                         initial_chunks.append(ChunkOutput(
                             chunk_text=chunk_text_content,
@@ -295,11 +400,18 @@ def clean_chunk_text_asset(
             element_type_str = "unknown"
             source_element_metadata_from_element_obj = {}
 
-            # --- 根据元素类型提取文本和元数据 (保持不变) ---
             if isinstance(element, TitleElement) or (isinstance(element, dict) and element.get("element_type") == "title"):
                 element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
                 element_type_str = "title"
-                source_element_metadata_from_element_obj["level"] = element.level if hasattr(element, 'level') else element.get("level")
+                title_level = element.level if hasattr(element, 'level') else element.get("level", 1)
+                source_element_metadata_from_element_obj["level"] = title_level
+                
+                keys_to_remove = [lvl for lvl in current_title_hierarchy if lvl >= title_level]
+                for key in keys_to_remove:
+                    del current_title_hierarchy[key]
+                current_title_hierarchy[title_level] = element_text_content.strip()
+                logger.debug(f"  Updated title hierarchy for {doc_id_from_meta}: {current_title_hierarchy}")
+
             elif isinstance(element, NarrativeTextElement) or (isinstance(element, dict) and element.get("element_type") == "narrative_text"):
                 element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
                 element_type_str = "narrative_text"
@@ -324,105 +436,126 @@ def clean_chunk_text_asset(
                 source_element_metadata_from_element_obj["language"] = element.language if hasattr(element, 'language') else element.get("language")
             elif isinstance(element, PageBreakElement) or (isinstance(element, dict) and element.get("element_type") == "page_break"):
                 element_type_str = "page_break"
-            # --- 结束元素类型判断 ---
 
             element_text_content = element_text_content.strip() if element_text_content else ""
 
-            if not element_text_content:
-                context.log.debug(f"  Element {element_idx} (type: {element_type_str}) in {doc_id_from_meta} has no text content, skipping.")
+            if not element_text_content and element_type_str != "page_break":
+                context.log.debug(f"  Element {element_idx} (type: {element_type_str}) in {doc_id_from_meta} has no text content, skipping chunk creation.")
                 continue
             
-            # --- 长元素分割逻辑 (保持不变) ---
-            if len(element_text_content) > config.max_element_text_length_before_split:
+            base_chunk_meta = parsed_doc.original_metadata.copy()
+            base_chunk_meta.update({
+                "source_element_index": element_idx,
+                "source_element_type": element_type_str,
+                "title_hierarchy": current_title_hierarchy.copy(),
+                "is_merged_chunk": False,
+            })
+            if source_element_metadata_from_element_obj:
+                base_chunk_meta.update(source_element_metadata_from_element_obj)
+            
+            element_specific_meta = None
+            if hasattr(element, 'metadata') and element.metadata:
+                if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata):
+                    element_specific_meta = element.metadata.model_dump(exclude_none=True)
+                elif isinstance(element.metadata, dict):
+                    element_specific_meta = element.metadata
+            elif isinstance(element, dict) and element.get("metadata"):
+                element_specific_meta = element.get("metadata")
+            if element_specific_meta:
+                base_chunk_meta.update({f"el_{k}": v for k, v in element_specific_meta.items()})
 
-                # --- 修改：表格类型的特殊分割处理 ---
+            if len(element_text_content) > config.max_element_text_length_before_split:
+                sub_chunks_created_count = 0
+                
                 if element_type_str == "table" and hasattr(element, 'markdown_representation') and element.markdown_representation:
                     context.log.info(f"  Table Element {element_idx} (markdown_len: {len(element.markdown_representation)}) in {doc_id_from_meta} is too long. Attempting row-based splitting.")
-                    
                     table_sub_chunks_data = split_markdown_table_by_rows(
                         element.markdown_representation,
                         config.target_sentence_split_chunk_size,
-                        config.max_merged_chunk_size, # 使用这个作为单行如果超长时的硬限制
+                        config.max_merged_chunk_size,
                         context
                     )
                     
-                    # 检查分割是否有效并且产生了与原始不同的块
-                    # (例如，原始表格只有一个数据行但被正确包装，或者分割成了多个块)
-                    # 或者 start_row_index != -1 (表示成功处理)
                     if table_sub_chunks_data and \
-                       (len(table_sub_chunks_data) > 1 or 
-                        (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["text"] != element.markdown_representation) or
-                        (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["start_row_index"] != -1) ): # -1 表示原始表格无法按行分割
+                       (len(table_sub_chunks_data) > 1 or
+                       (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["text"] != element.markdown_representation) or
+                       (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["start_row_index"] != -1)):
                         
                         context.log.info(f"    Successfully split/processed table into {len(table_sub_chunks_data)} sub-chunk(s) by row.")
                         for sub_idx, chunk_data_dict in enumerate(table_sub_chunks_data):
-                            sub_chunk_text = chunk_data_dict["text"]
-                            start_row = chunk_data_dict["start_row_index"]
-                            end_row = chunk_data_dict["end_row_index"]
-                            
                             doc_internal_chunk_counter += 1
-                            chunk_meta = parsed_doc.original_metadata.copy()
+                            chunk_meta = base_chunk_meta.copy()
                             chunk_meta.update({
                                 "chunk_number_in_doc": doc_internal_chunk_counter,
-                                "source_element_index": element_idx,
-                                "source_element_type": "table_row_chunk", # 保持这个类型
+                                "source_element_type": "table_row_chunk",
                                 "chunking_strategy": "table_split_by_row_v1",
                                 "is_split_from_long_element": True,
-                                "original_element_text_length": len(element.markdown_representation), # 原始表格markdown总长度
+                                "original_element_text_length": len(element.markdown_representation),
                                 "sub_chunk_sequence_in_element": sub_idx + 1,
                                 "total_sub_chunks_from_element": len(table_sub_chunks_data),
-                                "is_merged_chunk": False,
-                                "table_original_start_row": start_row, # 新增元数据
-                                "table_original_end_row": end_row,     # 新增元数据
+                                "table_original_start_row": chunk_data_dict["start_row_index"],
+                                "table_original_end_row": chunk_data_dict["end_row_index"],
                             })
-                            if source_element_metadata_from_element_obj: # 如 caption
-                                chunk_meta.update(source_element_metadata_from_element_obj)
-                            
-                            initial_chunks.append(ChunkOutput(
-                                chunk_text=sub_chunk_text,
-                                source_document_id=doc_id_from_meta,
-                                chunk_metadata=chunk_meta
-                            ))
-                        continue # 处理完表格，跳过后续的通用句子分割
+                            initial_chunks.append(ChunkOutput(chunk_text=chunk_data_dict["text"], source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
+                            sub_chunks_created_count += 1
+                        if sub_chunks_created_count > 0: continue
                     else:
                         context.log.warning(f"    Row-based splitting of table (idx {element_idx}) did not result in valid sub-chunks or was not applicable. Falling back to sentence splitting for the entire table markdown.")
-                # --- 结束修改的表格处理 ---
 
-                context.log.info(f"  Element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting sentence splitting.")
+                elif element_type_str == "code_block":
+                    context.log.info(f"  Code Block Element {element_idx} (len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting blank line splitting.")
+                    code_sub_chunks = split_code_block_by_blank_lines(
+                        element_text_content,
+                        config.target_sentence_split_chunk_size,
+                        config.max_merged_chunk_size,
+                        context
+                    )
+                    if code_sub_chunks and (len(code_sub_chunks) > 1 or code_sub_chunks[0] != element_text_content):
+                        context.log.info(f"    Successfully split code block into {len(code_sub_chunks)} sub-chunks by blank lines.")
+                        for sub_idx, sub_chunk_text in enumerate(code_sub_chunks):
+                            if not sub_chunk_text.strip(): continue
+                            doc_internal_chunk_counter += 1
+                            chunk_meta = base_chunk_meta.copy()
+                            chunk_meta.update({
+                                "chunk_number_in_doc": doc_internal_chunk_counter,
+                                "source_element_type": "code_fragment",
+                                "chunking_strategy": "code_split_by_blank_line_v1",
+                                "is_split_from_long_element": True,
+                                "original_element_text_length": len(element_text_content),
+                                "sub_chunk_sequence_in_element": sub_idx + 1,
+                                "total_sub_chunks_from_element": len(code_sub_chunks),
+                            })
+                            initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
+                            sub_chunks_created_count += 1
+                        if sub_chunks_created_count > 0: continue
+                    else:
+                        context.log.warning(f"    Blank line splitting of code block (idx {element_idx}) did not result in multiple chunks or failed. Falling back to sentence/char splitting for the code content.")
+
+                context.log.info(f"  Element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting sentence splitting (or fallback).")
                 sentences = split_text_into_sentences(element_text_content)
                 if not sentences:
                     context.log.warning(f"    Could not split element {element_idx} into sentences. Using RecursiveCharacterTextSplitter as fallback.")
                     from langchain_text_splitters import RecursiveCharacterTextSplitter
                     char_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=config.chunk_size, 
+                        chunk_size=config.chunk_size,
                         chunk_overlap=config.chunk_overlap,
                         length_function=len
                     )
                     sub_chunks_texts = char_splitter.split_text(element_text_content)
                     for sub_idx, sub_chunk_text in enumerate(sub_chunks_texts):
                         doc_internal_chunk_counter += 1
-                        chunk_meta = parsed_doc.original_metadata.copy()
+                        chunk_meta = base_chunk_meta.copy()
                         chunk_meta.update({
                             "chunk_number_in_doc": doc_internal_chunk_counter,
-                            "source_element_index": element_idx,
-                            "source_element_type": element_type_str,
                             "chunking_strategy": "element_char_split_due_to_no_sentence_split_v1",
                             "is_split_from_long_element": True,
                             "original_element_text_length": len(element_text_content),
                             "sub_chunk_sequence_in_element": sub_idx + 1,
                             "total_sub_chunks_from_element": len(sub_chunks_texts),
-                            "is_merged_chunk": False, # 新增标记
                         })
-                        if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
-                        element_specific_meta = None
-                        if hasattr(element, 'metadata') and element.metadata:
-                            if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
-                            elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
-                        elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
-                        if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
                         initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
                         context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_texts)} (char_split) from element {element_idx} for {doc_id_from_meta}")
-                else: 
+                else:
                     current_sub_chunk_sentences = []
                     current_sub_chunk_length = 0
                     sub_chunks_generated_for_element = []
@@ -439,165 +572,162 @@ def clean_chunk_text_asset(
                             current_sub_chunk_sentences = current_sub_chunk_sentences[start_index_for_new_chunk:]
                             current_sub_chunk_sentences.append(sentence)
                             current_sub_chunk_length = len(" ".join(current_sub_chunk_sentences))
-                    if current_sub_chunk_sentences: sub_chunks_generated_for_element.append(" ".join(current_sub_chunk_sentences))
+                    if current_sub_chunk_sentences:
+                        sub_chunks_generated_for_element.append(" ".join(current_sub_chunk_sentences))
+
                     for sub_idx, sub_chunk_text in enumerate(sub_chunks_generated_for_element):
                         doc_internal_chunk_counter += 1
-                        chunk_meta = parsed_doc.original_metadata.copy()
+                        chunk_meta = base_chunk_meta.copy()
                         chunk_meta.update({
                             "chunk_number_in_doc": doc_internal_chunk_counter,
-                            "source_element_index": element_idx,
-                            "source_element_type": element_type_str,
                             "chunking_strategy": "element_split_by_sentence_v1",
                             "is_split_from_long_element": True,
                             "original_element_text_length": len(element_text_content),
                             "sub_chunk_sequence_in_element": sub_idx + 1,
                             "total_sub_chunks_from_element": len(sub_chunks_generated_for_element),
-                            "is_merged_chunk": False, # 新增标记
                         })
-                        if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
-                        element_specific_meta = None
-                        if hasattr(element, 'metadata') and element.metadata:
-                            if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
-                            elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
-                        elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
-                        if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
                         initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
                         context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_generated_for_element)} (sentence_split) from element {element_idx} for {doc_id_from_meta}")
-            else: 
+            
+            else:
                 doc_internal_chunk_counter += 1
-                chunk_meta = parsed_doc.original_metadata.copy()
+                chunk_meta = base_chunk_meta.copy()
                 chunk_meta.update({
                     "chunk_number_in_doc": doc_internal_chunk_counter,
-                    "source_element_index": element_idx,
-                    "source_element_type": element_type_str,
                     "chunking_strategy": "element_as_chunk_v1",
                     "is_split_from_long_element": False,
                     "original_element_text_length": len(element_text_content),
-                    "is_merged_chunk": False, # 新增标记
                 })
-                if source_element_metadata_from_element_obj: chunk_meta.update(source_element_metadata_from_element_obj)
-                element_specific_meta = None
-                if hasattr(element, 'metadata') and element.metadata:
-                    if _PYDANTIC_AVAILABLE and isinstance(element.metadata, DocumentElementMetadata): element_specific_meta = element.metadata.model_dump(exclude_none=True)
-                    elif isinstance(element.metadata, dict): element_specific_meta = element.metadata
-                elif isinstance(element, dict) and element.get("metadata"): element_specific_meta = element.get("metadata")
-                if element_specific_meta: chunk_meta.update({f"el_{k}": v for k,v in element_specific_meta.items()})
                 initial_chunks.append(ChunkOutput(chunk_text=element_text_content, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
                 context.log.info(f"  Created chunk from element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} (not split).")
 
-    # --- 开始合并短块的逻辑 ---
     if not initial_chunks:
         context.log.info("No initial chunks to process for merging.")
         return []
 
     context.log.info(f"Starting short chunk merging process. Initial chunks: {len(initial_chunks)}")
     context.log.info(f"Merging config: MinLenToAvoidMerge={config.min_chunk_length_to_avoid_merge}, MaxMergedSize={config.max_merged_chunk_size}")
-
+    
     merged_chunks: List[ChunkOutput] = []
     i = 0
     while i < len(initial_chunks):
         current_chunk = initial_chunks[i]
         
-        # 检查当前块是否适合作为合并的起点 (自身较短)
-        if len(current_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge:
-            # 尝试向后合并
+        merged_this_iteration = False
+
+        if len(current_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge or \
+           current_chunk.chunk_metadata.get("source_element_type") == "title":
+
             chunks_to_merge = [current_chunk]
             current_merged_text = current_chunk.chunk_text
             current_merged_len = len(current_merged_text)
             
             j = i + 1
-            while j < len(initial_chunks):
+            if j < len(initial_chunks):
                 next_chunk = initial_chunks[j]
                 
-                # 合并条件检查
                 can_merge = False
-                
-                # 规则1：合并来自同一父元素（因过长而被分割）的相邻短子块
-                if current_chunk.chunk_metadata.get("is_split_from_long_element") and \
-                   next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                merge_reason = ""
+                potential_merged_text = ""
+
+                is_current_short_title = (
+                    current_chunk.chunk_metadata.get("source_element_type") == "title" and
+                    len(current_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge
+                )
+                is_next_short_narrative = (
+                    next_chunk.chunk_metadata.get("source_element_type") == "narrative_text" and
+                    len(next_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge
+                )
+
+                if is_current_short_title and is_next_short_narrative and \
                    current_chunk.source_document_id == next_chunk.source_document_id and \
-                   current_chunk.chunk_metadata.get("source_element_index") == next_chunk.chunk_metadata.get("source_element_index"):
-                    can_merge = True
-                    merge_reason = "same_parent_split"
-                
-                # 规则2：合并来自原始文档中结构上紧邻且类型相同的短元素块
-                elif not current_chunk.chunk_metadata.get("is_split_from_long_element") and \
-                     not next_chunk.chunk_metadata.get("is_split_from_long_element") and \
-                     current_chunk.source_document_id == next_chunk.source_document_id and \
-                     current_chunk.chunk_metadata.get("source_element_type") == next_chunk.chunk_metadata.get("source_element_type") and \
-                     current_chunk.chunk_metadata.get("source_element_index") + 1 == next_chunk.chunk_metadata.get("source_element_index"):
-                    can_merge = True
-                    merge_reason = "adjacent_same_type_short"
+                   current_chunk.chunk_metadata.get("source_element_index", -2) + 1 == next_chunk.chunk_metadata.get("source_element_index", -1):
+                    
+                    temp_merged_text = current_chunk.chunk_text + "\n\n" + next_chunk.chunk_text
+                    if len(temp_merged_text) <= config.max_merged_chunk_size:
+                        can_merge = True
+                        merge_reason = "title_narrative"
+                        potential_merged_text = temp_merged_text
+                        chunks_to_merge.append(next_chunk)
+
+                if not can_merge:
+                    if current_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                       next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                       current_chunk.chunk_metadata.get("source_document_id") == next_chunk.chunk_metadata.get("source_document_id") and \
+                       current_chunk.chunk_metadata.get("source_element_index") == next_chunk.chunk_metadata.get("source_element_index"):
+                        
+                        separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
+                        temp_merged_text = current_merged_text + separator + next_chunk.chunk_text
+                        if len(temp_merged_text) <= config.max_merged_chunk_size:
+                            can_merge = True
+                            merge_reason = "same_parent_split"
+                            potential_merged_text = temp_merged_text
+                            chunks_to_merge.append(next_chunk)
+                    
+                    elif not current_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                         not next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                         current_chunk.chunk_metadata.get("source_document_id") == next_chunk.chunk_metadata.get("source_document_id") and \
+                         current_chunk.chunk_metadata.get("source_element_type") == next_chunk.chunk_metadata.get("source_element_type") and \
+                         current_chunk.chunk_metadata.get("source_element_index", -2) + 1 == next_chunk.chunk_metadata.get("source_element_index", -1):
+                         
+                        separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
+                        temp_merged_text = current_merged_text + separator + next_chunk.chunk_text
+                        if len(temp_merged_text) <= config.max_merged_chunk_size:
+                            can_merge = True
+                            merge_reason = "adjacent_same_type_short"
+                            potential_merged_text = temp_merged_text
+                            chunks_to_merge.append(next_chunk)
 
                 if can_merge:
-                    # 检查合并后是否会超过最大长度
-                    # 对于列表项等，合并时中间最好加换行符
-                    separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
-                    potential_new_len = current_merged_len + len(separator) + len(next_chunk.chunk_text)
+                    first_merged_chunk = chunks_to_merge[0]
+                    second_merged_chunk = chunks_to_merge[1]
                     
-                    if potential_new_len <= config.max_merged_chunk_size:
-                        chunks_to_merge.append(next_chunk)
-                        current_merged_text += separator + next_chunk.chunk_text
-                        current_merged_len = len(current_merged_text)
-                        j += 1 # 继续尝试合并下一个
-                    else:
-                        # 超过长度，停止这个方向的合并
-                        context.log.debug(f"  Cannot merge next chunk (idx {j}, len {len(next_chunk.chunk_text)}) with current merged (len {current_merged_len}) due to max_merged_chunk_size ({config.max_merged_chunk_size}). Reason: {merge_reason}")
-                        break 
-                else:
-                    # 不符合合并条件，停止这个方向的合并
-                    context.log.debug(f"  Next chunk (idx {j}) does not meet merge criteria with current merged block (idx {i}).")
-                    break
+                    merged_meta = first_merged_chunk.chunk_metadata.copy() 
+                    final_merge_reason = merge_reason if merge_reason else "unknown_merge_rule"
+                    merged_meta["chunking_strategy"] = f"merged_{final_merge_reason}_v1"
+                    merged_meta["is_merged_chunk"] = True
+                    merged_meta["original_chunk_ids_merged"] = [c.chunk_id for c in chunks_to_merge]
+                    merged_meta["original_texts_lengths_merged"] = [len(c.chunk_text) for c in chunks_to_merge]
+                    
+                    if merge_reason == "title_narrative":
+                        merged_meta["source_element_type"] = "narrative_text"
+                        merged_meta["source_element_index_range"] = [
+                            first_merged_chunk.chunk_metadata.get("source_element_index"),
+                            second_merged_chunk.chunk_metadata.get("source_element_index")
+                        ]
+                        merged_meta["title_hierarchy"] = first_merged_chunk.chunk_metadata.get("title_hierarchy", {}) 
+                    elif merge_reason == "adjacent_same_type_short":
+                        merged_meta["source_element_index_range"] = [
+                            first_merged_chunk.chunk_metadata.get("source_element_index"),
+                            second_merged_chunk.chunk_metadata.get("source_element_index")
+                        ]
+                    elif merge_reason == "same_parent_split":
+                        merged_meta["sub_chunk_sequence_in_element_range"] = [
+                            first_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element"),
+                            second_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element")
+                        ]
+                    
+                    merged_chunk_output = ChunkOutput(
+                        chunk_text=potential_merged_text,
+                        source_document_id=first_merged_chunk.source_document_id,
+                        chunk_metadata=merged_meta
+                    )
+                    merged_chunks.append(merged_chunk_output)
+                    context.log.info(f"  Merged 2 chunks (indices {i} and {i+1}) into one. New len: {len(potential_merged_text)}. Strategy: {merged_meta['chunking_strategy']}.")
+                    i += 2
+                    merged_this_iteration = True
             
-            if len(chunks_to_merge) > 1:
-                # 执行合并
-                first_merged_chunk = chunks_to_merge[0]
-                last_merged_chunk = chunks_to_merge[-1]
-                
-                merged_meta = first_merged_chunk.chunk_metadata.copy() # 以第一个块的元数据为基础
-                merged_meta["chunking_strategy"] = f"merged_{merge_reason}_v1"
-                merged_meta["is_merged_chunk"] = True
-                merged_meta["original_chunk_ids_merged"] = [c.chunk_id for c in chunks_to_merge]
-                merged_meta["original_texts_lengths_merged"] = [len(c.chunk_text) for c in chunks_to_merge]
-                
-                # 更新元素索引范围 (如果适用)
-                if merge_reason == "adjacent_same_type_short":
-                    merged_meta["source_element_index_range"] = [
-                        first_merged_chunk.chunk_metadata.get("source_element_index"),
-                        last_merged_chunk.chunk_metadata.get("source_element_index")
-                    ]
-                elif merge_reason == "same_parent_split":
-                     merged_meta["sub_chunk_sequence_in_element_range"] = [
-                        first_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element"),
-                        last_merged_chunk.chunk_metadata.get("sub_chunk_sequence_in_element")
-                    ]
-                
-                # 其他元数据如页码等，可以简单取第一个，或实现更复杂的合并逻辑
-                # merged_meta["page_number"] = first_merged_chunk.chunk_metadata.get("page_number") 
-
-                merged_chunk_output = ChunkOutput(
-                    chunk_text=current_merged_text,
-                    source_document_id=first_merged_chunk.source_document_id,
-                    chunk_metadata=merged_meta
-                )
-                merged_chunks.append(merged_chunk_output)
-                context.log.info(f"  Merged {len(chunks_to_merge)} chunks (indices {i} to {j-1}) into one. New len: {current_merged_len}. Strategy: {merged_meta['chunking_strategy']}.")
-                i = j # 跳过已经被合并的块
-            else:
-                # 当前块虽然短，但未能与后续块合并
+            if not merged_this_iteration:
                 merged_chunks.append(current_chunk)
                 i += 1
         else:
-            # 当前块本身不短，直接保留
             merged_chunks.append(current_chunk)
             i += 1
             
     context.log.info(f"Merging process finished. Total chunks after merging: {len(merged_chunks)}")
-    # 后续可以考虑是否需要对 merged_chunks 重新编号 chunk_number_in_doc
 
     context.add_output_metadata(metadata={"total_chunks_generated_after_merge": len(merged_chunks)})
     return merged_chunks
-
 
 
 @dg.asset(

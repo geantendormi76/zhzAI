@@ -103,6 +103,6 @@ Thumbs.db
 
 local_models/
 stored_data/
-manual_tests
-
+manual_tests/
+mini_service_payload/
 project_snapshot.txt

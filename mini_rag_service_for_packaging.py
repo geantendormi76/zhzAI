@@ -105,52 +105,69 @@ async def startup_event():
 
     # --- 加载 Reranker 模型 (保持不变) ---
     logger.info("Attempting to load Reranker model...")
-    try:
-        actual_reranker_path = os.getenv("RERANKER_MODEL_PATH")
-        if not actual_reranker_path or not os.path.isdir(actual_reranker_path):
-            logger.error(f"RERANKER_MODEL_PATH from env ('{actual_reranker_path}') is not a valid directory. Cannot load Reranker.")
-            reranker_model = None
-        else:
-            logger.info(f"Loading Reranker model from: {actual_reranker_path}")
-            reranker_model = CrossEncoder(actual_reranker_path, max_length=512)
+    reranker_model_packaged_path = get_resource_path(os.path.join("mini_service_payload", "Qwen3-Reranker-0.6B-seq-cls"))
+    actual_reranker_path_to_load = None
+
+    if os.path.isdir(reranker_model_packaged_path):
+        logger.info(f"Found potential packaged Reranker model at: {reranker_model_packaged_path}")
+        actual_reranker_path_to_load = reranker_model_packaged_path
+    else:
+        logger.warning(f"Packaged Reranker model not found at '{reranker_model_packaged_path}'. Falling back to environment variable RERANKER_MODEL_PATH.")
+        actual_reranker_path_to_load = os.getenv("RERANKER_MODEL_PATH")
+
+    if actual_reranker_path_to_load and os.path.isdir(actual_reranker_path_to_load):
+        try:
+            logger.info(f"Loading Reranker model from: {actual_reranker_path_to_load}")
+            reranker_model = CrossEncoder(actual_reranker_path_to_load, max_length=512)
             logger.info("Reranker model loaded successfully.")
             logger.info("Performing a test inference with Reranker model...")
             test_sentence_pairs = [['Query: What is FastAPI?', 'FastAPI is a modern, fast (high-performance), web framework for building APIs with Python 3.7+ based on standard Python type hints.']]
             scores = reranker_model.predict(test_sentence_pairs)
             logger.info(f"Reranker test inference scores: {scores}")
-    except Exception as e:
-        logger.error(f"Failed to load or test Reranker model: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Failed to load or test Reranker model from '{actual_reranker_path_to_load}': {e}", exc_info=True)
+            reranker_model = None
+    else:
+        logger.error(f"Reranker model path ('{actual_reranker_path_to_load}') is not a valid directory. Cannot load Reranker.")
         reranker_model = None
 
     # --- 加载 Embedding 模型 ---
     logger.info("Attempting to load Embedding model...")
-    if not EMBEDDING_MODEL_PATH_ENV or not os.path.isfile(EMBEDDING_MODEL_PATH_ENV): # 检查路径是否为文件
-        logger.error(f"EMBEDDING_MODEL_PATH from env ('{EMBEDDING_MODEL_PATH_ENV}') is not a valid file. Cannot load Embedding model.")
-        embedding_model = None
+    embedding_model_packaged_path = get_resource_path(os.path.join("mini_service_payload", "Qwen3-Embedding-0.6B-Q8_0.gguf"))
+    actual_embedding_path_to_load = None
+
+    if os.path.isfile(embedding_model_packaged_path):
+        logger.info(f"Found potential packaged Embedding model at: {embedding_model_packaged_path}")
+        actual_embedding_path_to_load = embedding_model_packaged_path
     else:
+        logger.warning(f"Packaged Embedding model not found at '{embedding_model_packaged_path}'. Falling back to environment variable EMBEDDING_MODEL_PATH.")
+        actual_embedding_path_to_load = EMBEDDING_MODEL_PATH_ENV # 使用之前从env获取的
+
+    if actual_embedding_path_to_load and os.path.isfile(actual_embedding_path_to_load):
         try:
-            logger.info(f"Loading Embedding model from: {EMBEDDING_MODEL_PATH_ENV}")
+            logger.info(f"Loading Embedding model from: {actual_embedding_path_to_load}")
             logger.info(f"Embedding params: n_ctx={EMBEDDING_N_CTX_ENV}, n_gpu_layers={EMBEDDING_N_GPU_LAYERS_ENV}")
             embedding_model = Llama(
-                model_path=EMBEDDING_MODEL_PATH_ENV,
+                model_path=actual_embedding_path_to_load,
                 n_ctx=int(EMBEDDING_N_CTX_ENV),
                 n_gpu_layers=int(EMBEDDING_N_GPU_LAYERS_ENV),
-                embedding=True, # 必须设置为 True 以启用嵌入模式
-                verbose=False # 可以设为 True 以获取更多 llama.cpp 的日志
+                embedding=True,
+                verbose=False 
             )
-            embedding_model_dimensions = embedding_model.n_embd() # 获取模型的嵌入维度
+            embedding_model_dimensions = embedding_model.n_embd()
             logger.info(f"Embedding model loaded successfully. Dimensions: {embedding_model_dimensions}")
-
-            # 执行一次简单的嵌入操作
             logger.info("Performing a test embedding with Embedding model...")
             test_text_to_embed = "This is a test sentence for embedding."
             embedding_vector = embedding_model.embed(test_text_to_embed)
             logger.info(f"Embedding test successful. Vector length: {len(embedding_vector)}. First 5 dims: {embedding_vector[:5]}")
-
         except Exception as e:
-            logger.error(f"Failed to load or test Embedding model: {e}", exc_info=True)
+            logger.error(f"Failed to load or test Embedding model from '{actual_embedding_path_to_load}': {e}", exc_info=True)
             embedding_model = None
             embedding_model_dimensions = 0
+    else:
+        logger.error(f"Embedding model path ('{actual_embedding_path_to_load}') is not a valid file. Cannot load Embedding model.")
+        embedding_model = None
+        embedding_model_dimensions = 0
 
 
 @app.on_event("shutdown")
