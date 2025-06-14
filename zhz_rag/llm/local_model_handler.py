@@ -5,6 +5,7 @@ from typing import List, Optional, Dict
 from llama_cpp import Llama
 import asyncio
 import numpy as np
+import ctypes
 
 logger = logging.getLogger(__name__)
 
@@ -93,52 +94,92 @@ class LocalModelHandler:
         if not self.embedding_model or not self.embedding_model_dimension:
             logger.error("LMH (_blocking_embed_docs): Embedding model or dimension not initialized.")
             return [[] for _ in processed_texts_for_block]
-        
+
         default_zero_vector = [0.0] * self.embedding_model_dimension
         
-        try:
-            raw_embeddings_list = self.embedding_model.embed(processed_texts_for_block)
+        if not processed_texts_for_block:
+            logger.info("LMH (_blocking_embed_docs): Received empty list of texts to embed.")
+            return []
 
-            if not isinstance(raw_embeddings_list, list) or len(raw_embeddings_list) != len(processed_texts_for_block):
-                logger.error(f"LMH (_blocking_embed_docs): Expected a list of {len(processed_texts_for_block)} embeddings, "
-                               f"but got {type(raw_embeddings_list)} with length {len(raw_embeddings_list) if isinstance(raw_embeddings_list, list) else 'N/A'}. Using zero vectors.")
-                return [list(default_zero_vector) for _ in processed_texts_for_block]
+        logger.info(f"LMH (_blocking_embed_docs): Preparing to embed {len(processed_texts_for_block)} documents using create_embedding (batch).")
 
-            final_embeddings: List[List[float]] = []
-            for i, emb_item in enumerate(raw_embeddings_list):
-                current_embedding_list: List[float] = []
-                if isinstance(emb_item, np.ndarray):
-                    if emb_item.ndim == 1:
-                        current_embedding_list = emb_item.tolist()
-                    elif emb_item.ndim == 2 and emb_item.shape[0] == 1: 
-                        current_embedding_list = emb_item[0].tolist()
-                    else:
-                        logger.warning(f"LMH (_blocking_embed_docs): Item {i} is an np.ndarray with unexpected shape {emb_item.shape}. Using zero vector.")
-                elif isinstance(emb_item, list):
-                    if len(emb_item) == 1 and isinstance(emb_item[0], list) and all(isinstance(x, (float, int)) for x in emb_item[0]):
-                        current_embedding_list = [float(x) for x in emb_item[0]]
-                    elif all(isinstance(x, (float, int)) for x in emb_item):
-                        current_embedding_list = [float(x) for x in emb_item]
-                    else:
-                        logger.warning(f"LMH (_blocking_embed_docs): Item {i} is a list with unexpected inner types. Using zero vector.")
-                else:
-                    logger.warning(f"LMH (_blocking_embed_docs): Item {i} is not np.ndarray or list. Type: {type(emb_item)}. Using zero vector.")
+        # 1. 识别有效文本及其原始索引
+        valid_texts_with_indices: List[tuple[int, str]] = []
+        for i, text in enumerate(processed_texts_for_block):
+            if text and text.strip(): # 确保文本非空且去除空白后仍有内容
+                valid_texts_with_indices.append((i, text))
+            else:
+                logger.warning(f"LMH (_blocking_embed_docs): Input text at original index {i} is empty or invalid. Will use zero vector. Text: '{text}'")
 
-                if len(current_embedding_list) == self.embedding_model_dimension:
-                    final_embeddings.append(current_embedding_list)
-                else:
-                    if current_embedding_list: 
-                        logger.warning(f"LMH (_blocking_embed_docs): Embedding for item {i} has incorrect dimension after parsing. Expected {self.embedding_model_dimension}, got {len(current_embedding_list)}. Using zero vector.")
-                    else: 
-                        logger.warning(f"LMH (_blocking_embed_docs): Failed to parse embedding for item {i}. Using zero vector.")
-                    final_embeddings.append(list(default_zero_vector))
-            
-            normalized_embeddings = l2_normalize_embeddings(final_embeddings)
-            logger.info(f"LMH: Successfully processed {len(normalized_embeddings)} document embeddings (sync part). First embedding dim: {len(normalized_embeddings[0]) if normalized_embeddings and normalized_embeddings[0] else 'N/A'}")
-            return normalized_embeddings
-        except Exception as e_sync_embed_docs:
-            logger.error(f"LMH: Error during synchronous document embedding: {e_sync_embed_docs}", exc_info=True)
+        if not valid_texts_with_indices:
+            logger.info("LMH (_blocking_embed_docs): No valid texts found after filtering. Returning all zero vectors.")
             return [list(default_zero_vector) for _ in processed_texts_for_block]
+
+        valid_texts_to_embed = [text for _, text in valid_texts_with_indices]
+        logger.info(f"LMH (_blocking_embed_docs): Embedding {len(valid_texts_to_embed)} valid texts out of {len(processed_texts_for_block)} total.")
+
+        # 2. 对有效文本进行批量嵌入
+        raw_embeddings_for_valid_texts: List[List[float]] = []
+        try:
+            response = self.embedding_model.create_embedding(input=valid_texts_to_embed)
+            if response and "data" in response and isinstance(response["data"], list):
+                embeddings_data = response["data"]
+                # 假设 create_embedding 返回的顺序与输入 valid_texts_to_embed 的顺序一致
+                # 并且其 "index" 字段是相对于 valid_texts_to_embed 列表的索引
+                if len(embeddings_data) == len(valid_texts_to_embed):
+                    for item_idx, item in enumerate(embeddings_data):
+                        if isinstance(item, dict) and "embedding" in item:
+                            # 确认 item["index"] 是否与 item_idx 一致，如果不是，需要更复杂的排序
+                            # llama-cpp-python 通常按输入顺序返回，其内部索引也是如此
+                            if item.get("index") != item_idx:
+                                logger.warning(f"LMH (_blocking_embed_docs): Embedding response index mismatch. Expected {item_idx}, got {item.get('index')}. Assuming order is preserved.")
+
+                            embedding_vector = item["embedding"]
+                            if isinstance(embedding_vector, list) and \
+                               all(isinstance(x, (float, int)) for x in embedding_vector) and \
+                               len(embedding_vector) == self.embedding_model_dimension:
+                                raw_embeddings_for_valid_texts.append([float(x) for x in embedding_vector])
+                            else:
+                                logger.warning(f"LMH (_blocking_embed_docs): Valid text at valid_idx {item_idx} got invalid embedding vector or dimension. Using zero vector. Vector: {str(embedding_vector)[:100]}")
+                                raw_embeddings_for_valid_texts.append(list(default_zero_vector))
+                        else:
+                            logger.warning(f"LMH (_blocking_embed_docs): Invalid item format in embedding response for valid text at valid_idx {item_idx}. Using zero vector.")
+                            raw_embeddings_for_valid_texts.append(list(default_zero_vector))
+                else: # 返回的嵌入数量与有效文本数量不匹配
+                    logger.error(f"LMH (_blocking_embed_docs): Mismatch between number of embeddings received ({len(embeddings_data)}) and number of valid texts sent ({len(valid_texts_to_embed)}). Using zero vectors for all valid texts.")
+                    raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
+            else: # create_embedding 返回无效响应
+                logger.error(f"LMH (_blocking_embed_docs): Invalid or empty response from create_embedding for valid texts: {str(response)[:200]}. Using zero vectors for all valid texts.")
+                raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
+        except Exception as e_batch_embed: # 捕获批量嵌入过程中的任何异常
+            logger.error(f"LMH (_blocking_embed_docs): Error during batch embedding of valid texts: {e_batch_embed}", exc_info=True)
+            raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
+
+        # 3. 构建最终的嵌入列表，保持原始顺序，并为无效文本填充零向量
+        final_embeddings_ordered: List[List[float]] = [list(default_zero_vector) for _ in processed_texts_for_block]
+        
+        valid_embedding_idx = 0
+        for original_idx, _ in valid_texts_with_indices:
+            if valid_embedding_idx < len(raw_embeddings_for_valid_texts):
+                final_embeddings_ordered[original_idx] = raw_embeddings_for_valid_texts[valid_embedding_idx]
+                valid_embedding_idx += 1
+            else: # 应该不会发生，因为上面已经处理了数量不匹配的情况
+                logger.error(f"LMH (_blocking_embed_docs): Logic error in mapping valid embeddings back. Should not happen.")
+                final_embeddings_ordered[original_idx] = list(default_zero_vector) # 安全回退
+        
+        if len(final_embeddings_ordered) != len(processed_texts_for_block):
+            logger.critical(f"LMH (_blocking_embed_docs): Final ordered embeddings length ({len(final_embeddings_ordered)}) "
+                            f"mismatches input texts length ({len(processed_texts_for_block)}). This is a bug. Re-padding.")
+            # 尽力确保输出列表长度与输入一致
+            padded_final_embeddings = [list(default_zero_vector)] * len(processed_texts_for_block)
+            for i in range(min(len(final_embeddings_ordered), len(processed_texts_for_block))):
+                if final_embeddings_ordered[i] and len(final_embeddings_ordered[i]) == self.embedding_model_dimension:
+                    padded_final_embeddings[i] = final_embeddings_ordered[i]
+            final_embeddings_ordered = padded_final_embeddings
+
+        normalized_embeddings = l2_normalize_embeddings(final_embeddings_ordered)
+        logger.info(f"LMH: Successfully processed and normalized {len(normalized_embeddings)} document embeddings (batch, with invalid text handling).")
+        return normalized_embeddings
 
     def _blocking_embed_query_internal(self, processed_text: str) -> List[float]:
         if not self.embedding_model or not self.embedding_model_dimension:

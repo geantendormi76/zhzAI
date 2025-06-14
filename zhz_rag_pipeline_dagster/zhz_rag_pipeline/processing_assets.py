@@ -1,5 +1,7 @@
 #  文件: zhz_rag_pipeline_dagster/zhz_rag_pipeline/processing_assets.py
 
+import json
+import asyncio
 import re
 import dagster as dg
 from typing import List, Dict, Any, Optional, Union
@@ -730,6 +732,8 @@ def clean_chunk_text_asset(
     return merged_chunks
 
 
+# 在 processing_assets.py 中
+
 @dg.asset(
     name="text_embeddings",
     description="Generates vector embeddings for text chunks.",
@@ -738,24 +742,67 @@ def clean_chunk_text_asset(
 )
 def generate_embeddings_asset(
     context: dg.AssetExecutionContext,
-    text_chunks: List[ChunkOutput],
+    text_chunks: List[ChunkOutput], # <--- 这是 text_chunks 资产的输出
     embedder: GGUFEmbeddingResource
 ) -> List[EmbeddingOutput]:
+    # +++ 新增打印语句 +++
+    context.log.info(f"generate_embeddings_asset: Received {len(text_chunks)} text_chunks.")
+    if text_chunks:
+        context.log.info(f"generate_embeddings_asset: First chunk text (first 100 chars): '{text_chunks[0].chunk_text[:100]}'")
+        context.log.info(f"generate_embeddings_asset: First chunk metadata: {text_chunks[0].chunk_metadata}")
+    # +++ 结束新增打印语句 +++
+
     all_embeddings: List[EmbeddingOutput] = []
     if not text_chunks:
+        context.log.warning("generate_embeddings_asset: No text chunks received, returning empty list.") # 添加一个明确的警告
         return all_embeddings
-    chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks]
+    
+    # --- 确保 chunk_texts_to_encode 不为空才调用 embedder.encode ---
+    chunk_texts_to_encode = [chunk.chunk_text for chunk in text_chunks if chunk.chunk_text and chunk.chunk_text.strip()]
+    
+    if not chunk_texts_to_encode:
+        context.log.warning("generate_embeddings_asset: All received text chunks are empty or whitespace after filtering. Returning empty list.")
+        # 即使原始 text_chunks 非空，但如果所有 chunk_text 都无效，也应该返回空 embedding 列表
+        # 并且要确保下游知道期望的 EmbeddingOutput 数量可能是0
+        return all_embeddings # 返回空列表是正确的
+
     vectors = embedder.encode(chunk_texts_to_encode)
+
+    # --- 确保正确地将嵌入结果映射回原始的 text_chunks 列表（如果数量可能不一致）---
+    # 当前的逻辑是假设 vectors 和 chunk_texts_to_encode 一一对应，并且 text_chunks 的顺序与 chunk_texts_to_encode 过滤前的顺序相关
+    # 如果 chunk_texts_to_encode 进行了过滤，这里的循环需要更小心
+    
+    # 一个更安全的映射方式是，只为那些实际被编码的文本块创建 EmbeddingOutput
+    # 但这要求下游能处理 EmbeddingOutput 列表长度可能小于 ChunkOutput 列表长度的情况，
+    # 或者，我们应该为那些被过滤掉的 chunk 也创建一个带有零向量的 EmbeddingOutput。
+    # 我们之前的 LocalModelHandler 修改是为了处理单个空文本，现在这里是资产层面的。
+
+    # 保持与 LocalModelHandler 类似的健壮性：为所有传入的 text_chunks 生成 EmbeddingOutput，
+    # 如果其文本为空或嵌入失败，则使用零向量。
+
+    embedding_map = {text: vec for text, vec in zip(chunk_texts_to_encode, vectors)}
 
     for i, chunk_input in enumerate(text_chunks):
         model_name_for_log = embedder.embedding_model_path
+        embedding_vector_for_chunk = [0.0] * embedder.get_embedding_dimension() # 默认为零向量
+
+        if chunk_input.chunk_text and chunk_input.chunk_text.strip() and chunk_input.chunk_text in embedding_map:
+            embedding_vector_for_chunk = embedding_map[chunk_input.chunk_text]
+        elif chunk_input.chunk_text and chunk_input.chunk_text.strip(): 
+            # 文本有效但没有在 embedding_map 中找到 (可能因为 embedder.encode 内部的某些问题)
+            context.log.warning(f"generate_embeddings_asset: Valid chunk text for chunk_id {chunk_input.chunk_id} was not found in embedding_map. Using zero vector.")
+        else: # 文本本身就是空的
+            context.log.info(f"generate_embeddings_asset: Chunk_id {chunk_input.chunk_id} has empty text. Using zero vector.")
+
+
         all_embeddings.append(EmbeddingOutput(
             chunk_id=chunk_input.chunk_id,
-            chunk_text=chunk_input.chunk_text,
-            embedding_vector=vectors[i] if i < len(vectors) and vectors[i] else [0.0] * embedder.get_embedding_dimension(), # 提供默认值以防嵌入失败
+            chunk_text=chunk_input.chunk_text, # 存储原始文本，即使它是空的
+            embedding_vector=embedding_vector_for_chunk,
             embedding_model_name=model_name_for_log,
             original_chunk_metadata=chunk_input.chunk_metadata
         ))
+    
     context.add_output_metadata(metadata={"total_embeddings_generated": len(all_embeddings)})
     return all_embeddings
 
@@ -773,18 +820,77 @@ def vector_storage_asset(
 ) -> None:
     if not text_embeddings:
         context.log.warning("No embeddings received, nothing to store.")
+        context.add_output_metadata(metadata={"num_embeddings_stored": 0}) # 明确输出
         return
+
     ids_to_store = [emb.chunk_id for emb in text_embeddings]
     embeddings_to_store = [emb.embedding_vector for emb in text_embeddings]
-    metadatas_to_store = [emb.original_chunk_metadata for emb in text_embeddings]
-    for meta, emb in zip(metadatas_to_store, text_embeddings):
-        meta["chunk_text"] = emb.chunk_text
-    chroma_db.add_embeddings(ids=ids_to_store, embeddings=embeddings_to_store, metadatas=metadatas_to_store)
-    context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
+    
+    cleaned_metadatas: List[Dict[str, Any]] = []
+    for i, emb_output in enumerate(text_embeddings):
+        meta = emb_output.original_chunk_metadata.copy() # 使用副本
+        meta["chunk_text"] = emb_output.chunk_text # 添加 chunk_text
+
+        # --- 新增：清理元数据中的字典值 ---
+        cleaned_meta_item: Dict[str, Any] = {}
+        for key, value in meta.items():
+            if isinstance(value, dict):
+                # 如果值是字典，将其转换为JSON字符串，或者根据情况特殊处理
+                # 对于 title_hierarchy，如果是空的，可以替换为 "None" 或删除
+                if key == "title_hierarchy" and not value: # 如果是 title_hierarchy 且为空字典
+                    cleaned_meta_item[key] = "None" # 或者直接 continue 跳过这个键
+                    context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Replaced empty title_hierarchy dict with 'None' string.")
+                else:
+                    try:
+                        # 尝试序列化为JSON字符串
+                        cleaned_meta_item[key] = json.dumps(value, ensure_ascii=False)
+                        context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted dict value for key '{key}' to JSON string.")
+                    except TypeError:
+                        # 如果无法序列化，则转换为普通字符串或跳过
+                        cleaned_meta_item[key] = str(value)
+                        context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize dict for key '{key}', used str(). Value: {value}")
+            elif isinstance(value, list):
+                # ChromaDB 元数据值不接受列表，将其转换为JSON字符串
+                try:
+                    cleaned_meta_item[key] = json.dumps(value, ensure_ascii=False)
+                    context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted list value for key '{key}' to JSON string.")
+                except TypeError:
+                    # 如果JSON序列化失败（不太可能对于简单列表），则回退为普通字符串表示
+                    cleaned_meta_item[key] = str(value)
+                    context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize list for key '{key}', used str(). Value: {value}")
+            elif value is None:
+                # 将 None 值转换为空字符串，以满足 ChromaDB 要求
+                cleaned_meta_item[key] = "" # 或者 "None" 字符串
+                context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted None value for key '{key}' to empty string.")
+            else: # str, int, float, bool 应该可以直接使用
+                cleaned_meta_item[key] = value
+        cleaned_metadatas.append(cleaned_meta_item)
+        # --- 结束清理 ---
+
+    context.log.info(f"Adding/updating {len(ids_to_store)} embeddings to ChromaDB collection '{chroma_db.collection_name}' after metadata cleaning.")
+    # 打印一个清理后的元数据样本以供调试
+    if cleaned_metadatas:
+        context.log.debug(f"Sample of cleaned metadata for first item (id: {ids_to_store[0]}): {cleaned_metadatas[0]}")
+
+    try:
+        chroma_db.add_embeddings(ids=ids_to_store, embeddings=embeddings_to_store, metadatas=cleaned_metadatas)
+        context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
+        context.log.info(f"Successfully stored {len(ids_to_store)} embeddings.")
+    except Exception as e_chroma_add:
+        context.log.error(f"Failed to add embeddings to ChromaDB after metadata cleaning: {e_chroma_add}", exc_info=True)
+        # 如果这里出错，可以打印出导致错误的具体元数据项
+        # for idx, m_data in enumerate(cleaned_metadatas):
+        #     try:
+        #         chroma_db._collection.add(ids=[ids_to_store[idx]], embeddings=[embeddings_to_store[idx]], metadatas=[m_data])
+        #     except Exception as e_item:
+        #         context.log.error(f"Error adding item with id {ids_to_store[idx]} and metadata {m_data}: {e_item}")
+        #         raise # 重新抛出原始错误或自定义错误
+        raise # 重新抛出原始错误
 
 
 class BM25IndexConfig(dg.Config):
     index_file_path: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index/"
+
 
 @dg.asset(
     name="keyword_index",
@@ -878,6 +984,7 @@ DEFAULT_KG_EXTRACTION_SCHEMA = {
 }
 # --- [修复结束] ---
 
+
 @dg.asset(
     name="kg_extractions",
     description="Extracts entities and relations from text chunks for knowledge graph construction.",
@@ -889,33 +996,92 @@ async def kg_extraction_asset(
     context: dg.AssetExecutionContext,
     text_chunks: List[ChunkOutput],
     config: KGExtractionConfig,
-    sglang_api: LocalLLMAPIResource
+    LocalLLM_api: LocalLLMAPIResource # LocalLLM_api is actually LocalLLMAPIResource
 ) -> List[KGTripleSetOutput]:
     all_kg_outputs: List[KGTripleSetOutput] = []
+
     if not text_chunks:
+        context.log.info("No text chunks received for KG extraction, skipping.")
         return all_kg_outputs
+
     total_entities_count = 0
     total_relations_count = 0
-    for i, chunk in enumerate(text_chunks):
-        prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
-        try:
-            structured_response = await sglang_api.generate_structured_output(prompt=prompt, json_schema=DEFAULT_KG_EXTRACTION_SCHEMA)
-            entities_data = structured_response.get("entities", [])
-            extracted_entities_list = [ExtractedEntity(text=normalize_text_for_id(e["text"]), label=e["label"].upper()) for e in entities_data if isinstance(e, dict)]
-            relations_data = structured_response.get("relations", [])
-            extracted_relations_list = [ExtractedRelation(head_entity_text=r['head_entity_text'], head_entity_label=r['head_entity_label'], relation_type=r['relation_type'], tail_entity_text=r['tail_entity_text'], tail_entity_label=r['tail_entity_label']) for r in relations_data if isinstance(r, dict)]
-            total_entities_count += len(extracted_entities_list)
-            total_relations_count += len(extracted_relations_list)
-            all_kg_outputs.append(KGTripleSetOutput(
-                chunk_id=chunk.chunk_id,
-                extracted_entities=extracted_entities_list,
-                extracted_relations=extracted_relations_list,
-                extraction_model_name=config.local_llm_model_name,
-                original_chunk_metadata=chunk.chunk_metadata
-            ))
-        except Exception as e:
-            context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
-    context.add_output_metadata(metadata={"total_entities_extracted": total_entities_count, "total_relations_extracted": total_relations_count})
+
+    CONCURRENT_REQUESTS_LIMIT = 1
+    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+    # --- 结束并发控制参数 ---
+
+    async def extract_kg_for_chunk(chunk: ChunkOutput) -> Optional[KGTripleSetOutput]:
+        async with semaphore: # 控制并发数量
+            prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
+            try:
+                # context.log.debug(f"Starting KG extraction for chunk_id: {chunk.chunk_id}") # 可选的详细日志
+                structured_response = await LocalLLM_api.generate_structured_output(
+                    prompt=prompt, 
+                    json_schema=DEFAULT_KG_EXTRACTION_SCHEMA
+                )
+                
+                entities_data = structured_response.get("entities", [])
+                extracted_entities_list = [
+                    ExtractedEntity(text=normalize_text_for_id(e["text"]), label=e["label"].upper())
+                    for e in entities_data if isinstance(e, dict) and e.get("text") and e.get("label")
+                ]
+                
+                relations_data = structured_response.get("relations", [])
+                extracted_relations_list = [
+                    ExtractedRelation(
+                        head_entity_text=r['head_entity_text'], 
+                        head_entity_label=r['head_entity_label'].upper(), 
+                        relation_type=r['relation_type'].upper(), 
+                        tail_entity_text=r['tail_entity_text'], 
+                        tail_entity_label=r['tail_entity_label'].upper()
+                    ) 
+                    for r in relations_data if isinstance(r, dict) and 
+                                               r.get('head_entity_text') and r.get('head_entity_label') and
+                                               r.get('relation_type') and r.get('tail_entity_text') and
+                                               r.get('tail_entity_label')
+                ]
+                
+                # context.log.debug(f"Finished KG extraction for chunk_id: {chunk.chunk_id}. Entities: {len(extracted_entities_list)}, Relations: {len(extracted_relations_list)}")
+                return KGTripleSetOutput(
+                    chunk_id=chunk.chunk_id,
+                    extracted_entities=extracted_entities_list,
+                    extracted_relations=extracted_relations_list,
+                    extraction_model_name=config.local_llm_model_name, # 使用配置中的模型名
+                    original_chunk_metadata=chunk.chunk_metadata
+                )
+            except Exception as e:
+                context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
+                # 返回 None 或一个特殊的错误标记对象，以便在 gather 后进行过滤或处理
+                return None 
+
+    context.log.info(f"Starting KG extraction for {len(text_chunks)} chunks with concurrency limit: {CONCURRENT_REQUESTS_LIMIT}.")
+
+    tasks = [extract_kg_for_chunk(chunk) for chunk in text_chunks]
+
+    results = await asyncio.gather(*tasks)
+    
+    context.log.info(f"Finished all KG extraction tasks. Received {len(results)} results (including potential None for failures).")
+
+    # 处理结果，过滤掉失败的 (None)
+    for result_item in results:
+        if result_item and isinstance(result_item, KGTripleSetOutput):
+            all_kg_outputs.append(result_item)
+            total_entities_count += len(result_item.extracted_entities)
+            total_relations_count += len(result_item.extracted_relations)
+        elif result_item is None:
+            context.log.warning("A KG extraction task failed and returned None.")
+            # 这里可以增加一个计数器来记录失败的任务数量
+            
+    context.log.info(f"KG extraction complete. Successfully processed {len(all_kg_outputs)} chunks.")
+    context.add_output_metadata(
+        metadata={
+            "total_chunks_processed_for_kg": len(text_chunks),
+            "chunks_successfully_extracted_kg": len(all_kg_outputs),
+            "total_entities_extracted": total_entities_count, 
+            "total_relations_extracted": total_relations_count
+        }
+    )
     return all_kg_outputs
 
 # --- KuzuDB 构建资产链 ---

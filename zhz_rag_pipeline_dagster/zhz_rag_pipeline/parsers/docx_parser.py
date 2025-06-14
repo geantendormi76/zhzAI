@@ -43,19 +43,19 @@ except ImportError as e_unstructured:
     _UNSTRUCTURED_AVAILABLE_DOCX = False
     # 创建占位符类以避免后续 NameError
     class UnstructuredElement: pass
-    class Text: pass                 # type: ignore
-    class NarrativeText: pass        # type: ignore
-    class Title: pass                # type: ignore
-    class ListItem: pass             # type: ignore
-    class Table: pass                # type: ignore
-    class UnstructuredImage: pass    # type: ignore
-    class UnstructuredHeader: pass   # type: ignore
-    class UnstructuredFooter: pass   # type: ignore
-    class Address: pass              # type: ignore
-    class EmailAddress: pass         # type: ignore
-    class FigureCaption: pass        # type: ignore
-    class UnstructuredPageBreak: pass# type: ignore
-    class CodeSnippet: pass          # type: ignore
+    class Text: pass                  # type: ignore
+    class NarrativeText: pass          # type: ignore
+    class Title: pass                  # type: ignore
+    class ListItem: pass               # type: ignore
+    class Table: pass                  # type: ignore
+    class UnstructuredImage: pass      # type: ignore
+    class UnstructuredHeader: pass     # type: ignore
+    class UnstructuredFooter: pass     # type: ignore
+    class Address: pass                # type: ignore
+    class EmailAddress: pass           # type: ignore
+    class FigureCaption: pass          # type: ignore
+    class UnstructuredPageBreak: pass  # type: ignore
+    class CodeSnippet: pass            # type: ignore
 
 try:
     from markdownify import markdownify as md # type: ignore
@@ -149,8 +149,8 @@ def _convert_unstructured_elements_to_custom(
         el_type_name = type(el).__name__
         el_id_str = getattr(el, 'id', 'N/A')
         el_text_preview = getattr(el, 'text', '')[:50].strip().replace('\n', ' ') if getattr(el, 'text', '') else "[NO TEXT]"
-        # --- 使用 print 进行强制调试 ---
-        logger.info(
+        # --- 修改日志级别 ---
+        logger.debug( # <--- 从 info 修改为 debug
             f"DOCX Parser ({file_basename_for_log}): Processing unstructured element index {el_idx}, "
             f"Type: {el_type_name}, ID: {el_id_str}, Text Preview: '{el_text_preview}'"
         )
@@ -158,7 +158,10 @@ def _convert_unstructured_elements_to_custom(
         # 打印 el.metadata.text_as_html 的预览（如果存在）
         html_preview_from_meta = getattr(el.metadata, 'text_as_html', None) if hasattr(el, 'metadata') else None
         if html_preview_from_meta:
-            logger.info(f"  └─ ({file_basename_for_log}) Unstructured Element (idx {el_idx}, type {el_type_name}) has text_as_html (len: {len(html_preview_from_meta)}). Preview: {html_preview_from_meta[:70]}")
+            logger.debug( # <--- 从 info 修改为 debug
+                f"  └─ ({file_basename_for_log}) Unstructured Element (idx {el_idx}, type {el_type_name}) has text_as_html (len: {len(html_preview_from_meta)}). Preview: {html_preview_from_meta[:70]}"
+            )
+        # --- 结束修改 ---
         
         element_metadata = _create_doc_element_metadata(el)
         el_text = el.text.strip() if hasattr(el, 'text') and el.text else ""
@@ -200,12 +203,12 @@ def _convert_unstructured_elements_to_custom(
             raw_table_text_fallback = el.text.strip() if hasattr(el, 'text') and el.text else None
             caption_text = None
             if hasattr(el.metadata, 'table_captions') and el.metadata.table_captions:
-                 caption_obj = el.metadata.table_captions[0]
-                 if hasattr(caption_obj, 'text'):
-                     caption_text = caption_obj.text
+                    caption_obj = el.metadata.table_captions[0]
+                    if hasattr(caption_obj, 'text'):
+                            caption_text = caption_obj.text
             
             if not caption_text and hasattr(el.metadata, 'filename'): # Redundant if filename is always doc_path_for_log
-                 caption_text = f"Table from {file_basename_for_log}" # Use basename
+                    caption_text = f"Table from {file_basename_for_log}" # Use basename
             final_caption = caption_text if caption_text else "Table"
 
             final_md_table = md_table
@@ -216,7 +219,7 @@ def _convert_unstructured_elements_to_custom(
                 logger.info(f"DOCX Parser ({file_basename_for_log}): Table (idx {el_idx}) has no HTML/MD rep, but has raw text from unstructured: '{raw_table_text_fallback[:100]}...' Using it as text_representation.")
                 final_text_representation = raw_table_text_fallback
             elif not final_md_table and not final_html_table and not raw_table_text_fallback:
-                 logger.warning(f"DOCX Parser ({file_basename_for_log}): Table (idx {el_idx}) has no HTML, Markdown, or raw text representation from unstructured.")
+                    logger.warning(f"DOCX Parser ({file_basename_for_log}): Table (idx {el_idx}) has no HTML, Markdown, or raw text representation from unstructured.")
 
 
             if _PYDANTIC_MODELS_AVAILABLE_DOCX: 
@@ -280,7 +283,7 @@ def _convert_unstructured_elements_to_custom(
                 if _PYDANTIC_MODELS_AVAILABLE_DOCX: custom_el = NarrativeTextElement(text=el_text, metadata=element_metadata)
                 else: custom_el = {"element_type": "narrative_text", "text": el_text, "_unstructured_type": el_type_name, "metadata": element_metadata}
             elif el_type_name != "CompositeElement": # CompositeElement often has no direct text but contains other elements
-                 logger.debug(f"DOCX Parser ({file_basename_for_log}): Skipping Unstructured element type: {el_type_name} at index {el_idx} due to no text content.")
+                    logger.debug(f"DOCX Parser ({file_basename_for_log}): Skipping Unstructured element type: {el_type_name} at index {el_idx} due to no text content.")
 
         if custom_el:
             custom_elements.append(custom_el)
@@ -365,11 +368,11 @@ def parse_docx_to_structured_output(
 
         if not custom_elements and not linear_text.strip() and unstructured_elements:
             logger.warning(f"DOCX Parser ({file_basename_for_log}): partition_docx returned {len(unstructured_elements)} elements, "
-                           "but no custom elements or linear text were generated. This might indicate all elements were skipped "
-                           "or had no text content suitable for conversion.")
+                            "but no custom elements or linear text were generated. This might indicate all elements were skipped "
+                            "or had no text content suitable for conversion.")
         elif not custom_elements and not linear_text.strip() and not unstructured_elements:
-             logger.warning(f"DOCX Parser ({file_basename_for_log}): partition_docx returned 0 elements, "
-                           "and no custom elements or linear text were generated.")
+                logger.warning(f"DOCX Parser ({file_basename_for_log}): partition_docx returned 0 elements, "
+                                "and no custom elements or linear text were generated.")
 
         if _PYDANTIC_MODELS_AVAILABLE_DOCX:
             return ParsedDocumentOutput(

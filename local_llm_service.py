@@ -7,9 +7,22 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional, Union
 import json
 
+# --- START: 添加 HardwareManager 导入 ---
+try:
+    # 假设 hardware_manager.py 在 zhz_agent/utils/ 目录下
+    from utils.hardware_manager import HardwareManager
+except ImportError:
+    # 如果 utils 不在 zhz_agent 的直接子目录，或者PYTHONPATH设置问题，可能需要调整导入路径
+    # 例如，如果 zhz_agent 是项目根目录，且 utils 是根目录下的文件夹：
+    # from utils.hardware_manager import HardwareManager
+    # 如果 hardware_manager.py 与 local_llm_service.py 在同一目录（不推荐）：
+    # from hardware_manager import HardwareManager
+    print("ERROR: Failed to import HardwareManager. Ensure it's in the correct path and PYTHONPATH is set.")
+    # 定义一个占位符，以便服务至少能尝试启动（尽管功能会受限）
+    HardwareManager = None
+# --- END: 添加 HardwareManager 导入 ---
 
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
-
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
@@ -21,7 +34,8 @@ import re
 # --- 配置 ---
 MODEL_DIR = os.getenv("LOCAL_LLM_MODEL_DIR", "/home/zhz/models/Qwen3-1.7B-GGUF")
 MODEL_FILENAME = os.getenv("LOCAL_LLM_MODEL_FILENAME")
-N_GPU_LAYERS = int(os.getenv("LOCAL_LLM_N_GPU_LAYERS", 0))
+# N_GPU_LAYERS 将在 lifespan 中被 HAL 动态设置，这里的初始值可以作为无法检测时的回退
+INITIAL_N_GPU_LAYERS = int(os.getenv("LOCAL_LLM_N_GPU_LAYERS", 0))
 N_CTX = int(os.getenv("LOCAL_LLM_N_CTX", 4096))
 N_BATCH = int(os.getenv("LOCAL_LLM_N_BATCH", 512))
 SERVICE_PORT = int(os.getenv("LOCAL_LLM_SERVICE_PORT", 8088))
@@ -35,12 +49,64 @@ model_path_global: Optional[str] = None
 # logit_bias 相关的全局变量 (在 lifespan 中初始化)
 failure_phrase_token_ids: List[int] = []
 logit_bias_for_failure_phrase: Optional[Dict[int, float]] = None
+# 初始化为环境变量或默认值，稍后会被HAL覆盖
+N_GPU_LAYERS: int = INITIAL_N_GPU_LAYERS
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global llama_model, model_path_global, failure_phrase_token_ids, logit_bias_for_failure_phrase
+    # 声明我们要修改全局变量 N_GPU_LAYERS
+    global N_GPU_LAYERS
+
     print("--- Local LLM Service: Lifespan startup (with GBNF and logit_bias prep) ---")
-    
+
+    # --- START: HardwareManager 集成 ---
+    final_n_gpu_layers_to_use = INITIAL_N_GPU_LAYERS  # 默认使用初始值
+    if HardwareManager:  # 确保导入成功
+        try:
+            print("Initializing HardwareManager for dynamic configuration...")
+            hw_manager = HardwareManager()
+            hw_info = hw_manager.get_hardware_info()
+
+            if hw_info:
+                print(f"Detected Hardware: {hw_info}")
+                # Qwen3-1.7B 模型参数
+                model_total_layers = 28  # 根据你的模型实际层数调整
+                model_size_on_disk_gb = 1.8  # Qwen3-1.7B-Q8_0.gguf 约 1.7-1.8 GB
+                context_length_tokens = N_CTX  # 使用当前配置的上下文长度
+
+                # 从 HardwareManager 获取推荐的GPU层数
+                recommended_layers = hw_manager.recommend_llm_gpu_layers(
+                    model_total_layers=model_total_layers,
+                    model_size_on_disk_gb=model_size_on_disk_gb,
+                    context_length_tokens=context_length_tokens
+                    # 可以按需传递 kv_cache_gb_per_1k_ctx 和 safety_buffer_vram_gb
+                )
+                print(f"HardwareManager recommended n_gpu_layers: {recommended_layers}")
+
+                # 应用推荐值（优雅降级已在 recommend_llm_gpu_layers 内部处理）
+                final_n_gpu_layers_to_use = recommended_layers
+
+                if final_n_gpu_layers_to_use == 0 and hw_info.gpu_available:
+                    print("INFO: GPU is available, but HAL recommended 0 GPU layers (CPU inference). This might be due to low VRAM or other heuristics.")
+                elif final_n_gpu_layers_to_use > 0:
+                    print(f"INFO: GPU available and HAL recommended {final_n_gpu_layers_to_use} layers for GPU offload.")
+                elif not hw_info.gpu_available:
+                    print("INFO: No compatible GPU detected by HAL. Using CPU inference (0 GPU layers).")
+
+            else:
+                print("WARNING: HardwareManager failed to get hardware info. Using initial n_gpu_layers value.")
+        except Exception as e_hal:
+            print(f"ERROR during HardwareManager initialization or recommendation: {e_hal}. Using initial n_gpu_layers value.")
+            traceback.print_exc()
+    else:
+        print("WARNING: HardwareManager class not available. Using initial n_gpu_layers value.")
+
+    N_GPU_LAYERS = final_n_gpu_layers_to_use  # 更新全局变量
+    print(f"Final n_gpu_layers to be used for Llama model: {N_GPU_LAYERS}")
+    # --- END: HardwareManager 集成 ---
+
     model_file_to_load = MODEL_FILENAME
     if not model_file_to_load:
         print(f"MODEL_FILENAME environment variable not set. Attempting to auto-detect GGUF file in {MODEL_DIR}...")
@@ -49,7 +115,7 @@ async def lifespan(app: FastAPI):
             if not gguf_files:
                 error_msg = f"No GGUF models found in directory: {MODEL_DIR}"
                 print(f"ERROR: {error_msg}")
-                app.state.cypher_path_grammar = None # Ensure state variable exists even on error
+                app.state.cypher_path_grammar = None  # Ensure state variable exists even on error
                 raise RuntimeError(error_msg)
             if len(gguf_files) > 1:
                 print(f"Warning: Multiple GGUF models found in {MODEL_DIR}. Using the first one: {gguf_files[0]}")
@@ -68,12 +134,13 @@ async def lifespan(app: FastAPI):
 
     model_path_global = os.path.join(MODEL_DIR, model_file_to_load)
     print(f"Attempting to load Llama model from: {model_path_global}")
+    # 这里确保使用更新后的 N_GPU_LAYERS
     print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
 
     try:
         llama_model = Llama(
             model_path=model_path_global,
-            n_gpu_layers=N_GPU_LAYERS,
+            n_gpu_layers=N_GPU_LAYERS,  # <--- 确保这里使用的是更新后的 N_GPU_LAYERS
             n_ctx=N_CTX,
             n_batch=N_BATCH,
             verbose=True
@@ -111,49 +178,55 @@ async def lifespan(app: FastAPI):
                 traceback.print_exc()
         else:
             print(f"ERROR: GBNF grammar file not found at '{GBNF_FILE_PATH}'.")
-        
+
         app.state.cypher_path_grammar = gbnf_grammar_instance
 
     except Exception as e:
         print(f"FATAL: Failed to load Llama model or prepare GBNF/logit_bias: {e}")
         app.state.cypher_path_grammar = None
-        logit_bias_for_failure_phrase = None # Ensure this is also cleared
-    
+        logit_bias_for_failure_phrase = None  # Ensure this is also cleared
+
     yield
     print("--- Local LLM Service: Lifespan shutdown ---")
 
 app = FastAPI(
     title="Local LLM Service (OpenAI Compatible)",
     description="Uses GBNF with logit_bias for conditional JSON output.",
-    version="0.1.7", 
+    version="0.1.7",
     lifespan=lifespan
 )
+
 
 class ChatMessage(BaseModel):
     role: str
     content: str
 
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     temperature: float = 0.7
-    max_tokens: Optional[int] = 1024 # Default to 1024 or higher
+    max_tokens: Optional[int] = 1024  # Default to 1024 or higher
     stream: bool = False
     stop: Optional[Union[str, List[str]]] = None
+
 
 class ChatCompletionMessage(BaseModel):
     role: str
     content: Optional[str] = None
+
 
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatCompletionMessage
     finish_reason: Optional[str] = "stop"
 
+
 class UsageInfo(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+
 
 class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
@@ -163,6 +236,7 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionChoice]
     usage: UsageInfo
     system_fingerprint: Optional[str] = None
+
 
 def post_process_llm_output(content: Optional[str], finish_reason: Optional[str]) -> Optional[str]:
     if content is None:
@@ -178,21 +252,22 @@ def post_process_llm_output(content: Optional[str], finish_reason: Optional[str]
        not re.search(r"</think\s*>", processed_content, flags=re.IGNORECASE):
         print("DEBUG_POST_PROCESS: Incomplete think block due to length, attempting to remove partial tag.")
         # More aggressive removal of any leading <think...> tag if it's incomplete
-        processed_content = re.sub(r"^<think[^>]*>","", processed_content.strip(), flags=re.IGNORECASE).strip()
+        processed_content = re.sub(r"^<think[^>]*>", "", processed_content.strip(), flags=re.IGNORECASE).strip()
 
     # Remove any remaining stray <think> or </think> tags
     stray_think_tag_pattern = re.compile(r"</?\s*think[^>]*?>\s*", flags=re.IGNORECASE)
     processed_content = stray_think_tag_pattern.sub("", processed_content)
     return processed_content.strip()
 
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: ChatCompletionRequest):
     global llama_model, model_path_global, logit_bias_for_failure_phrase
-    
+
     # --- 添加调试日志 ---
     print("\n--- local_llm_service: Received /v1/chat/completions request ---")
     try:
-        print(f"Request Body (raw): {await fastapi_req.body()}") # 打印原始请求体
+        print(f"Request Body (raw): {await fastapi_req.body()}")  # 打印原始请求体
         print(f"Request Model: {request.model}")
         print(f"Request Messages (count): {len(request.messages) if request.messages else 0}")
         print(f"Request Temperature: {request.temperature}")
@@ -202,9 +277,8 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         print(f"Error logging request details: {e_req_log}")
     # --- 调试日志结束 ---
 
-
     loaded_cypher_path_grammar: Optional[LlamaGrammar] = getattr(fastapi_req.app.state, 'cypher_path_grammar', None)
-    
+
     if llama_model is None:
         raise HTTPException(status_code=503, detail="Llama model is not loaded or failed to load.")
     if request.stream:
@@ -215,7 +289,7 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
     completion_tokens = 0
     total_tokens = 0
     finish_reason = "stop"
-    request_model_name = request.model 
+    request_model_name = request.model
     final_json_output_str_for_client: Optional[str] = None
 
     if not hasattr(llama_model, "create_chat_completion"):
@@ -237,12 +311,12 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         dict_messages = [msg.model_dump() for msg in request.messages]
         completion_params: Dict[str, Any] = {
             "messages": dict_messages,
-            "temperature": request.temperature, 
+            "temperature": request.temperature,
             "max_tokens": request.max_tokens or 1024,
             "stop": request.stop,
         }
 
-            # --- 新增：根据模型名称判断是否启用JSON模式 ---
+        # --- 新增：根据模型名称判断是否启用JSON模式 ---
         # 假设模型名称中包含 "kg_entity_extraction" 表示我们期望JSON输出
         if "kg_entity_extraction" in request.model.lower():
             try:
@@ -260,7 +334,7 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         is_cypher_gen_task = False
         if dict_messages and dict_messages[0]["role"] == "system":
             system_content_for_check = dict_messages[0]["content"]
-            keyword_to_check = "知识图谱结构 (KuzuDB) 与 Cypher 查询生成规则" # Ensure this matches constants.py
+            keyword_to_check = "知识图谱结构 (KuzuDB) 与 Cypher 查询生成规则"  # Ensure this matches constants.py
             processed_system_content = system_content_for_check.lower()
             processed_keyword = keyword_to_check.lower()
             print(f"DEBUG_FastAPI_CypherTaskCheck: System prompt content (LOWERCASED, first 300 chars): '{processed_system_content[:300]}...'")
@@ -272,13 +346,13 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
                 print("DEBUG_FastAPI_CypherTaskCheck: Cypher generation task NOT DETECTED (keyword missing after lowercasing).")
         else:
             print("DEBUG_FastAPI_CypherTaskCheck: No system message found or messages empty, not a Cypher task.")
-         
+
         if is_cypher_gen_task:
             print("DEBUG_FastAPI: Cypher generation task DETECTED.")
             if loaded_cypher_path_grammar is not None:
                 print("DEBUG_FastAPI: Applying GBNF grammar (success/failure paths) FROM APP.STATE.")
                 completion_params["grammar"] = loaded_cypher_path_grammar
-                
+
                 if logit_bias_for_failure_phrase:
                     print(f"DEBUG_FastAPI: Applying logit_bias for failure phrase: {logit_bias_for_failure_phrase}")
                     completion_params["logit_bias"] = logit_bias_for_failure_phrase
@@ -286,12 +360,12 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
                 print("DEBUG_FastAPI: GBNF grammar FROM APP.STATE IS NONE. Proceeding without grammar for Cypher task.")
         else:
             print("DEBUG_FastAPI: Not a Cypher task. No grammar or specific logit_bias applied.")
-        
+
         print(f"DEBUG_FastAPI: Calling llama_model.create_chat_completion with params (preview): "
-          f"model={request.model}, temp={completion_params['temperature']}, "
-          f"max_tokens={completion_params['max_tokens']}, stop={completion_params['stop']}, "
-          f"json_mode_enabled={'response_format' in completion_params}")
-    
+              f"model={request.model}, temp={completion_params['temperature']}, "
+              f"max_tokens={completion_params['max_tokens']}, stop={completion_params['stop']}, "
+              f"json_mode_enabled={'response_format' in completion_params}")
+
         completion = llama_model.create_chat_completion(**completion_params)
 
         # --- 添加调试日志 ---
@@ -310,15 +384,15 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         traceback.print_exc()
         # Ensure this is a JSON string
         final_json_output_str_for_client = json.dumps({"status": "unable_to_generate", "query": "LLM call failed during generation."})
-        finish_reason = "error" # Indicate an error finish
+        finish_reason = "error"  # Indicate an error finish
 
-    if final_json_output_str_for_client is None: # Only process if no error above set this
+    if final_json_output_str_for_client is None:  # Only process if no error above set this
         processed_llm_text = post_process_llm_output(response_content_raw, finish_reason)
-        
+
         if is_cypher_gen_task:
-            standard_success_template = {"status": "success", "query": ""} 
+            standard_success_template = {"status": "success", "query": ""}
             standard_unable_json_obj = {"status": "unable_to_generate", "query": "无法生成Cypher查询."}
-            final_json_to_return_obj = standard_unable_json_obj # Default to unable
+            final_json_to_return_obj = standard_unable_json_obj  # Default to unable
 
             if processed_llm_text:
                 cleaned_text_for_json_parse = processed_llm_text.strip()
@@ -327,7 +401,7 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
                     cleaned_text_for_json_parse = cleaned_text_for_json_parse[len("```json"):].strip()
                 if cleaned_text_for_json_parse.endswith("```"):
                     cleaned_text_for_json_parse = cleaned_text_for_json_parse[:-len("```")].strip()
-                
+
                 try:
                     data = json.loads(cleaned_text_for_json_parse)
                     if isinstance(data, dict) and "status" in data and "query" in data:
@@ -335,25 +409,24 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
                             final_json_to_return_obj = data
                             print(f"DEBUG_FastAPI: LLM output is a valid 'success' JSON (GBNF success path likely): {json.dumps(final_json_to_return_obj, ensure_ascii=False)}")
                         elif data.get("status") == "unable_to_generate" and data.get("query") == "无法生成Cypher查询.":
-                            final_json_to_return_obj = data # Already standard
+                            final_json_to_return_obj = data  # Already standard
                             print(f"DEBUG_FastAPI: LLM output is a valid 'unable_to_generate' JSON (GBNF failure path likely): {json.dumps(final_json_to_return_obj, ensure_ascii=False)}")
-                        else: # JSON has status/query but not matching expected values
+                        else:  # JSON has status/query but not matching expected values
                             print(f"DEBUG_FastAPI: LLM JSON has unexpected status/query content. Status: '{data.get('status')}', Query: '{str(data.get('query'))[:100]}'. Defaulting to standard 'unable_to_generate'.")
                             # final_json_to_return_obj remains standard_unable_json_obj
-                    else: 
+                    else:
                         print(f"DEBUG_FastAPI: LLM output parsed as JSON, but not the expected dict with status/query: '{cleaned_text_for_json_parse}'. Defaulting to standard 'unable_to_generate'.")
                 except json.JSONDecodeError:
                     print(f"DEBUG_FastAPI: LLM output was not valid JSON. Raw (after post_process): '{processed_llm_text}'. Defaulting to standard 'unable_to_generate'.")
                 except Exception as e_parse:
-                     print(f"DEBUG_FastAPI: Unexpected error parsing LLM output: {e_parse}. Raw: '{processed_llm_text}'. Defaulting to 'unable_to_generate'.")
+                    print(f"DEBUG_FastAPI: Unexpected error parsing LLM output: {e_parse}. Raw: '{processed_llm_text}'. Defaulting to 'unable_to_generate'.")
             else:
                 print("DEBUG_FastAPI: LLM output was empty after post_processing. Defaulting to standard 'unable_to_generate' JSON.")
-            
+
             final_json_output_str_for_client = json.dumps(final_json_to_return_obj, ensure_ascii=False)
-        else: 
+        else:
             # For non-Cypher tasks, return the processed text directly
             final_json_output_str_for_client = processed_llm_text if processed_llm_text is not None else ""
-
 
     print(f"DEBUG_FastAPI: Final content string to be returned to client: '{final_json_output_str_for_client}'")
 
@@ -364,10 +437,10 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         effective_model_name = os.path.basename(model_path_global)
     elif not effective_model_name:
         effective_model_name = "local-llm-unknown"
-    
+
     # Ensure final_json_output_str_for_client is a string, even if empty (for non-Cypher tasks)
     if final_json_output_str_for_client is None:
-        final_json_output_str_for_client = "" # Or some other default string
+        final_json_output_str_for_client = ""  # Or some other default string
 
     return ChatCompletionResponse(
         id=response_id,
@@ -378,7 +451,7 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
             ChatCompletionChoice(
                 index=0,
                 message=ChatCompletionMessage(role="assistant", content=final_json_output_str_for_client),
-                finish_reason=finish_reason 
+                finish_reason=finish_reason
             )
         ],
         usage=UsageInfo(
@@ -388,12 +461,13 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
         )
     )
 
+
 @app.get("/v1/models", response_model=Dict[str, Any])
 async def list_models():
     global model_path_global
     model_id_for_clients = "qwen3local_gguf_gbnf_logit_bias"
     model_name_to_display = "Qwen3-1.7B-GGUF (GBNF+LogitBias)"
-    
+
     if model_path_global and os.path.exists(model_path_global):
         model_name_to_display = os.path.basename(model_path_global)
         created_timestamp = int(os.path.getctime(model_path_global))
@@ -414,6 +488,7 @@ async def list_models():
             }
         ]
     }
+
 
 if __name__ == "__main__":
     print(f"--- Starting Local LLM FastAPI Service on {SERVICE_HOST}:{SERVICE_PORT} ---")
