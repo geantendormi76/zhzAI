@@ -17,7 +17,8 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     ChromaDBResource, ChromaDBResourceConfig,
     LocalLLMAPIResource, LocalLLMAPIResourceConfig,
     DuckDBResource,
-    GeminiAPIResource, GeminiAPIResourceConfig
+    GeminiAPIResource, GeminiAPIResourceConfig,
+    SystemResource  # <--- 添加导入 SystemResource
 )
 from zhz_rag_pipeline_dagster.zhz_rag_pipeline.custom_io_managers import PydanticListJsonIOManager
 
@@ -48,5 +49,6 @@ defs = Definitions(
         "duckdb_kg": DuckDBResource(),
         "gemini_api": GeminiAPIResource(model_name=GeminiAPIResourceConfig().model_name, proxy_url=GeminiAPIResourceConfig().proxy_url, default_temperature=GeminiAPIResourceConfig().default_temperature, default_max_tokens=GeminiAPIResourceConfig().default_max_tokens),
         "pydantic_json_io_manager": pydantic_io_manager_instance,
+        "system_info": SystemResource()  # <--- 添加 SystemResource 实例
     }
 )

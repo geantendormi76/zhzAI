@@ -35,6 +35,7 @@ from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import (
     ChromaDBResource,
     DuckDBResource,
     LocalLLMAPIResource,
+    SystemResource  # <--- 添加这一行以导入 SystemResource
 )
 import jieba
 import bm25s
@@ -962,18 +963,20 @@ DEFAULT_KG_EXTRACTION_SCHEMA = {
     "required": ["entities", "relations"]
 }
 
+
 @dg.asset(
     name="kg_extractions",
-    description="Extracts entities and relations from text chunks for knowledge graph construction.", # 恢复描述
+    description="Extracts entities and relations from text chunks for knowledge graph construction.",
     group_name="kg_building",
     io_manager_key="pydantic_json_io_manager",
     deps=["text_chunks"]
 )
 async def kg_extraction_asset(
-    context: dg.AssetExecutionContext,
+    context: dg.AssetExecutionContext, # Pylance 提示 dg.AssetExecutionContext 未定义 "SystemResource"
     text_chunks: List[ChunkOutput],
     config: KGExtractionConfig,
-    LocalLLM_api: LocalLLMAPIResource
+    LocalLLM_api: LocalLLMAPIResource,
+    system_info: SystemResource  # <--- 我们添加了 system_info
 ) -> List[KGTripleSetOutput]:
     all_kg_outputs: List[KGTripleSetOutput] = []
     if not text_chunks:
@@ -986,9 +989,14 @@ async def kg_extraction_asset(
     successfully_processed_chunks_count = 0
     
     # 并发控制参数
-    # TODO: 后续这个值应该从HAL或配置中获取 config.concurrent_kg_requests
-    CONCURRENT_REQUESTS_LIMIT = 1 # 恢复到之前的单并发，后续可调整测试
+    recommended_concurrency = system_info.get_recommended_concurrent_tasks(task_type="kg_extraction_llm")
+    # 使用我们手动测试过的有效并发数4作为上限，并结合HAL的推荐
+    # 如果HAL推荐更高，我们仍然限制在4；如果HAL推荐更低（例如在低配机器上），则使用HAL的推荐
+    CONCURRENT_REQUESTS_LIMIT = min(4, max(1, recommended_concurrency)) 
+    
+    context.log.info(f"HAL recommended concurrency for 'kg_extraction_llm': {recommended_concurrency}. Effective limit set to: {CONCURRENT_REQUESTS_LIMIT}")
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+
 
     async def extract_kg_for_chunk(chunk: ChunkOutput) -> Optional[KGTripleSetOutput]:
         async with semaphore:

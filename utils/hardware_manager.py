@@ -214,19 +214,12 @@ class HardwareManager:
             logger.warning("Hardware info not available, defaulting to 1 concurrent task.")
             return 1
         
-        if task_type == "cpu_bound_llm":
-            # 对于LLM CPU推理，即使是多核，单个推理任务也可能占满一个或多个核心
-            # 过多并发可能导致严重的上下文切换和缓存竞争，反而降低效率
-            # 保守起见，推荐1，或者物理核心数的一半，取较小者
-            # 如果未来LLM服务本身能很好地利用多核进行单请求加速，则另当别论
-            # 但目前我们假设一个请求主要由一个worker的单线程（或少量线程）处理
-            # return 1 
-            # 或者稍微激进一点，如果物理核心多：
+        if task_type == "cpu_bound_llm" or task_type == "kg_extraction_llm":
             base_cores = self.hw_info.cpu_physical_cores
             if base_cores >= 8:
-                return max(1, base_cores // 4)
+                return max(1, base_cores // 4) # 例如，对于8核物理，推荐2
             elif base_cores >= 4:
-                return max(1, base_cores // 2)
+                return max(1, base_cores // 2) # 例如，对于4核物理（如您的i5 P-cores），推荐2
             else:
                 return 1
         elif task_type == "io_bound":

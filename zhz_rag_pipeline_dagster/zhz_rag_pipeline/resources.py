@@ -17,6 +17,22 @@ import time
 import gc
 import duckdb
 
+# --- START: 添加 HardwareManager 导入 ---
+try:
+    # 假设 hardware_manager.py 位于项目的 utils 目录下，
+    # 并且 zhz_agent 是项目的根目录且在 PYTHONPATH 中
+    from utils.hardware_manager import HardwareManager, HardwareInfo
+except ImportError as e_hal_import:
+    # 如果 utils 目录不在 zhz_agent 下，或者 PYTHONPATH 问题，可能需要调整
+    # 例如，如果 hardware_manager.py 与 resources.py 在同一目录的父目录的utils下：
+    # from ..utils.hardware_manager import HardwareManager, HardwareInfo
+    print(f"ERROR: Failed to import HardwareManager/HardwareInfo from utils.hardware_manager: {e_hal_import}. "
+          "Ensure it's in the correct path relative to this file or PYTHONPATH is set. "
+          "Proceeding without HAL capabilities.")
+    HardwareManager = None
+    HardwareInfo = None # type: ignore
+# --- END: 添加 HardwareManager 导入 ---
+
 try:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
 except ImportError as e:
@@ -417,3 +433,83 @@ class DuckDBResource(dg.ConfigurableResource):
         # 注意：这种共享连接的方式对于并发的 Dagster ops (如果使用非 in_process_executor) 需要小心
         # 但对于 in_process_executor 和我们的流水线是安全的。
         yield self._conn
+
+
+# --- START: 定义 SystemResource ---
+class SystemResource(dg.ConfigurableResource):
+    """
+    Dagster resource to provide system hardware information and recommendations
+    based on Hardware Abstraction Layer (HAL).
+    """
+    _hw_manager: Optional[Any] = PrivateAttr(default=None)
+    _hw_info: Optional[Any] = PrivateAttr(default=None)
+    _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+    
+    # 可以添加一些配置项来微调HAL的行为，如果需要的话
+    # 例如：safety_vram_buffer_gb_override: Optional[float] = None
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger = context.log
+        self._logger.info("Initializing SystemResource...")
+        if HardwareManager:
+            try:
+                self._hw_manager = HardwareManager()
+                self._hw_info = self._hw_manager.get_hardware_info()
+                if self._hw_info:
+                    self._logger.info(f"SystemResource: Hardware detection successful: {self._hw_info}")
+                else:
+                    self._logger.warning("SystemResource: HardwareManager did not return hardware info.")
+            except Exception as e:
+                self._logger.error(f"SystemResource: Error initializing HardwareManager: {e}", exc_info=True)
+        else:
+            self._logger.warning("SystemResource: HardwareManager class not available. HAL features will be disabled.")
+        self._logger.info("SystemResource initialized.")
+
+    def get_hardware_info(self) -> Optional[Any]:
+        """Returns the detected HardwareInfo object, or None if detection failed."""
+        if not self._hw_info:
+            self._logger.warning("Accessing hardware info, but it was not successfully detected during initialization.")
+        return self._hw_info
+
+    def get_recommended_llm_gpu_layers(
+        self, 
+        model_total_layers: int, 
+        model_size_on_disk_gb: float, 
+        context_length_tokens: int,
+        # 可以暴露HAL方法中的其他参数作为此方法的参数，或使用默认/固定值
+        kv_cache_gb_per_1k_ctx: float = 0.25, 
+        safety_buffer_vram_gb: float = 1.5
+    ) -> int:
+        """
+        Delegates to HardwareManager to recommend n_gpu_layers.
+        Returns 0 if HAL is not available or GPU is not suitable.
+        """
+        if self._hw_manager:
+            try:
+                return self._hw_manager.recommend_llm_gpu_layers(
+                    model_total_layers=model_total_layers,
+                    model_size_on_disk_gb=model_size_on_disk_gb,
+                    kv_cache_gb_per_1k_ctx=kv_cache_gb_per_1k_ctx,
+                    context_length_tokens=context_length_tokens,
+                    safety_buffer_vram_gb=safety_buffer_vram_gb
+                )
+            except Exception as e:
+                self._logger.error(f"Error getting GPU layer recommendation from HAL: {e}", exc_info=True)
+                return 0 # Fallback to CPU on error
+        self._logger.warning("HardwareManager not available, defaulting to 0 GPU layers.")
+        return 0 # Fallback to CPU
+
+    def get_recommended_concurrent_tasks(self, task_type: str = "cpu_bound_llm") -> int:
+        """
+        Delegates to HardwareManager to recommend concurrent task number.
+        Returns 1 if HAL is not available.
+        """
+        if self._hw_manager:
+            try:
+                return self._hw_manager.recommend_concurrent_tasks(task_type=task_type)
+            except Exception as e:
+                self._logger.error(f"Error getting concurrent task recommendation from HAL: {e}", exc_info=True)
+                return 1 # Fallback to 1 on error
+        self._logger.warning("HardwareManager not available, defaulting to 1 concurrent task.")
+        return 1 # Fallback
+# --- END: 定义 SystemResource ---
