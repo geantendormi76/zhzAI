@@ -990,10 +990,7 @@ async def kg_extraction_asset(
     
     # 并发控制参数
     recommended_concurrency = system_info.get_recommended_concurrent_tasks(task_type="kg_extraction_llm")
-    # 使用我们手动测试过的有效并发数4作为上限，并结合HAL的推荐
-    # 如果HAL推荐更高，我们仍然限制在4；如果HAL推荐更低（例如在低配机器上），则使用HAL的推荐
-    CONCURRENT_REQUESTS_LIMIT = min(4, max(1, recommended_concurrency)) 
-    
+    CONCURRENT_REQUESTS_LIMIT = max(1, recommended_concurrency) # 直接使用HAL推荐，但至少为1
     context.log.info(f"HAL recommended concurrency for 'kg_extraction_llm': {recommended_concurrency}. Effective limit set to: {CONCURRENT_REQUESTS_LIMIT}")
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
