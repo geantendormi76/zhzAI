@@ -28,10 +28,6 @@ markdownify==0.12.1       # 用于HTML转Markdown
 dagster==1.10.17             # 您当前使用的版本，假设兼容 Pydantic V2
 dagster-webserver==1.10.17
 dagster-graphql==1.10.17
-
-
-
-PyMuPDF
 dagster-pipes==1.10.17
 dagster_shared==0.26.17
 
@@ -53,6 +49,7 @@ python-dotenv==1.1.0
 pytz==2025.2
 SQLAlchemy==2.0.41
 bm25s==0.2.13
+PyMuPDF
 
 # --- OpenTelemetry (让 crewai 自动拉取，如果还有问题再显式指定) ---
 # opentelemetry-api

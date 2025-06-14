@@ -106,12 +106,6 @@ SIMPLIFIED_CYPHER_TEMPLATES = [
     }
 ]
 
-# --- 精简的Schema描述 (只保留与上述模板最相关的部分) ---
-# 注意：NEW_KG_SCHEMA_DESCRIPTION 本身已经很详细了，这里我们为了测试，
-# 可以考虑创建一个更精简的字符串，或者在prompt中只引用NEW_KG_SCHEMA_DESCRIPTION中与ExtractedEntity相关的部分。
-# 为了简单起见，我们先仍然使用完整的 NEW_KG_SCHEMA_DESCRIPTION，但会在prompt中强调只关注ExtractedEntity。
-# 如果依然太长导致问题，下一步可以尝试动态构建一个更小的schema片段传给LLM。
-
 def get_cypher_generation_messages_with_templates(user_question: str) -> List[Dict[str, str]]: # 函数名保持一致
     """
     构建用于（基于【单个指定模板】）生成Cypher查询的LLM输入messages。
@@ -220,3 +214,54 @@ def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str
         {"role": "user", "content": user_content}
     ]
     return messages
+
+
+# 用于Dagster流水线中，从单个文本块抽取KG的提示词
+KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1 = """
+你是一个信息抽取助手。请从以下提供的文本中抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体。
+同时，请抽取出以下两种关系：
+1. WORKS_AT (当一个人在一个组织工作时，例如：PERSON WORKS_AT ORGANIZATION)
+2. ASSIGNED_TO (当一个任务分配给一个人时，例如：TASK ASSIGNED_TO PERSON)
+
+请严格按照以下JSON格式进行输出，不要包含任何额外的解释或Markdown标记：
+{{
+  "entities": [
+    {{"text": "实体1原文", "label": "实体1类型"}},
+    ...
+  ],
+  "relations": [
+    {{"head_entity_text": "头实体文本", "head_entity_label": "头实体类型", "relation_type": "关系类型", "tail_entity_text": "尾实体文本", "tail_entity_label": "尾实体类型"}},
+    ...
+  ]
+}}
+如果文本中没有可抽取的实体或关系，请返回一个空的对应列表 (例如 {{"entities": [], "relations": []}})。
+
+文本：
+"{text_to_extract}"
+""" # <--- 末尾引导词已删除
+
+# 用于Dagster流水线中，从一批文本块抽取KG的提示词
+KG_EXTRACTION_BATCH_PROMPT_TEMPLATE_V1 = """
+你是一个信息抽取助手。你的任务是处理下面编号的【文本块列表】中的每一个文本块。
+对于列表中的【每一个文本块】，请独立地抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体，以及它们之间可能存在的WORKS_AT和ASSIGNED_TO关系。
+
+【输出格式要求】:
+你的最终输出【必须】是一个JSON数组。
+这个数组中的每个元素都对应输入【文本块列表】中相应顺序的文本块的抽取结果。
+每个元素的结构【必须】严格符合以下JSON Schema：
+{{
+  "entities": [ 
+    {{"text": "实体原文", "label": "实体类型"}}, 
+    ... 
+  ],
+  "relations": [
+    {{"head_entity_text": "头实体文本", "head_entity_label": "头实体类型", "relation_type": "关系类型", "tail_entity_text": "尾实体文本", "tail_entity_label": "尾实体类型"}},
+    ...
+  ]
+}}
+如果某个文本块中沒有可抽取的实体或关系，则其在JSON数组中对应的元素应为：{{"entities": [], "relations": []}}。
+【绝对禁止】在最终的JSON数组之外包含任何其他文本、解释或Markdown标记。
+
+【待处理的文本块列表】:
+{formatted_text_block_list}
+""" # <--- 末尾引导词已删除

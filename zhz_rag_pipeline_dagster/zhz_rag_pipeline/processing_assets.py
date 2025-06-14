@@ -922,33 +922,12 @@ def keyword_index_asset(
 
 # --- KG Extraction 相关的配置和资产 ---
 
+from zhz_rag.llm.rag_prompts import KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1, KG_EXTRACTION_BATCH_PROMPT_TEMPLATE_V1 # 导入常量
+
 class KGExtractionConfig(dg.Config):
-    # --- [核心修复] 使用双重大括号 {{ 和 }} 转义所有JSON示例中的大括号 ---
-    extraction_prompt_template: str = (
-        "你是一个信息抽取助手。请从以下提供的文本中抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体。\n"
-        "同时，请抽取出以下两种关系：\n"
-        "1. WORKS_AT (当一个人在一个组织工作时，例如：PERSON WORKS_AT ORGANIZATION)\n"
-        "2. ASSIGNED_TO (当一个任务分配给一个人时，例如：TASK ASSIGNED_TO PERSON)\n\n"
-        "请严格按照以下JSON格式进行输出，不要包含任何额外的解释或Markdown标记：\n"
-        "{{\n"
-        "  \"entities\": [\n"
-        "    {{\"text\": \"实体1原文\", \"label\": \"实体1类型\"}},\n"
-        "    ...\n"
-        "  ],\n"
-        "  \"relations\": [\n"
-        "    {{\"head_entity_text\": \"头实体文本\", \"head_entity_label\": \"头实体类型\", \"relation_type\": \"关系类型\", \"tail_entity_text\": \"尾实体文本\", \"tail_entity_label\": \"尾实体类型\"}},\n"
-        "    ...\n"
-        "  ]\n"
-        "}}\n"
-        "如果文本中没有可抽取的实体或关系，请返回一个空的对应列表 (例如 {{\"entities\": [], \"relations\": []}})。\n\n"
-        "文本：\n"
-        "\"{text_to_extract}\"\n\n"
-        "JSON输出："
-    )
-    # --- [修复结束] ---
+    extraction_prompt_template: str = KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1
     local_llm_model_name: str = "Qwen3-1.7B-GGUF_via_llama.cpp"
 
-# --- [核心修复] 在这里添加缺失的常量定义 ---
 DEFAULT_KG_EXTRACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -982,12 +961,10 @@ DEFAULT_KG_EXTRACTION_SCHEMA = {
     },
     "required": ["entities", "relations"]
 }
-# --- [修复结束] ---
-
 
 @dg.asset(
     name="kg_extractions",
-    description="Extracts entities and relations from text chunks for knowledge graph construction.",
+    description="Extracts entities and relations from text chunks for knowledge graph construction.", # 恢复描述
     group_name="kg_building",
     io_manager_key="pydantic_json_io_manager",
     deps=["text_chunks"]
@@ -996,45 +973,53 @@ async def kg_extraction_asset(
     context: dg.AssetExecutionContext,
     text_chunks: List[ChunkOutput],
     config: KGExtractionConfig,
-    LocalLLM_api: LocalLLMAPIResource # LocalLLM_api is actually LocalLLMAPIResource
+    LocalLLM_api: LocalLLMAPIResource
 ) -> List[KGTripleSetOutput]:
     all_kg_outputs: List[KGTripleSetOutput] = []
-
     if not text_chunks:
         context.log.info("No text chunks received for KG extraction, skipping.")
         return all_kg_outputs
 
-    total_entities_count = 0
-    total_relations_count = 0
-
-    CONCURRENT_REQUESTS_LIMIT = 1
+    total_input_chunks = len(text_chunks)
+    total_entities_extracted_overall = 0
+    total_relations_extracted_overall = 0
+    successfully_processed_chunks_count = 0
+    
+    # 并发控制参数
+    # TODO: 后续这个值应该从HAL或配置中获取 config.concurrent_kg_requests
+    CONCURRENT_REQUESTS_LIMIT = 1 # 恢复到之前的单并发，后续可调整测试
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-    # --- 结束并发控制参数 ---
 
     async def extract_kg_for_chunk(chunk: ChunkOutput) -> Optional[KGTripleSetOutput]:
-        async with semaphore: # 控制并发数量
+        async with semaphore:
+            # 使用单个chunk的prompt模板
             prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
             try:
-                # context.log.debug(f"Starting KG extraction for chunk_id: {chunk.chunk_id}") # 可选的详细日志
+                context.log.debug(f"Starting KG extraction for chunk_id: {chunk.chunk_id}, Text (start): {chunk.chunk_text[:100]}...")
                 structured_response = await LocalLLM_api.generate_structured_output(
                     prompt=prompt, 
-                    json_schema=DEFAULT_KG_EXTRACTION_SCHEMA
+                    json_schema=DEFAULT_KG_EXTRACTION_SCHEMA # 使用单个对象的schema
                 )
                 
+                # 确保 structured_response 是字典类型
+                if not isinstance(structured_response, dict):
+                    context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: LLM response was not a dict. Got: {type(structured_response)}. Response: {str(structured_response)[:200]}")
+                    return None
+
                 entities_data = structured_response.get("entities", [])
                 extracted_entities_list = [
-                    ExtractedEntity(text=normalize_text_for_id(e["text"]), label=e["label"].upper())
-                    for e in entities_data if isinstance(e, dict) and e.get("text") and e.get("label")
+                    ExtractedEntity(text=normalize_text_for_id(e.get("text","")), label=e.get("label","UNKNOWN").upper())
+                    for e in entities_data if isinstance(e, dict)
                 ]
                 
                 relations_data = structured_response.get("relations", [])
                 extracted_relations_list = [
                     ExtractedRelation(
-                        head_entity_text=r['head_entity_text'], 
-                        head_entity_label=r['head_entity_label'].upper(), 
-                        relation_type=r['relation_type'].upper(), 
-                        tail_entity_text=r['tail_entity_text'], 
-                        tail_entity_label=r['tail_entity_label'].upper()
+                        head_entity_text=r.get('head_entity_text',""), 
+                        head_entity_label=r.get('head_entity_label',"UNKNOWN").upper(), 
+                        relation_type=r.get('relation_type',"UNKNOWN").upper(), 
+                        tail_entity_text=r.get('tail_entity_text',""), 
+                        tail_entity_label=r.get('tail_entity_label',"UNKNOWN").upper()
                     ) 
                     for r in relations_data if isinstance(r, dict) and 
                                                r.get('head_entity_text') and r.get('head_entity_label') and
@@ -1042,47 +1027,47 @@ async def kg_extraction_asset(
                                                r.get('tail_entity_label')
                 ]
                 
-                # context.log.debug(f"Finished KG extraction for chunk_id: {chunk.chunk_id}. Entities: {len(extracted_entities_list)}, Relations: {len(extracted_relations_list)}")
+                context.log.debug(f"Finished KG extraction for chunk_id: {chunk.chunk_id}. Entities: {len(extracted_entities_list)}, Relations: {len(extracted_relations_list)}")
                 return KGTripleSetOutput(
                     chunk_id=chunk.chunk_id,
                     extracted_entities=extracted_entities_list,
                     extracted_relations=extracted_relations_list,
-                    extraction_model_name=config.local_llm_model_name, # 使用配置中的模型名
+                    extraction_model_name=config.local_llm_model_name,
                     original_chunk_metadata=chunk.chunk_metadata
                 )
             except Exception as e:
                 context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
-                # 返回 None 或一个特殊的错误标记对象，以便在 gather 后进行过滤或处理
                 return None 
 
-    context.log.info(f"Starting KG extraction for {len(text_chunks)} chunks with concurrency limit: {CONCURRENT_REQUESTS_LIMIT}.")
-
+    context.log.info(f"Starting KG extraction for {total_input_chunks} chunks with concurrency limit: {CONCURRENT_REQUESTS_LIMIT}.")
+    
     tasks = [extract_kg_for_chunk(chunk) for chunk in text_chunks]
-
+    
     results = await asyncio.gather(*tasks)
     
     context.log.info(f"Finished all KG extraction tasks. Received {len(results)} results (including potential None for failures).")
 
-    # 处理结果，过滤掉失败的 (None)
     for result_item in results:
         if result_item and isinstance(result_item, KGTripleSetOutput):
             all_kg_outputs.append(result_item)
-            total_entities_count += len(result_item.extracted_entities)
-            total_relations_count += len(result_item.extracted_relations)
+            total_entities_extracted_overall += len(result_item.extracted_entities)
+            total_relations_extracted_overall += len(result_item.extracted_relations)
+            successfully_processed_chunks_count +=1
         elif result_item is None:
             context.log.warning("A KG extraction task failed and returned None.")
-            # 这里可以增加一个计数器来记录失败的任务数量
             
-    context.log.info(f"KG extraction complete. Successfully processed {len(all_kg_outputs)} chunks.")
+    context.log.info(f"KG extraction complete. Successfully processed {successfully_processed_chunks_count} out of {total_input_chunks} chunks.")
     context.add_output_metadata(
         metadata={
-            "total_chunks_processed_for_kg": len(text_chunks),
-            "chunks_successfully_extracted_kg": len(all_kg_outputs),
-            "total_entities_extracted": total_entities_count, 
-            "total_relations_extracted": total_relations_count
+            "total_chunks_input_to_kg": total_input_chunks, # 恢复为 total_input_chunks
+            "chunks_successfully_extracted_kg": successfully_processed_chunks_count,
+            "total_entities_extracted": total_entities_extracted_overall, 
+            "total_relations_extracted": total_relations_extracted_overall
+            # 移除了批处理相关的元数据 "total_batches_processed", "batch_size_configured"
         }
     )
     return all_kg_outputs
+
 
 # --- KuzuDB 构建资产链 ---
 
@@ -1390,14 +1375,6 @@ def duckdb_vector_index_asset(
             context.log.info(f"Executing DuckDB vector index creation command:\n{index_creation_sql.strip()}")
             conn.execute(index_creation_sql)
             context.log.info(f"DuckDB vector index '{index_name}' creation command executed successfully (or index already existed).")
-
-            # 验证索引是否已创建 (可选，但有助于确认)
-            # DuckDB 中查看索引的命令可能不像 KuzuDB 那样直接，
-            # 通常，如果 CREATE INDEX 没有报错，就表示成功了。
-            # 我们可以尝试查询 pg_indexes 或 duckdb_indexes() (如果 DuckDB 版本支持)
-            # 或者简单地依赖 CREATE INDEX IF NOT EXISTS 的行为。
-            # 为了简化，我们这里先不加复杂的验证查询。
-            # 如果需要验证，可以查询 PRAGMA show_indexes('ExtractedEntity'); 但解析其输出较麻烦。
 
     except Exception as e_index_asset:
         context.log.error(f"Error during DuckDB vector index creation: {e_index_asset}", exc_info=True)

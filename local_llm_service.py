@@ -200,15 +200,19 @@ app = FastAPI(
 class ChatMessage(BaseModel):
     role: str
     content: str
-
+    
+class ResponseFormat(BaseModel): # 新增这个辅助模型
+    type: str = "json_object" # 默认为 json_object
+    schema_definition: Optional[Dict[str, Any]] = Field(default=None, alias="schema") # 使用 alias 兼容 OpenAI 的 "schema" 字段
 
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     temperature: float = 0.7
-    max_tokens: Optional[int] = 1024  # Default to 1024 or higher
+    max_tokens: Optional[int] = 1024
     stream: bool = False
     stop: Optional[Union[str, List[str]]] = None
+    response_format: Optional[ResponseFormat] = None # <--- 新增此行
 
 
 class ChatCompletionMessage(BaseModel):
@@ -316,20 +320,33 @@ async def create_chat_completion_endpoint(fastapi_req: FastAPIRequest, request: 
             "stop": request.stop,
         }
 
-        # --- 新增：根据模型名称判断是否启用JSON模式 ---
-        # 假设模型名称中包含 "kg_entity_extraction" 表示我们期望JSON输出
-        if "kg_entity_extraction" in request.model.lower():
+        # --- 修改：使用请求中传递的 response_format (如果存在且有效) ---
+        if request.response_format and \
+        request.response_format.type == "json_object" and \
+        request.response_format.schema_definition:
             try:
-                json_schema_for_extraction = ExtractedEntitiesAndRelationIntent.model_json_schema()
+                # 直接使用客户端提供的 schema
                 completion_params["response_format"] = {
                     "type": "json_object",
-                    "schema": json_schema_for_extraction
+                    "schema": request.response_format.schema_definition 
                 }
-                print(f"DEBUG_FastAPI: Enabled JSON mode with schema for model {request.model}")
-                # print(f"DEBUG_FastAPI: JSON Schema: {json.dumps(json_schema_for_extraction, indent=2)}") # 可选打印
-            except Exception as e_schema:
-                print(f"ERROR_FastAPI: Failed to generate JSON schema for ExtractedEntitiesAndRelationIntent: {e_schema}")
-        # --- 结束新增 ---
+                print(f"DEBUG_FastAPI: Enabled JSON mode using schema provided in request for model {request.model}.")
+                # 可选打印详细schema:
+                # try:
+                #     print(f"DEBUG_FastAPI: JSON Schema from request: {json.dumps(request.response_format.schema_definition, indent=2, ensure_ascii=False)}")
+                # except Exception as e_dumps:
+                #     print(f"DEBUG_FastAPI: Could not dump schema for logging: {e_dumps}")
+            except Exception as e_schema_assign:
+                print(f"ERROR_FastAPI: Failed to assign response_format from request: {e_schema_assign}")
+        elif "kg_entity_extraction" in request.model.lower():
+            # 回退逻辑：如果模型名暗示KG抽取，但请求中没有提供有效的response_format，
+            # 我们可以选择报错，或者使用一个默认的单对象抽取schema（但这不适用于批处理）。
+            # 为了批处理的正确性，我们应该依赖客户端提供正确的schema。
+            # 因此，如果进行批处理，客户端必须提供 BATCH_KG_EXTRACTION_SCHEMA。
+            # 如果是单对象抽取，客户端也应该提供 DEFAULT_KG_EXTRACTION_SCHEMA。
+            # 这里可以加一个警告，如果需要JSON输出但schema未提供。
+            print(f"WARNING_FastAPI: Model name {request.model} suggests JSON output, but no valid response_format.schema provided in the request. LLM might not produce structured JSON.")
+        # --- 结束修改 ---
 
         is_cypher_gen_task = False
         if dict_messages and dict_messages[0]["role"] == "system":
