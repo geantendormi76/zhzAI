@@ -1,0 +1,1002 @@
+项目结构树: /home/zhz/zhz_agent
+├── .venv-uv-rag/
+│   ├── bin/
+│   │   ├── activate
+│   │   ├── activate.bat
+│   │   ├── activate.csh
+│   │   ├── activate.fish
+│   │   ├── activate.nu
+│   │   ├── activate.ps1
+│   │   ├── activate_this.py
+│   │   ├── alembic
+│   │   ├── chardetect
+│   │   ├── chroma
+│   │   ├── coloredlogs
+│   │   ├── convert-caffe2-to-onnx
+│   │   ├── convert-onnx-to-caffe2
+│   │   ├── crewai
+│   │   ├── dagster
+│   │   ├── dagster-components
+│   │   ├── dagster-daemon
+│   │   ├── dagster-graphql
+│   │   ├── dagster-webserver
+│   │   ├── dagster-webserver-debug
+│   │   ├── deactivate.bat
+│   │   ├── distro
+│   │   ├── dotenv
+│   │   ├── dumppdf.py
+│   │   ├── f2py
+│   │   ├── fastapi
+│   │   ├── filetype
+│   │   ├── gql-cli
+│   │   ├── httpx
+│   │   ├── huggingface-cli
+│   │   ├── humanfriendly
+│   │   ├── instructor
+│   │   ├── ipython
+│   │   ├── ipython3
+│   │   ├── isympy
+│   │   ├── json_repair
+│   │   ├── jsondiff
+│   │   ├── jsonpatch
+│   │   ├── jsonpointer
+│   │   ├── jsonschema
+│   │   ├── litellm
+│   │   ├── mako-render
+│   │   ├── markdown-it
+│   │   ├── markdownify
+│   │   ├── nltk
+│   │   ├── normalizer
+│   │   ├── numpy-config
+│   │   ├── onnxruntime_test
+│   │   ├── openai
+│   │   ├── opentelemetry-bootstrap
+│   │   ├── opentelemetry-instrument
+│   │   ├── oxmsg
+│   │   ├── pdf2txt.py
+│   │   ├── pdfplumber
+│   │   ├── proton
+│   │   ├── proton-viewer
+│   │   ├── pydoc.bat
+│   │   ├── pygmentize
+│   │   ├── pygrun
+│   │   ├── pyjson5
+│   │   ├── pymupdf
+│   │   ├── pypdfium2
+│   │   ├── pyproject-build
+│   │   ├── pyrsa-decrypt
+│   │   ├── pyrsa-encrypt
+│   │   ├── pyrsa-keygen
+│   │   ├── pyrsa-priv2pub
+│   │   ├── pyrsa-sign
+│   │   ├── pyrsa-verify
+│   │   ├── python
+│   │   ├── python3
+│   │   ├── python3.12
+│   │   ├── tabulate
+│   │   ├── tiny-agents
+│   │   ├── torchfrtrace
+│   │   ├── torchrun
+│   │   ├── tqdm
+│   │   ├── transformers
+│   │   ├── transformers-cli
+│   │   ├── typer
+│   │   ├── uv
+│   │   ├── uvicorn
+│   │   ├── uvx
+│   │   ├── watchfiles
+│   │   ├── watchmedo
+│   │   ├── websockets
+│   │   └── wsdump
+│   ├── include/
+│   │   └── site/
+│   │       └── python3.12/
+│   │           └── greenlet/
+│   │               └── greenlet.h
+│   ├── lib/
+│   │   └── python3.12/
+│   │       └── site-packages/
+│   │           ├── _distutils_hack/
+│   │           │   ├── __init__.py
+│   │           │   └── override.py
+│   │           ├── _yaml/
+│   │           │   └── __init__.py
+│   │           ├── adbc_driver_duckdb/
+│   │           │   ├── __init__.py
+│   │           │   └── dbapi.py
+│   │           ├── aiofiles/
+│   │           │   ├── tempfile/
+│   │           │   │   ├── __init__.py
+│   │           │   │   └── temptypes.py
+│   │           │   ├── threadpool/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── binary.py
+│   │           │   │   ├── text.py
+│   │           │   │   └── utils.py
+│   │           │   ├── __init__.py
+│   │           │   ├── base.py
+│   │           │   ├── os.py
+│   │           │   └── ospath.py
+│   │           ├── aiofiles-24.1.0.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   ├── LICENSE
+│   │           │   │   └── NOTICE
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── aiohappyeyeballs/
+│   │           │   ├── __init__.py
+│   │           │   ├── _staggered.py
+│   │           │   ├── impl.py
+│   │           │   ├── py.typed
+│   │           │   ├── types.py
+│   │           │   └── utils.py
+│   │           ├── aiohappyeyeballs-2.6.1.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── aiohttp/
+│   │           │   ├── .hash/
+│   │           │   │   ├── _cparser.pxd.hash
+│   │           │   │   ├── _find_header.pxd.hash
+│   │           │   │   ├── _http_parser.pyx.hash
+│   │           │   │   ├── _http_writer.pyx.hash
+│   │           │   │   └── hdrs.py.hash
+│   │           │   ├── _websocket/
+│   │           │   │   ├── .hash/
+│   │           │   │   │   ├── mask.pxd.hash
+│   │           │   │   │   ├── mask.pyx.hash
+│   │           │   │   │   └── reader_c.pxd.hash
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── helpers.py
+│   │           │   │   ├── mask.cpython-312-x86_64-linux-gnu.so
+│   │           │   │   ├── mask.pxd
+│   │           │   │   ├── mask.pyx
+│   │           │   │   ├── models.py
+│   │           │   │   ├── reader.py
+│   │           │   │   ├── reader_c.cpython-312-x86_64-linux-gnu.so
+│   │           │   │   ├── reader_c.pxd
+│   │           │   │   ├── reader_c.py
+│   │           │   │   ├── reader_py.py
+│   │           │   │   └── writer.py
+│   │           │   ├── __init__.py
+│   │           │   ├── _cparser.pxd
+│   │           │   ├── _find_header.pxd
+│   │           │   ├── _headers.pxi
+│   │           │   ├── _http_parser.cpython-312-x86_64-linux-gnu.so
+│   │           │   ├── _http_parser.pyx
+│   │           │   ├── _http_writer.cpython-312-x86_64-linux-gnu.so
+│   │           │   ├── _http_writer.pyx
+│   │           │   ├── abc.py
+│   │           │   ├── base_protocol.py
+│   │           │   ├── client.py
+│   │           │   ├── client_exceptions.py
+│   │           │   ├── client_middleware_digest_auth.py
+│   │           │   ├── client_middlewares.py
+│   │           │   ├── client_proto.py
+│   │           │   ├── client_reqrep.py
+│   │           │   ├── client_ws.py
+│   │           │   ├── compression_utils.py
+│   │           │   ├── connector.py
+│   │           │   ├── cookiejar.py
+│   │           │   ├── formdata.py
+│   │           │   ├── hdrs.py
+│   │           │   ├── helpers.py
+│   │           │   ├── http.py
+│   │           │   ├── http_exceptions.py
+│   │           │   ├── http_parser.py
+│   │           │   ├── http_websocket.py
+│   │           │   ├── http_writer.py
+│   │           │   ├── log.py
+│   │           │   ├── multipart.py
+│   │           │   ├── payload.py
+│   │           │   ├── payload_streamer.py
+│   │           │   ├── py.typed
+│   │           │   ├── pytest_plugin.py
+│   │           │   ├── resolver.py
+│   │           │   ├── streams.py
+│   │           │   ├── tcp_helpers.py
+│   │           │   ├── test_utils.py
+│   │           │   ├── tracing.py
+│   │           │   ├── typedefs.py
+│   │           │   ├── web.py
+│   │           │   ├── web_app.py
+│   │           │   ├── web_exceptions.py
+│   │           │   ├── web_fileresponse.py
+│   │           │   ├── web_log.py
+│   │           │   ├── web_middlewares.py
+│   │           │   ├── web_protocol.py
+│   │           │   ├── web_request.py
+│   │           │   ├── web_response.py
+│   │           │   ├── web_routedef.py
+│   │           │   ├── web_runner.py
+│   │           │   ├── web_server.py
+│   │           │   ├── web_urldispatcher.py
+│   │           │   ├── web_ws.py
+│   │           │   └── worker.py
+│   │           ├── aiohttp-3.12.0.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   └── LICENSE.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── aiosignal/
+│   │           │   ├── __init__.py
+│   │           │   ├── __init__.pyi
+│   │           │   └── py.typed
+│   │           ├── aiosignal-1.3.2.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── aiosqlite/
+│   │           │   ├── tests/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── __main__.py
+│   │           │   │   ├── helpers.py
+│   │           │   │   ├── perf.py
+│   │           │   │   └── smoke.py
+│   │           │   ├── __init__.py
+│   │           │   ├── __version__.py
+│   │           │   ├── context.py
+│   │           │   ├── core.py
+│   │           │   ├── cursor.py
+│   │           │   └── py.typed
+│   │           ├── aiosqlite-0.21.0.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── alembic/
+│   │           │   ├── autogenerate/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── api.py
+│   │           │   │   ├── compare.py
+│   │           │   │   ├── render.py
+│   │           │   │   └── rewriter.py
+│   │           │   ├── ddl/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── _autogen.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── impl.py
+│   │           │   │   ├── mssql.py
+│   │           │   │   ├── mysql.py
+│   │           │   │   ├── oracle.py
+│   │           │   │   ├── postgresql.py
+│   │           │   │   └── sqlite.py
+│   │           │   ├── operations/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── batch.py
+│   │           │   │   ├── ops.py
+│   │           │   │   ├── schemaobj.py
+│   │           │   │   └── toimpl.py
+│   │           │   ├── runtime/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── environment.py
+│   │           │   │   └── migration.py
+│   │           │   ├── script/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── revision.py
+│   │           │   │   └── write_hooks.py
+│   │           │   ├── templates/
+│   │           │   │   ├── async/
+│   │           │   │   │   ├── alembic.ini.mako
+│   │           │   │   │   ├── env.py
+│   │           │   │   │   ├── README
+│   │           │   │   │   └── script.py.mako
+│   │           │   │   ├── generic/
+│   │           │   │   │   ├── alembic.ini.mako
+│   │           │   │   │   ├── env.py
+│   │           │   │   │   ├── README
+│   │           │   │   │   └── script.py.mako
+│   │           │   │   ├── multidb/
+│   │           │   │   │   ├── alembic.ini.mako
+│   │           │   │   │   ├── env.py
+│   │           │   │   │   ├── README
+│   │           │   │   │   └── script.py.mako
+│   │           │   │   └── pyproject/
+│   │           │   │       ├── alembic.ini.mako
+│   │           │   │       ├── env.py
+│   │           │   │       ├── pyproject.toml.mako
+│   │           │   │       ├── README
+│   │           │   │       └── script.py.mako
+│   │           │   ├── testing/
+│   │           │   │   ├── plugin/
+│   │           │   │   │   ├── __init__.py
+│   │           │   │   │   └── bootstrap.py
+│   │           │   │   ├── suite/
+│   │           │   │   │   ├── __init__.py
+│   │           │   │   │   ├── _autogen_fixtures.py
+│   │           │   │   │   ├── test_autogen_comments.py
+│   │           │   │   │   ├── test_autogen_computed.py
+│   │           │   │   │   ├── test_autogen_diffs.py
+│   │           │   │   │   ├── test_autogen_fks.py
+│   │           │   │   │   ├── test_autogen_identity.py
+│   │           │   │   │   ├── test_environment.py
+│   │           │   │   │   └── test_op.py
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── assertions.py
+│   │           │   │   ├── env.py
+│   │           │   │   ├── fixtures.py
+│   │           │   │   ├── requirements.py
+│   │           │   │   ├── schemacompare.py
+│   │           │   │   ├── util.py
+│   │           │   │   └── warnings.py
+│   │           │   ├── util/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── compat.py
+│   │           │   │   ├── editor.py
+│   │           │   │   ├── exc.py
+│   │           │   │   ├── langhelpers.py
+│   │           │   │   ├── messaging.py
+│   │           │   │   ├── pyfiles.py
+│   │           │   │   └── sqla_compat.py
+│   │           │   ├── __init__.py
+│   │           │   ├── __main__.py
+│   │           │   ├── command.py
+│   │           │   ├── config.py
+│   │           │   ├── context.py
+│   │           │   ├── context.pyi
+│   │           │   ├── environment.py
+│   │           │   ├── migration.py
+│   │           │   ├── op.py
+│   │           │   ├── op.pyi
+│   │           │   └── py.typed
+│   │           ├── alembic-1.16.1.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   └── LICENSE
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── annotated_types/
+│   │           │   ├── __init__.py
+│   │           │   ├── py.typed
+│   │           │   └── test_cases.py
+│   │           ├── annotated_types-0.7.0.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   └── LICENSE
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── antlr4/
+│   │           │   ├── atn/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── ATN.py
+│   │           │   │   ├── ATNConfig.py
+│   │           │   │   ├── ATNConfigSet.py
+│   │           │   │   ├── ATNDeserializationOptions.py
+│   │           │   │   ├── ATNDeserializer.py
+│   │           │   │   ├── ATNSimulator.py
+│   │           │   │   ├── ATNState.py
+│   │           │   │   ├── ATNType.py
+│   │           │   │   ├── LexerAction.py
+│   │           │   │   ├── LexerActionExecutor.py
+│   │           │   │   ├── LexerATNSimulator.py
+│   │           │   │   ├── ParserATNSimulator.py
+│   │           │   │   ├── PredictionMode.py
+│   │           │   │   ├── SemanticContext.py
+│   │           │   │   └── Transition.py
+│   │           │   ├── dfa/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── DFA.py
+│   │           │   │   ├── DFASerializer.py
+│   │           │   │   └── DFAState.py
+│   │           │   ├── error/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── DiagnosticErrorListener.py
+│   │           │   │   ├── ErrorListener.py
+│   │           │   │   ├── Errors.py
+│   │           │   │   └── ErrorStrategy.py
+│   │           │   ├── tree/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── Chunk.py
+│   │           │   │   ├── ParseTreeMatch.py
+│   │           │   │   ├── ParseTreePattern.py
+│   │           │   │   ├── ParseTreePatternMatcher.py
+│   │           │   │   ├── RuleTagToken.py
+│   │           │   │   ├── TokenTagToken.py
+│   │           │   │   ├── Tree.py
+│   │           │   │   └── Trees.py
+│   │           │   ├── xpath/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── XPath.py
+│   │           │   │   └── XPathLexer.py
+│   │           │   ├── __init__.py
+│   │           │   ├── _pygrun.py
+│   │           │   ├── BufferedTokenStream.py
+│   │           │   ├── CommonTokenFactory.py
+│   │           │   ├── CommonTokenStream.py
+│   │           │   ├── FileStream.py
+│   │           │   ├── InputStream.py
+│   │           │   ├── IntervalSet.py
+│   │           │   ├── Lexer.py
+│   │           │   ├── ListTokenSource.py
+│   │           │   ├── LL1Analyzer.py
+│   │           │   ├── Parser.py
+│   │           │   ├── ParserInterpreter.py
+│   │           │   ├── ParserRuleContext.py
+│   │           │   ├── PredictionContext.py
+│   │           │   ├── Recognizer.py
+│   │           │   ├── RuleContext.py
+│   │           │   ├── StdinStream.py
+│   │           │   ├── Token.py
+│   │           │   ├── TokenStreamRewriter.py
+│   │           │   └── Utils.py
+│   │           ├── antlr4_python3_runtime-4.13.2.dist-info/
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── anyio/
+│   │           │   ├── _backends/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── _asyncio.py
+│   │           │   │   └── _trio.py
+│   │           │   ├── _core/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── _asyncio_selector_thread.py
+│   │           │   │   ├── _eventloop.py
+│   │           │   │   ├── _exceptions.py
+│   │           │   │   ├── _fileio.py
+│   │           │   │   ├── _resources.py
+│   │           │   │   ├── _signals.py
+│   │           │   │   ├── _sockets.py
+│   │           │   │   ├── _streams.py
+│   │           │   │   ├── _subprocesses.py
+│   │           │   │   ├── _synchronization.py
+│   │           │   │   ├── _tasks.py
+│   │           │   │   ├── _tempfile.py
+│   │           │   │   ├── _testing.py
+│   │           │   │   └── _typedattr.py
+│   │           │   ├── abc/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── _eventloop.py
+│   │           │   │   ├── _resources.py
+│   │           │   │   ├── _sockets.py
+│   │           │   │   ├── _streams.py
+│   │           │   │   ├── _subprocesses.py
+│   │           │   │   ├── _tasks.py
+│   │           │   │   └── _testing.py
+│   │           │   ├── streams/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── buffered.py
+│   │           │   │   ├── file.py
+│   │           │   │   ├── memory.py
+│   │           │   │   ├── stapled.py
+│   │           │   │   ├── text.py
+│   │           │   │   └── tls.py
+│   │           │   ├── __init__.py
+│   │           │   ├── from_thread.py
+│   │           │   ├── lowlevel.py
+│   │           │   ├── py.typed
+│   │           │   ├── pytest_plugin.py
+│   │           │   ├── to_interpreter.py
+│   │           │   ├── to_process.py
+│   │           │   └── to_thread.py
+│   │           ├── anyio-4.9.0.dist-info/
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── appdirs-1.4.4.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE.txt
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── apscheduler/
+│   │           │   ├── executors/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── asyncio.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── debug.py
+│   │           │   │   ├── gevent.py
+│   │           │   │   ├── pool.py
+│   │           │   │   ├── tornado.py
+│   │           │   │   └── twisted.py
+│   │           │   ├── jobstores/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── etcd.py
+│   │           │   │   ├── memory.py
+│   │           │   │   ├── mongodb.py
+│   │           │   │   ├── redis.py
+│   │           │   │   ├── rethinkdb.py
+│   │           │   │   ├── sqlalchemy.py
+│   │           │   │   └── zookeeper.py
+│   │           │   ├── schedulers/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── asyncio.py
+│   │           │   │   ├── background.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── blocking.py
+│   │           │   │   ├── gevent.py
+│   │           │   │   ├── qt.py
+│   │           │   │   ├── tornado.py
+│   │           │   │   └── twisted.py
+│   │           │   ├── triggers/
+│   │           │   │   ├── cron/
+│   │           │   │   │   ├── __init__.py
+│   │           │   │   │   ├── expressions.py
+│   │           │   │   │   └── fields.py
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── calendarinterval.py
+│   │           │   │   ├── combining.py
+│   │           │   │   ├── date.py
+│   │           │   │   └── interval.py
+│   │           │   ├── __init__.py
+│   │           │   ├── events.py
+│   │           │   ├── job.py
+│   │           │   └── util.py
+│   │           ├── APScheduler-3.11.0.dist-info/
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE.txt
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── asgiref/
+│   │           │   ├── __init__.py
+│   │           │   ├── compatibility.py
+│   │           │   ├── current_thread_executor.py
+│   │           │   ├── local.py
+│   │           │   ├── py.typed
+│   │           │   ├── server.py
+│   │           │   ├── sync.py
+│   │           │   ├── testing.py
+│   │           │   ├── timeout.py
+│   │           │   ├── typing.py
+│   │           │   └── wsgi.py
+│   │           ├── asgiref-3.8.1.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── asttokens/
+│   │           │   ├── __init__.py
+│   │           │   ├── astroid_compat.py
+│   │           │   ├── asttokens.py
+│   │           │   ├── line_numbers.py
+│   │           │   ├── mark_tokens.py
+│   │           │   ├── py.typed
+│   │           │   ├── util.py
+│   │           │   └── version.py
+│   │           ├── asttokens-3.0.0.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── attr/
+│   │           │   ├── __init__.py
+│   │           │   ├── __init__.pyi
+│   │           │   ├── _cmp.py
+│   │           │   ├── _cmp.pyi
+│   │           │   ├── _compat.py
+│   │           │   ├── _config.py
+│   │           │   ├── _funcs.py
+│   │           │   ├── _make.py
+│   │           │   ├── _next_gen.py
+│   │           │   ├── _typing_compat.pyi
+│   │           │   ├── _version_info.py
+│   │           │   ├── _version_info.pyi
+│   │           │   ├── converters.py
+│   │           │   ├── converters.pyi
+│   │           │   ├── exceptions.py
+│   │           │   ├── exceptions.pyi
+│   │           │   ├── filters.py
+│   │           │   ├── filters.pyi
+│   │           │   ├── py.typed
+│   │           │   ├── setters.py
+│   │           │   ├── setters.pyi
+│   │           │   ├── validators.py
+│   │           │   └── validators.pyi
+│   │           ├── attrs/
+│   │           │   ├── __init__.py
+│   │           │   ├── __init__.pyi
+│   │           │   ├── converters.py
+│   │           │   ├── exceptions.py
+│   │           │   ├── filters.py
+│   │           │   ├── py.typed
+│   │           │   ├── setters.py
+│   │           │   └── validators.py
+│   │           ├── attrs-25.3.0.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   └── LICENSE
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── auth0/
+│   │           │   ├── authentication/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── async_token_verifier.py
+│   │           │   │   ├── back_channel_login.py
+│   │           │   │   ├── base.py
+│   │           │   │   ├── client_authentication.py
+│   │           │   │   ├── database.py
+│   │           │   │   ├── delegated.py
+│   │           │   │   ├── enterprise.py
+│   │           │   │   ├── get_token.py
+│   │           │   │   ├── passwordless.py
+│   │           │   │   ├── pushed_authorization_requests.py
+│   │           │   │   ├── revoke_token.py
+│   │           │   │   ├── social.py
+│   │           │   │   ├── token_verifier.py
+│   │           │   │   └── users.py
+│   │           │   ├── management/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── actions.py
+│   │           │   │   ├── async_auth0.py
+│   │           │   │   ├── attack_protection.py
+│   │           │   │   ├── auth0.py
+│   │           │   │   ├── blacklists.py
+│   │           │   │   ├── branding.py
+│   │           │   │   ├── client_credentials.py
+│   │           │   │   ├── client_grants.py
+│   │           │   │   ├── clients.py
+│   │           │   │   ├── connections.py
+│   │           │   │   ├── custom_domains.py
+│   │           │   │   ├── device_credentials.py
+│   │           │   │   ├── email_templates.py
+│   │           │   │   ├── emails.py
+│   │           │   │   ├── grants.py
+│   │           │   │   ├── guardian.py
+│   │           │   │   ├── hooks.py
+│   │           │   │   ├── jobs.py
+│   │           │   │   ├── log_streams.py
+│   │           │   │   ├── logs.py
+│   │           │   │   ├── organizations.py
+│   │           │   │   ├── prompts.py
+│   │           │   │   ├── resource_servers.py
+│   │           │   │   ├── roles.py
+│   │           │   │   ├── rules.py
+│   │           │   │   ├── rules_configs.py
+│   │           │   │   ├── self_service_profiles.py
+│   │           │   │   ├── stats.py
+│   │           │   │   ├── tenants.py
+│   │           │   │   ├── tickets.py
+│   │           │   │   ├── user_blocks.py
+│   │           │   │   ├── users.py
+│   │           │   │   └── users_by_email.py
+│   │           │   ├── test/
+│   │           │   │   ├── authentication/
+│   │           │   │   │   ├── __init__.py
+│   │           │   │   │   ├── test_back_channel_login.py
+│   │           │   │   │   ├── test_base.py
+│   │           │   │   │   ├── test_database.py
+│   │           │   │   │   ├── test_delegated.py
+│   │           │   │   │   ├── test_enterprise.py
+│   │           │   │   │   ├── test_get_token.py
+│   │           │   │   │   ├── test_passwordless.py
+│   │           │   │   │   ├── test_pushed_authorization_requests.py
+│   │           │   │   │   ├── test_revoke_token.py
+│   │           │   │   │   ├── test_social.py
+│   │           │   │   │   ├── test_token_verifier.py
+│   │           │   │   │   └── test_users.py
+│   │           │   │   ├── management/
+│   │           │   │   │   ├── __init__.py
+│   │           │   │   │   ├── test_actions.py
+│   │           │   │   │   ├── test_atack_protection.py
+│   │           │   │   │   ├── test_auth0.py
+│   │           │   │   │   ├── test_blacklists.py
+│   │           │   │   │   ├── test_branding.py
+│   │           │   │   │   ├── test_client_credentials.py
+│   │           │   │   │   ├── test_client_grants.py
+│   │           │   │   │   ├── test_clients.py
+│   │           │   │   │   ├── test_connections.py
+│   │           │   │   │   ├── test_custom_domains.py
+│   │           │   │   │   ├── test_device_credentials.py
+│   │           │   │   │   ├── test_email_endpoints.py
+│   │           │   │   │   ├── test_emails.py
+│   │           │   │   │   ├── test_grants.py
+│   │           │   │   │   ├── test_guardian.py
+│   │           │   │   │   ├── test_hooks.py
+│   │           │   │   │   ├── test_jobs.py
+│   │           │   │   │   ├── test_log_streams.py
+│   │           │   │   │   ├── test_logs.py
+│   │           │   │   │   ├── test_organizations.py
+│   │           │   │   │   ├── test_prompts.py
+│   │           │   │   │   ├── test_resource_servers.py
+│   │           │   │   │   ├── test_rest.py
+│   │           │   │   │   ├── test_roles.py
+│   │           │   │   │   ├── test_rules.py
+│   │           │   │   │   ├── test_rules_configs.py
+│   │           │   │   │   ├── test_self_service_profiles.py
+│   │           │   │   │   ├── test_stats.py
+│   │           │   │   │   ├── test_tenants.py
+│   │           │   │   │   ├── test_tickets.py
+│   │           │   │   │   ├── test_user_blocks.py
+│   │           │   │   │   ├── test_users.py
+│   │           │   │   │   └── test_users_by_email.py
+│   │           │   │   ├── __init__.py
+│   │           │   │   └── conftest.py
+│   │           │   ├── test_async/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── conftest.py
+│   │           │   │   ├── test_async_auth0.py
+│   │           │   │   ├── test_async_token_verifier.py
+│   │           │   │   └── test_asyncify.py
+│   │           │   ├── __init__.py
+│   │           │   ├── asyncify.py
+│   │           │   ├── exceptions.py
+│   │           │   ├── rest.py
+│   │           │   ├── rest_async.py
+│   │           │   ├── types.py
+│   │           │   └── utils.py
+│   │           ├── auth0_python-4.10.0.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── backoff/
+│   │           │   ├── __init__.py
+│   │           │   ├── _async.py
+│   │           │   ├── _common.py
+│   │           │   ├── _decorator.py
+│   │           │   ├── _jitter.py
+│   │           │   ├── _sync.py
+│   │           │   ├── _typing.py
+│   │           │   ├── _wait_gen.py
+│   │           │   ├── py.typed
+│   │           │   └── types.py
+│   │           ├── backoff-2.2.1.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── bcrypt/
+│   │           │   ├── __init__.py
+│   │           │   ├── __init__.pyi
+│   │           │   ├── _bcrypt.abi3.so
+│   │           │   └── py.typed
+│   │           ├── bcrypt-4.3.0.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── beautifulsoup4-4.13.4.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   ├── AUTHORS
+│   │           │   │   └── LICENSE
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── bin/
+│   │           │   ├── convert_hf_to_gguf.py
+│   │           │   ├── llama-llava-clip-quantize-cli
+│   │           │   └── llama-mtmd-cli
+│   │           ├── blinker/
+│   │           │   ├── __init__.py
+│   │           │   ├── _utilities.py
+│   │           │   ├── base.py
+│   │           │   └── py.typed
+│   │           ├── blinker-1.9.0.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE.txt
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── bm25s/
+│   │           │   ├── numba/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── retrieve_utils.py
+│   │           │   │   └── selection.py
+│   │           │   ├── utils/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── beir.py
+│   │           │   │   ├── benchmark.py
+│   │           │   │   ├── corpus.py
+│   │           │   │   └── json_functions.py
+│   │           │   ├── __init__.py
+│   │           │   ├── hf.py
+│   │           │   ├── scoring.py
+│   │           │   ├── selection.py
+│   │           │   ├── stopwords.py
+│   │           │   ├── tokenization.py
+│   │           │   └── version.py
+│   │           ├── bm25s-0.2.13.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── bs4/
+│   │           │   ├── builder/
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── _html5lib.py
+│   │           │   │   ├── _htmlparser.py
+│   │           │   │   └── _lxml.py
+│   │           │   ├── tests/
+│   │           │   │   ├── fuzz/
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-4670634698080256.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-4818336571064320.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-4999465949331456.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5000587759190016.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5167584867909632.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5270998950477824.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5375146639360000.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5492400320282624.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5703933063462912.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5843991618256896.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-5984173902397440.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-6124268085182464.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-6241471367348224.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-6306874195312640.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-6450958476902400.testcase
+│   │           │   │   │   ├── clusterfuzz-testcase-minimized-bs4_fuzzer-6600557255327744.testcase
+│   │           │   │   │   ├── crash-0d306a50c8ed8bcd0785b67000fcd5dea1d33f08.testcase
+│   │           │   │   │   └── crash-ffbdfa8a2b26f13537b68d3794b0478a4090ee4a.testcase
+│   │           │   │   ├── __init__.py
+│   │           │   │   ├── test_builder.py
+│   │           │   │   ├── test_builder_registry.py
+│   │           │   │   ├── test_css.py
+│   │           │   │   ├── test_dammit.py
+│   │           │   │   ├── test_element.py
+│   │           │   │   ├── test_filter.py
+│   │           │   │   ├── test_formatter.py
+│   │           │   │   ├── test_fuzz.py
+│   │           │   │   ├── test_html5lib.py
+│   │           │   │   ├── test_htmlparser.py
+│   │           │   │   ├── test_lxml.py
+│   │           │   │   ├── test_navigablestring.py
+│   │           │   │   ├── test_pageelement.py
+│   │           │   │   ├── test_soup.py
+│   │           │   │   ├── test_tag.py
+│   │           │   │   └── test_tree.py
+│   │           │   ├── __init__.py
+│   │           │   ├── _deprecation.py
+│   │           │   ├── _typing.py
+│   │           │   ├── _warnings.py
+│   │           │   ├── css.py
+│   │           │   ├── dammit.py
+│   │           │   ├── diagnose.py
+│   │           │   ├── element.py
+│   │           │   ├── exceptions.py
+│   │           │   ├── filter.py
+│   │           │   ├── formatter.py
+│   │           │   └── py.typed
+│   │           ├── build-1.2.2.post1.dist-info/
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   └── WHEEL
+│   │           ├── cachetools/
+│   │           │   ├── __init__.py
+│   │           │   ├── _decorators.py
+│   │           │   ├── func.py
+│   │           │   └── keys.py
+│   │           ├── cachetools-5.5.2.dist-info/
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── certifi/
+│   │           │   ├── __init__.py
+│   │           │   ├── __main__.py
+│   │           │   ├── cacert.pem
+│   │           │   ├── core.py
+│   │           │   └── py.typed
+│   │           ├── certifi-2025.4.26.dist-info/
+│   │           │   ├── licenses/
+│   │           │   │   └── LICENSE
+│   │           │   ├── INSTALLER
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── cffi/
+│   │           │   ├── __init__.py
+│   │           │   ├── _cffi_errors.h
+│   │           │   ├── _cffi_include.h
+│   │           │   ├── _embedding.h
+│   │           │   ├── _imp_emulation.py
+│   │           │   ├── _shimmed_dist_utils.py
+│   │           │   ├── api.py
+│   │           │   ├── backend_ctypes.py
+│   │           │   ├── cffi_opcode.py
+│   │           │   ├── commontypes.py
+│   │           │   ├── cparser.py
+│   │           │   ├── error.py
+│   │           │   ├── ffiplatform.py
+│   │           │   ├── lock.py
+│   │           │   ├── model.py
+│   │           │   ├── parse_c_type.h
+│   │           │   ├── pkgconfig.py
+│   │           │   ├── recompiler.py
+│   │           │   ├── setuptools_ext.py
+│   │           │   ├── vengine_cpy.py
+│   │           │   ├── vengine_gen.py
+│   │           │   └── verifier.py
+│   │           ├── cffi-1.17.1.dist-info/
+│   │           │   ├── entry_points.txt
+│   │           │   ├── INSTALLER
+│   │           │   ├── LICENSE
+│   │           │   ├── METADATA
+│   │           │   ├── RECORD
+│   │           │   ├── REQUESTED
+│   │           │   ├── top_level.txt
+│   │           │   └── WHEEL
+│   │           ├── cffi.libs/
+│   │           ├── chardet/
+│   │           │   ├── cli/
+│   │           │   │   ├── __init__.py
+│   │           │   │   └── chardetect.py
+│   │           │   ├── metadata/
+│   │           │   │   ├── __init__.py
+│   │           │   │   └── languages.py
+│   │           │   ├── __init__.py
+│   │           │   ├── __main__.py
+│   │           │   ├── big5freq.py
+│   │           │   ├── big5prober.py
+│   │           │   ├── chardistribution.py
+│   │           │   ├── charsetgroupprober.py
+│   │           │   ├── charsetprober.py
+│   │           │   ├── codingstatemachine.py
+│   │           │   ├── codingstatemachinedict.py
+│   │           │   ├── cp949prober.py
+│   │           │   ├── enums.py
+│   │           │   ├── escprober.py
+│   │           │   ├── escsm.py
+│   │           │   ├── eucjpprober.py
+│   │           │   ├── euckrfreq.py
+│   │           │   ├── euckrprober.py
+----------------------------------------

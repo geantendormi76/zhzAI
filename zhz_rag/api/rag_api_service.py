@@ -6,12 +6,10 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 import logging
 import sys
-import shutil # <--- 添加 shutil
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from dataclasses import dataclass
 from dotenv import load_dotenv
-
 
 # --- 添加开始：明确指定 .env 文件路径 ---
 # 获取 rag_api_service.py 文件所在的目录
@@ -31,16 +29,13 @@ else:
     # 即使没找到，也执行一次 load_dotenv()，它可能会从其他地方加载或什么都不做
     load_dotenv()
 
-
-# --- [MODIFIED] Import new handlers and functions ---
+# --- 导入应用模块 ---
 from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
 from zhz_rag.llm.llm_interface import generate_answer_from_context, generate_expanded_queries, NO_ANSWER_PHRASE_ANSWER_CLEAN
-# --- 添加 LocalModelHandler 的导入 ---
 from zhz_rag.llm.local_model_handler import LocalModelHandler
 from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
 from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
 from zhz_rag.core_rag.kg_retriever import KGRetriever
-# --- 添加 LlamaCppEmbeddingFunction 的导入 ---
 from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
 from zhz_rag.core_rag.fusion_engine import FusionEngine
 
@@ -53,8 +48,6 @@ if not api_logger.hasHandlers():
     handler.setFormatter(formatter)
     api_logger.addHandler(handler)
     api_logger.propagate = False
-
-load_dotenv()
 
 # --- 应用上下文 Dataclass ---
 @dataclass
@@ -71,28 +64,27 @@ async def lifespan(app: FastAPI):
     api_logger.info("--- RAG API Service: Initializing RAG components with Qwen3 GGUF models ---")
     
     # --- 读取环境变量 ---
-    # LLM GGUF 模型路径 (用于 LocalModelHandler 中的 LLM 功能，如果 rag_api_service 也用它生成答案的话)
-    # 注意: 当前 rag_api_service 中的 generate_answer_from_context 等函数是调用外部的 local_llm_service.py
-    # 所以 llm_model_path_for_handler 可能暂时不直接用于答案生成，但 LocalModelHandler 初始化需要它。
-    # 如果您希望 LocalModelHandler 只负责嵌入，可以将 llm_model_path 设置为 None。
-    # 我们先假设您可能希望 LocalModelHandler 也能处理 LLM 任务。
     llm_gguf_model_path_for_handler = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
     embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH")
     chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
     bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
-    # --- 修改开始 ---
-    # 使用 DUCKDB_KG_FILE_PATH 环境变量
-    duckdb_file_path_for_api = os.getenv("DUCKDB_KG_FILE_PATH") 
-    # --- 修改结束 ---
+    duckdb_file_path_for_api = os.getenv("DUCKDB_KG_FILE_PATH")
 
-    # --- 修改环境变量检查逻辑 ---
+    # --- 新增：读取进程池大小配置 ---
+    embedding_pool_size_str = os.getenv("EMBEDDING_SUBPROCESS_POOL_SIZE")
+    embedding_pool_size = None
+    if embedding_pool_size_str and embedding_pool_size_str.isdigit():
+        embedding_pool_size = int(embedding_pool_size_str)
+        api_logger.info(f"RAG API Service: Embedding subprocess pool size set from env: {embedding_pool_size}")
+    else:
+        api_logger.info(f"RAG API Service: Embedding subprocess pool size not set or invalid in env, LocalModelHandler will use default.")
+
+    # --- 环境变量检查 ---
     required_paths_for_log = {
         "EMBEDDING_MODEL_PATH": embedding_gguf_model_path,
         "CHROMA_PERSIST_DIRECTORY": chroma_persist_dir,
         "BM25_INDEX_DIRECTORY": bm25_index_dir,
         "DUCKDB_KG_FILE_PATH": duckdb_file_path_for_api
-        # LOCAL_LLM_GGUF_MODEL_PATH 是可选的，如果 LocalModelHandler 只用于嵌入
-        # RERANKER_MODEL_PATH 由 FusionEngine 内部处理
     }
     missing_paths = [name for name, path in required_paths_for_log.items() if not path]
 
@@ -106,55 +98,47 @@ async def lifespan(app: FastAPI):
 
     try:
         # 1. 初始化 LocalModelHandler
-        #    LocalModelHandler 现在负责加载GGUF嵌入模型和可选的GGUF LLM模型
         api_logger.info(f"Initializing LocalModelHandler with Embedding GGUF: {embedding_gguf_model_path}")
         if llm_gguf_model_path_for_handler:
-             api_logger.info(f"LocalModelHandler will also attempt to load LLM GGUF: {llm_gguf_model_path_for_handler}")
+            api_logger.info(f"LocalModelHandler will also attempt to load LLM GGUF: {llm_gguf_model_path_for_handler}")
         
         model_handler = LocalModelHandler(
-            llm_model_path=llm_gguf_model_path_for_handler, # 可选，如果只用嵌入则为 None
+            llm_model_path=llm_gguf_model_path_for_handler,
             embedding_model_path=embedding_gguf_model_path,
-            # 可以从 .env 读取 n_ctx, n_gpu_layers 等参数，或使用 LocalModelHandler 的默认值
-            n_gpu_layers_embed=int(os.getenv("EMBED_N_GPU_LAYERS", 0)), # 示例
-            n_gpu_layers_llm=int(os.getenv("LLM_N_GPU_LAYERS", 0))   # 示例
+            n_gpu_layers_embed=int(os.getenv("EMBEDDING_N_GPU_LAYERS", 0)),
+            n_gpu_layers_llm=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
+            embedding_pool_size=embedding_pool_size
         )
-        if not model_handler.embedding_model:
-            raise RuntimeError("Failed to load GGUF embedding model in LocalModelHandler.")
+        # --- 修改：由于嵌入模型在子进程加载，这里不再能直接检查 model_handler.embedding_model ---
+        if not model_handler.embedding_model_path:
+            raise RuntimeError("LocalModelHandler initialized without an embedding_model_path. Cannot proceed with embedding features.")
+        api_logger.info("LocalModelHandler instance created. Embedding operations will use subprocess pool.")
 
         # 2. 创建 LlamaCppEmbeddingFunction
         api_logger.info("Creating LlamaCppEmbeddingFunction...")
         custom_embed_fn = LlamaCppEmbeddingFunction(model_handler=model_handler)
 
-        # 3. 初始化 ChromaDBRetriever，传入自定义嵌入函数
+        # 3. 初始化 ChromaDBRetriever
         api_logger.info(f"Initializing ChromaDBRetriever with persist_directory: {chroma_persist_dir}")
         chroma_retriever_instance = ChromaDBRetriever(
-            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"), # 从env或默认
+            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"),
             persist_directory=chroma_persist_dir,
-            embedding_function=custom_embed_fn # <--- 关键：传入自定义嵌入函数
+            embedding_function=custom_embed_fn
         )
 
-        # 4. 初始化 FileBM25Retriever (保持不变)
+        # 4. 初始化 FileBM25Retriever
         api_logger.info(f"Initializing FileBM25Retriever with index_directory: {bm25_index_dir}")
         file_bm25_retriever_instance = FileBM25Retriever(index_directory_path=bm25_index_dir)
 
-        # 5. 初始化 KGRetriever (使用 DuckDB)
-        # KGRetriever 现在会从环境变量 DUCKDB_KG_FILE_PATH 或其内部默认值获取路径
-        # 我们需要确保 LocalModelHandler (model_handler) 被正确传递
-        duckdb_file_path_for_api = os.getenv(
-            "DUCKDB_KG_FILE_PATH", 
-            os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "duckdb_knowledge_graph.db")
-        )
+        # 5. 初始化 KGRetriever
         api_logger.info(f"Initializing KGRetriever (DuckDB) with db_file_path: {duckdb_file_path_for_api}")
-        
-        # 确保 KGRetriever 的 __init__ 现在接受 db_file_path (如果不是仅依赖环境变量)
-        # 并且它内部会进行必要的 DuckDB 连接和 vss 设置检查
         kg_retriever_instance = KGRetriever(
-            db_file_path=duckdb_file_path_for_api, # 显式传递路径，覆盖其内部默认值（如果需要）
+            db_file_path=duckdb_file_path_for_api,
             embedder=model_handler 
         )
         api_logger.info("KGRetriever (DuckDB) initialized for RAG API Service.")
         
-        # 6. 初始化 FusionEngine (它内部会从env读取RERANKER_MODEL_PATH)
+        # 6. 初始化 FusionEngine
         api_logger.info("Initializing FusionEngine...")
         fusion_engine_instance = FusionEngine(logger=api_logger)
 
@@ -165,24 +149,40 @@ async def lifespan(app: FastAPI):
             file_bm25_retriever=file_bm25_retriever_instance,
             fusion_engine=fusion_engine_instance
         )
-        api_logger.info("--- RAG components initialized successfully using Qwen3 GGUF models. Service is ready. ---")
+        api_logger.info("--- RAG components initialized successfully. Embedding uses subprocesses. Service is ready. ---")
     except Exception as e:
         api_logger.critical(f"FATAL: Failed to initialize RAG components during startup: {e}", exc_info=True)
         app.state.rag_context = None 
     
     yield
     
+    # --- 应用关闭阶段 ---
     api_logger.info("--- RAG API Service: Cleaning up resources ---")
     rag_context_to_clean: Optional[RAGAppContext] = getattr(app.state, 'rag_context', None)
-    if rag_context_to_clean and rag_context_to_clean.kg_retriever:
-        rag_context_to_clean.kg_retriever.close() 
+    
+    if rag_context_to_clean:
+        if rag_context_to_clean.kg_retriever and hasattr(rag_context_to_clean.kg_retriever, 'close'):
+            try:
+                rag_context_to_clean.kg_retriever.close() 
+                api_logger.info("KGRetriever closed.")
+            except Exception as e_kg_close:
+                api_logger.error(f"Error closing KGRetriever: {e_kg_close}", exc_info=True)
+
+        # --- 新增：关闭 LocalModelHandler 的嵌入进程池 ---
+        if rag_context_to_clean.model_handler:
+            api_logger.info("Attempting to close LocalModelHandler's embedding pool...")
+            try:
+                rag_context_to_clean.model_handler.close_embedding_pool()
+            except Exception as e_pool_close:
+                api_logger.error(f"Error explicitly closing LocalModelHandler's embedding pool: {e_pool_close}", exc_info=True)
+        
     api_logger.info("--- Cleanup complete. ---")
 
 # --- FastAPI 应用实例 ---
 app = FastAPI(
     title="Upgraded Standalone RAG API Service",
     description="Provides API access to the RAG framework, now powered by Qwen3 models.",
-    version="2.0.0", # Major version upgrade!
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -196,7 +196,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     api_logger.info(f"Using Semaphore with limit: {CONCURRENT_CPU_OPERATIONS_LIMIT} for CPU-bound tasks.")
 
     async def run_with_semaphore(semaphore: asyncio.Semaphore, coro_or_func_name: str, coro_obj):
-        """执行一个协程，并使用信号量控制并发。"""
         async with semaphore:
             api_logger.debug(f"Semaphore acquired for async task: {coro_or_func_name}")
             result = await coro_obj
@@ -204,17 +203,14 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             return result
     
     async def run_sync_with_semaphore(semaphore: asyncio.Semaphore, func_name: str, func_obj, *args):
-        """在线程中执行一个同步阻塞函数，并使用信号量控制并发。"""
         async with semaphore:
             api_logger.debug(f"Semaphore acquired for sync task: {func_name}")
             result = await asyncio.to_thread(func_obj, *args)
             api_logger.debug(f"Semaphore released for sync task: {func_name}")
             return result
-    # --- 结束添加 ---
 
     app_ctx: RAGAppContext = request.app.state.rag_context
     if not app_ctx:
-        # 这个 HTTPException 会被 FastAPI 框架捕获并返回给客户端
         raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
 
     try:
@@ -229,15 +225,19 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         retrieval_tasks = []
         for q_text in expanded_queries:
             api_logger.debug(f"Preparing retrieval tasks for query part: '{q_text}'")
+
+            # --- 修改：ChromaDBRetriever.retrieve 现在是异步的，使用 run_with_semaphore ---
             retrieval_tasks.append(
-                run_sync_with_semaphore(
+                run_with_semaphore( # <--- 改回
                     cpu_bound_semaphore, 
                     "chroma_retriever.retrieve",
-                    app_ctx.chroma_retriever.retrieve, 
-                    q_text, 
-                    query_request.top_k_vector
+                    # 调用异步方法返回协程
+                    app_ctx.chroma_retriever.retrieve(q_text, query_request.top_k_vector) 
                 )
             )
+            # --- 结束修改 ---
+
+            # FileBM25Retriever.retrieve 是同步的，保持 run_sync_with_semaphore
             retrieval_tasks.append(
                 run_sync_with_semaphore(
                     cpu_bound_semaphore,
@@ -247,6 +247,8 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     query_request.top_k_bm25
                 )
             )
+            
+            # KGRetriever.retrieve 是异步的，使用 run_with_semaphore 是正确的
             retrieval_tasks.append(
                 run_with_semaphore(
                     cpu_bound_semaphore,
@@ -273,43 +275,43 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             for item in result_group:
                 if isinstance(item, RetrievedDocument):
                     all_retrieved_docs.append(item)
-                elif isinstance(item, dict) and 'id' in item and 'score' in item and item.get('source_type') != "knowledge_graph_kuzu": # 确保不是KG的结果
-                    # 假设只有BM25会返回这种简单字典格式，需要内容补全
+                # BM25 返回的是字典列表
+                elif isinstance(item, dict) and 'id' in item and 'score' in item:
                     bm25_results_to_enrich.append(item)
-                elif isinstance(item, dict) and item.get('source_type') == "knowledge_graph_kuzu": # KG retriever 返回的是字典
-                    try:
-                        all_retrieved_docs.append(RetrievedDocument(**item))
-                    except Exception as e_kg_parse:
-                        api_logger.error(f"Failed to parse KG result into RetrievedDocument: {item}, error: {e_kg_parse}")
 
-        api_logger.info(f"Processed gather results. Total docs before BM25 enrichment: {len(all_retrieved_docs)}. BM25 results to enrich: {len(bm25_results_to_enrich)}")
+        api_logger.info(f"Processed gather results. Total vector/KG docs: {len(all_retrieved_docs)}. BM25 results to enrich: {len(bm25_results_to_enrich)}")
         
         if bm25_results_to_enrich:
             bm25_ids = list(set([res['id'] for res in bm25_results_to_enrich]))
             if bm25_ids:
                 api_logger.info(f"Enriching {len(bm25_ids)} BM25 results by fetching texts from ChromaDB.")
-                # get_texts_by_ids 是同步的，也需要用 to_thread + semaphore
-                texts_map = await run_sync_with_semaphore(
+                texts_map = await run_with_semaphore( 
                     cpu_bound_semaphore,
                     "chroma_retriever.get_texts_by_ids",
-                    app_ctx.chroma_retriever.get_texts_by_ids,
-                    bm25_ids
+                    app_ctx.chroma_retriever.get_texts_by_ids(bm25_ids) 
                 )
                 api_logger.debug(f"Texts map from ChromaDB for BM25 enrichment: {texts_map}")
                 for res in bm25_results_to_enrich:
                     chunk_id = res['id']
-                    content_text = texts_map.get(chunk_id, f"[Content for BM25 chunk_id {chunk_id} not found in ChromaDB]")
+                    # --- 【关键修改，采纳外部AI建议】 ---
+                    content_text = texts_map.get(chunk_id) # 先尝试获取
+                    if content_text is None: # 显式检查 None
+                        content_text = f"[Content for BM25 chunk_id {chunk_id} not found in ChromaDB]"
+                        api_logger.warning(f"BM25 enrichment: Content for chunk_id {chunk_id} was not found. Using fallback text.")
+                    # --- 【修改结束】 ---
+                    
                     all_retrieved_docs.append(RetrievedDocument(
-                        source_type="keyword_bm25s",
-                        content=content_text,
+                        # --- 建议：source_type 统一小写和下划线 ---
+                        source_type="keyword_bm25", # 或 "keyword_bm25s" 取决于你的实际库/偏好
+                        content=content_text, # 现在确保 content_text 是字符串
                         score=res.get('score'),
                         metadata={"chunk_id": chunk_id}
                     ))
                 api_logger.info(f"BM25 results enriched. Total docs now: {len(all_retrieved_docs)}")
         
         if not all_retrieved_docs:
-             api_logger.info("No documents retrieved from any source after processing all tasks.")
-             return HybridRAGResponse(answer=NO_ANSWER_PHRASE_ANSWER_CLEAN, original_query=query_request.query, retrieved_sources=[])
+            api_logger.info("No documents retrieved from any source after processing all tasks.")
+            return HybridRAGResponse(answer=NO_ANSWER_PHRASE_ANSWER_CLEAN, original_query=query_request.query, retrieved_sources=[])
 
         api_logger.info(f"Acquiring semaphore for 'fusion_engine.fuse_results' (total {len(all_retrieved_docs)} docs)...")
         final_context_docs = await run_with_semaphore(
@@ -325,7 +327,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         else:
             context_strings = []
             for doc in final_context_docs:
-                score_to_display = doc.score # FusionEngine 应该已经统一了score
+                score_to_display = doc.score
                 score_str = f"{score_to_display:.4f}" if isinstance(score_to_display, float) else str(score_to_display if score_to_display is not None else 'N/A')
                 context_strings.append(
                     f"Source Type: {doc.source_type}, Score: {score_str}\nContent: {doc.content}"
@@ -345,7 +347,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
 
     except Exception as e:
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
-        # 确保即使在这里出错，也返回一个符合 HybridRAGResponse 结构或至少是FastAPI能处理的HTTPException
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 # --- Main execution block ---

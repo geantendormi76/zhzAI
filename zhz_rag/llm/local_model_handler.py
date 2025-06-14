@@ -1,21 +1,29 @@
 # 文件: zhz_rag/llm/local_model_handler.py
 import os
 import logging
-from typing import List, Optional, Dict
-from llama_cpp import Llama
+from typing import List, Optional, Dict, Any
 import asyncio
 import numpy as np
-import ctypes
+import multiprocessing
+from functools import partial
+from multiprocessing.pool import Pool
+
+# 导入新的工作函数
+from zhz_rag.llm.embedding_process_worker import embed_texts_in_subprocess, embed_query_in_subprocess
 
 logger = logging.getLogger(__name__)
 
 def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
+    """
+    对一批嵌入向量进行L2归一化。
+    注意：这个函数现在主要作为备用或验证，因为归一化逻辑已移至工作进程中。
+    """
     if not embeddings or not isinstance(embeddings, list):
         return []
     normalized_embeddings = []
     for emb_list in embeddings:
         if not emb_list or not isinstance(emb_list, list) or not all(isinstance(x, (float, int)) for x in emb_list):
-            logger.warning(f"L2_NORM: Skipping invalid or empty inner list: {emb_list}")
+            logger.warning(f"L2_NORM (LMH): Skipping invalid or empty inner list: {emb_list}")
             normalized_embeddings.append([]) 
             continue
         try:
@@ -31,6 +39,13 @@ def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
     return normalized_embeddings
 
 class LocalModelHandler:
+    """
+    管理本地GGUF模型加载和调用的句柄。
+    LLM模型在主进程中加载。
+    嵌入模型的操作被委托给一个独立的子进程池，以避免多线程冲突和段错误。
+    """
+    _instance_count = 0 
+
     def __init__(
         self,
         llm_model_path: Optional[str] = None,
@@ -39,236 +54,207 @@ class LocalModelHandler:
         n_gpu_layers_llm: int = 0,
         n_ctx_embed: int = 2048,
         n_gpu_layers_embed: int = 0,
-        pooling_type_embed: int = 2 # 0 for NONE, 1 for MEAN, 2 for CLS. Defaulting to CLS.
+        pooling_type_embed: int = 2,
+        embedding_pool_size: Optional[int] = None
     ):
-        self.llm_model: Optional[Llama] = None
-        self.embedding_model: Optional[Llama] = None
-        self.embedding_model_dimension: Optional[int] = None
-        self.pooling_type_embed = pooling_type_embed # Store it
+        LocalModelHandler._instance_count += 1
+        self.instance_id = LocalModelHandler._instance_count
+        logger.info(f"LMH Instance [{self.instance_id}] __init__ called.")
 
+        # LLM 模型加载逻辑
+        self.llm_model_path = llm_model_path
+        self.n_ctx_llm = n_ctx_llm
+        self.n_gpu_layers_llm = n_gpu_layers_llm
+        self.llm_model: Optional[Any] = None
+        
         if llm_model_path:
             try:
-                logger.info(f"LocalModelHandler: Loading LLM model from: {llm_model_path}")
+                from llama_cpp import Llama
+                logger.info(f"LMH Instance [{self.instance_id}]: Loading LLM model from: {llm_model_path}")
                 self.llm_model = Llama(
                     model_path=llm_model_path,
                     n_ctx=n_ctx_llm,
                     n_gpu_layers=n_gpu_layers_llm,
                     verbose=False
                 )
-                logger.info("LocalModelHandler: LLM model loaded successfully.")
+                logger.info(f"LMH Instance [{self.instance_id}]: LLM model loaded successfully.")
             except Exception as e:
-                logger.error(f"LocalModelHandler: Failed to load LLM model from {llm_model_path}: {e}", exc_info=True)
+                logger.error(f"LMH Instance [{self.instance_id}]: Failed to load LLM model from {llm_model_path}: {e}", exc_info=True)
+                self.llm_model = None
 
-        if embedding_model_path:
+        # 保存嵌入模型配置，不再直接加载
+        self.embedding_model_path = embedding_model_path
+        self.n_ctx_embed = n_ctx_embed
+        self.n_gpu_layers_embed = n_gpu_layers_embed
+        self.pooling_type_embed = pooling_type_embed
+        
+        self._embedding_model_dimension: Optional[int] = None
+        self._dimension_lock = asyncio.Lock()
+
+        # 初始化进程池
+        self._embedding_pool: Optional[Pool] = None
+        self._pool_size = embedding_pool_size if embedding_pool_size else os.cpu_count() or 1
+        
+        if self.embedding_model_path:
             try:
-                logger.info(f"LocalModelHandler: Loading embedding model from: {embedding_model_path}")
-                self.embedding_model = Llama(
-                    model_path=embedding_model_path,
-                    n_ctx=n_ctx_embed,
-                    n_gpu_layers=n_gpu_layers_embed,
-                    embedding=True,
-                    pooling_type=self.pooling_type_embed, # Use the stored integer value
-                    verbose=False
-                )
-                logger.info(f"LocalModelHandler: Embedding model loaded successfully with pooling_type={self.pooling_type_embed}.")
-                
-                if self.embedding_model:
-                    self.embedding_model_dimension = self.embedding_model.n_embd()
-                    logger.info(f"LocalModelHandler: Embedding dimension obtained from model metadata (n_embd()): {self.embedding_model_dimension}")
-                    if not self.embedding_model_dimension or self.embedding_model_dimension <= 0:
-                        logger.error(f"LocalModelHandler: n_embd() returned invalid dimension {self.embedding_model_dimension}. This should not happen.")
-                        raise ValueError(f"Invalid embedding dimension from model: {self.embedding_model_dimension}")
-                else:
-                    logger.error("LocalModelHandler: Embedding model loaded but instance is None, cannot get dimension.")
-                    raise RuntimeError("Embedding model failed to instantiate correctly.")
+                ctx = multiprocessing.get_context('spawn')
+                self._embedding_pool = ctx.Pool(processes=self._pool_size)
+                logger.info(f"LMH Instance [{self.instance_id}]: Embedding subprocess pool initialized with size {self._pool_size} and context 'spawn'.")
+            except Exception as e_pool:
+                logger.error(f"LMH Instance [{self.instance_id}]: Failed to initialize embedding subprocess pool: {e_pool}", exc_info=True)
+                self._embedding_pool = None
+        else:
+            logger.warning(f"LMH Instance [{self.instance_id}]: No embedding_model_path provided. Embedding pool not created.")
 
-            except Exception as e:
-                logger.error(f"LocalModelHandler: Failed to load embedding model or get dimension from {embedding_model_path}: {e}", exc_info=True)
-                self.embedding_model = None 
-                self.embedding_model_dimension = None
-        
-        if not self.llm_model and not self.embedding_model:
-            logger.warning("LocalModelHandler initialized without any models loaded.")
+        if not self.llm_model and not self.embedding_model_path:
+            logger.warning(f"LMH Instance [{self.instance_id}]: Initialized without LLM and no path for embedding model.")
 
-    def _blocking_embed_documents_internal(self, processed_texts_for_block: List[str]) -> List[List[float]]:
-        if not self.embedding_model or not self.embedding_model_dimension:
-            logger.error("LMH (_blocking_embed_docs): Embedding model or dimension not initialized.")
-            return [[] for _ in processed_texts_for_block]
+    async def _get_embedding_dimension_from_worker_once(self) -> Optional[int]:
+        """
+        通过启动一个临时工作进程来获取嵌入维度，并缓存结果。
+        """
+        if not self.embedding_model_path or not self._embedding_pool:
+            logger.error(f"LMH Instance [{self.instance_id}]: Cannot get dimension, no model path or pool.")
+            return None
 
-        default_zero_vector = [0.0] * self.embedding_model_dimension
-        
-        if not processed_texts_for_block:
-            logger.info("LMH (_blocking_embed_docs): Received empty list of texts to embed.")
-            return []
-
-        logger.info(f"LMH (_blocking_embed_docs): Preparing to embed {len(processed_texts_for_block)} documents using create_embedding (batch).")
-
-        # 1. 识别有效文本及其原始索引
-        valid_texts_with_indices: List[tuple[int, str]] = []
-        for i, text in enumerate(processed_texts_for_block):
-            if text and text.strip(): # 确保文本非空且去除空白后仍有内容
-                valid_texts_with_indices.append((i, text))
-            else:
-                logger.warning(f"LMH (_blocking_embed_docs): Input text at original index {i} is empty or invalid. Will use zero vector. Text: '{text}'")
-
-        if not valid_texts_with_indices:
-            logger.info("LMH (_blocking_embed_docs): No valid texts found after filtering. Returning all zero vectors.")
-            return [list(default_zero_vector) for _ in processed_texts_for_block]
-
-        valid_texts_to_embed = [text for _, text in valid_texts_with_indices]
-        logger.info(f"LMH (_blocking_embed_docs): Embedding {len(valid_texts_to_embed)} valid texts out of {len(processed_texts_for_block)} total.")
-
-        # 2. 对有效文本进行批量嵌入
-        raw_embeddings_for_valid_texts: List[List[float]] = []
+        dummy_text = "dimension" 
+        logger.info(f"LMH Instance [{self.instance_id}]: Attempting to derive embedding dimension via a dummy query in subprocess...")
         try:
-            response = self.embedding_model.create_embedding(input=valid_texts_to_embed)
-            if response and "data" in response and isinstance(response["data"], list):
-                embeddings_data = response["data"]
-                # 假设 create_embedding 返回的顺序与输入 valid_texts_to_embed 的顺序一致
-                # 并且其 "index" 字段是相对于 valid_texts_to_embed 列表的索引
-                if len(embeddings_data) == len(valid_texts_to_embed):
-                    for item_idx, item in enumerate(embeddings_data):
-                        if isinstance(item, dict) and "embedding" in item:
-                            # 确认 item["index"] 是否与 item_idx 一致，如果不是，需要更复杂的排序
-                            # llama-cpp-python 通常按输入顺序返回，其内部索引也是如此
-                            if item.get("index") != item_idx:
-                                logger.warning(f"LMH (_blocking_embed_docs): Embedding response index mismatch. Expected {item_idx}, got {item.get('index')}. Assuming order is preserved.")
+            task_args = (
+                dummy_text,
+                self.embedding_model_path,
+                self.n_ctx_embed,
+                self.n_gpu_layers_embed,
+                self.pooling_type_embed
+            )
+            loop = asyncio.get_running_loop()
+            async_result = self._embedding_pool.apply_async(embed_query_in_subprocess, args=task_args)
+            result_embedding = await loop.run_in_executor(None, async_result.get, 60)
 
-                            embedding_vector = item["embedding"]
-                            if isinstance(embedding_vector, list) and \
-                               all(isinstance(x, (float, int)) for x in embedding_vector) and \
-                               len(embedding_vector) == self.embedding_model_dimension:
-                                raw_embeddings_for_valid_texts.append([float(x) for x in embedding_vector])
-                            else:
-                                logger.warning(f"LMH (_blocking_embed_docs): Valid text at valid_idx {item_idx} got invalid embedding vector or dimension. Using zero vector. Vector: {str(embedding_vector)[:100]}")
-                                raw_embeddings_for_valid_texts.append(list(default_zero_vector))
-                        else:
-                            logger.warning(f"LMH (_blocking_embed_docs): Invalid item format in embedding response for valid text at valid_idx {item_idx}. Using zero vector.")
-                            raw_embeddings_for_valid_texts.append(list(default_zero_vector))
-                else: # 返回的嵌入数量与有效文本数量不匹配
-                    logger.error(f"LMH (_blocking_embed_docs): Mismatch between number of embeddings received ({len(embeddings_data)}) and number of valid texts sent ({len(valid_texts_to_embed)}). Using zero vectors for all valid texts.")
-                    raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
-            else: # create_embedding 返回无效响应
-                logger.error(f"LMH (_blocking_embed_docs): Invalid or empty response from create_embedding for valid texts: {str(response)[:200]}. Using zero vectors for all valid texts.")
-                raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
-        except Exception as e_batch_embed: # 捕获批量嵌入过程中的任何异常
-            logger.error(f"LMH (_blocking_embed_docs): Error during batch embedding of valid texts: {e_batch_embed}", exc_info=True)
-            raw_embeddings_for_valid_texts = [list(default_zero_vector) for _ in valid_texts_to_embed]
-
-        # 3. 构建最终的嵌入列表，保持原始顺序，并为无效文本填充零向量
-        final_embeddings_ordered: List[List[float]] = [list(default_zero_vector) for _ in processed_texts_for_block]
-        
-        valid_embedding_idx = 0
-        for original_idx, _ in valid_texts_with_indices:
-            if valid_embedding_idx < len(raw_embeddings_for_valid_texts):
-                final_embeddings_ordered[original_idx] = raw_embeddings_for_valid_texts[valid_embedding_idx]
-                valid_embedding_idx += 1
-            else: # 应该不会发生，因为上面已经处理了数量不匹配的情况
-                logger.error(f"LMH (_blocking_embed_docs): Logic error in mapping valid embeddings back. Should not happen.")
-                final_embeddings_ordered[original_idx] = list(default_zero_vector) # 安全回退
-        
-        if len(final_embeddings_ordered) != len(processed_texts_for_block):
-            logger.critical(f"LMH (_blocking_embed_docs): Final ordered embeddings length ({len(final_embeddings_ordered)}) "
-                            f"mismatches input texts length ({len(processed_texts_for_block)}). This is a bug. Re-padding.")
-            # 尽力确保输出列表长度与输入一致
-            padded_final_embeddings = [list(default_zero_vector)] * len(processed_texts_for_block)
-            for i in range(min(len(final_embeddings_ordered), len(processed_texts_for_block))):
-                if final_embeddings_ordered[i] and len(final_embeddings_ordered[i]) == self.embedding_model_dimension:
-                    padded_final_embeddings[i] = final_embeddings_ordered[i]
-            final_embeddings_ordered = padded_final_embeddings
-
-        normalized_embeddings = l2_normalize_embeddings(final_embeddings_ordered)
-        logger.info(f"LMH: Successfully processed and normalized {len(normalized_embeddings)} document embeddings (batch, with invalid text handling).")
-        return normalized_embeddings
-
-    def _blocking_embed_query_internal(self, processed_text: str) -> List[float]:
-        if not self.embedding_model or not self.embedding_model_dimension:
-            logger.error("LMH (_blocking_embed_query): Embedding model or dimension not initialized.")
-            return []
-        
-        default_zero_vector = [0.0] * self.embedding_model_dimension
-        try:
-            # llama-cpp-python's embed() for a single string with pooling_type set
-            # should return a List[float] directly.
-            embedding_vector = self.embedding_model.embed(processed_text)
-            
-            current_embedding_list: List[float] = []
-            if isinstance(embedding_vector, np.ndarray):
-                if embedding_vector.ndim == 1:
-                    current_embedding_list = embedding_vector.tolist()
-                else:
-                    logger.warning(f"LMH (_blocking_embed_query): Query embedding (np.ndarray) has unexpected shape {embedding_vector.shape}. Using zero vector.")
-            elif isinstance(embedding_vector, list):
-                if all(isinstance(x, (float, int)) for x in embedding_vector):
-                    current_embedding_list = [float(x) for x in embedding_vector]
-                # Removed the List[List[float]] check for single query as it's less likely with pooling
-                else:
-                    logger.warning(f"LMH (_blocking_embed_query): Query embedding (list) has unexpected inner types. Using zero vector.")
+            if result_embedding and isinstance(result_embedding, list) and len(result_embedding) > 0:
+                dim = len(result_embedding)
+                logger.info(f"LMH Instance [{self.instance_id}]: Successfully derived embedding dimension: {dim}")
+                return dim
             else:
-                logger.warning(f"LMH (_blocking_embed_query): Query embedding is not np.ndarray or list. Type: {type(embedding_vector)}. Using zero vector.")
-
-            if len(current_embedding_list) == self.embedding_model_dimension:
-                normalized_embedding_list_of_list = l2_normalize_embeddings([current_embedding_list])
-                final_embedding = normalized_embedding_list_of_list[0] if normalized_embedding_list_of_list and normalized_embedding_list_of_list[0] else list(default_zero_vector)
-                logger.info(f"LMH: Successfully processed query embedding (sync part). Dimension: {len(final_embedding)}")
-                return final_embedding
-            else:
-                if current_embedding_list:
-                    logger.warning(f"LMH (_blocking_embed_query): Query embedding dim mismatch after parsing. Expected {self.embedding_model_dimension}, got {len(current_embedding_list)}. Using zero vector.")
-                else:
-                    logger.warning(f"LMH (_blocking_embed_query): Failed to parse query embedding. Using zero vector.")
-                return list(default_zero_vector)
-        except Exception as e_sync_embed_query:
-            logger.error(f"LMH: Error during synchronous query embedding for '{processed_text[:50]}...': {e_sync_embed_query}", exc_info=True)
-            return list(default_zero_vector)
+                logger.error(f"LMH Instance [{self.instance_id}]: Failed to derive dimension. Dummy query returned: {result_embedding}")
+                return None
+        except multiprocessing.TimeoutError:
+            logger.error(f"LMH Instance [{self.instance_id}]: Timeout while trying to get dimension from worker.")
+            return None
+        except Exception as e_dim:
+            logger.error(f"LMH Instance [{self.instance_id}]: Error deriving embedding dimension: {e_dim}", exc_info=True)
+            return None
 
     async def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if not self.embedding_model:
-            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed documents.")
-            return [[] for _ in texts] 
+        if not self._embedding_pool or not self.embedding_model_path:
+            logger.error(f"LMH Instance [{self.instance_id}]: Embedding pool or model path not available. Cannot embed documents.")
+            async with self._dimension_lock:
+                if self._embedding_model_dimension is None:
+                    logger.warning(f"LMH Instance [{self.instance_id}]: embed_documents - dimension unknown, attempting to get it first.")
+                    temp_dim = await self._get_embedding_dimension_from_worker_once()
+                    if temp_dim:
+                        self._embedding_model_dimension = temp_dim
+                    else:
+                        logger.error(f"LMH Instance [{self.instance_id}]: embed_documents - Failed to get dimension, cannot proceed.")
+                        return [[] for _ in texts]
+            return [[0.0] * self._embedding_model_dimension if self._embedding_model_dimension else [] for _ in texts]
+
         if not texts:
             return []
 
-        processed_texts = [
-            (text + "<|endoftext|>" if text and not text.endswith("<|endoftext|>") else text)
-            for text in texts
-        ]
-        logger.info(f"LocalModelHandler: Embedding {len(processed_texts)} documents (async via to_thread)...")
+        processed_texts = [(text + "<|endoftext|>" if text and not text.endswith("<|endoftext|>") else text) for text in texts]
+        logger.info(f"LMH Instance [{self.instance_id}]: Submitting {len(processed_texts)} documents for embedding to subprocess pool...")
+
         try:
-            return await asyncio.to_thread(self._blocking_embed_documents_internal, processed_texts)
+            task_func = partial(
+                embed_texts_in_subprocess,
+                embedding_model_path=self.embedding_model_path,
+                n_ctx_embed=self.n_ctx_embed,
+                n_gpu_layers_embed=self.n_gpu_layers_embed,
+                pooling_type_embed=self.pooling_type_embed
+            )
+            
+            loop = asyncio.get_running_loop()
+            async_result = self._embedding_pool.apply_async(task_func, args=(processed_texts,))
+            embeddings_list = await loop.run_in_executor(None, async_result.get, 300)
+
+            if embeddings_list is None:
+                raise RuntimeError("Embedding subprocess returned None, possibly due to timeout or unhandled error in worker.")
+
+            logger.info(f"LMH Instance [{self.instance_id}]: Received {len(embeddings_list)} embeddings from subprocess.")
+            return embeddings_list
+
+        except multiprocessing.TimeoutError:
+            logger.error(f"LMH Instance [{self.instance_id}]: Timeout embedding documents in subprocess.", exc_info=True)
+            return [[0.0] * (self._embedding_model_dimension or 1024) for _ in texts]
         except Exception as e_async_embed_docs:
-            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for document embedding: {e_async_embed_docs}", exc_info=True)
-            return [[0.0] * self.embedding_model_dimension if self.embedding_model_dimension else [] for _ in texts]
+            logger.error(f"LMH Instance [{self.instance_id}]: Error submitting document embedding task to subprocess: {e_async_embed_docs}", exc_info=True)
+            return [[0.0] * (self._embedding_model_dimension or 1024) for _ in texts]
 
     async def embed_query(self, text: str) -> List[float]:
-        if not self.embedding_model:
-            logger.error("LocalModelHandler: Embedding model is not loaded. Cannot embed query.")
-            return []
+        if not self._embedding_pool or not self.embedding_model_path:
+            logger.error(f"LMH Instance [{self.instance_id}]: Embedding pool or model path not available. Cannot embed query.")
+            async with self._dimension_lock:
+                if self._embedding_model_dimension is None:
+                    logger.warning(f"LMH Instance [{self.instance_id}]: embed_query - dimension unknown, attempting to get it first.")
+                    temp_dim = await self._get_embedding_dimension_from_worker_once()
+                    if temp_dim:
+                        self._embedding_model_dimension = temp_dim
+                    else:
+                        logger.error(f"LMH Instance [{self.instance_id}]: embed_query - Failed to get dimension, cannot proceed.")
+                        return []
+            return [0.0] * self._embedding_model_dimension if self._embedding_model_dimension else []
+
         if not text: 
             return []
 
-        processed_text_for_block = text + "<|endoftext|>" if not text.endswith("<|endoftext|>") else text
-        logger.info(f"LocalModelHandler: Embedding query (async via to_thread, first 100 chars): {processed_text_for_block[:100]}...")
+        processed_text = text + "<|endoftext|>" if not text.endswith("<|endoftext|>") else text
+        logger.info(f"LMH Instance [{self.instance_id}]: Submitting query for embedding to subprocess pool (first 100): {processed_text[:100]}...")
+
         try:
-            return await asyncio.to_thread(self._blocking_embed_query_internal, processed_text_for_block)
+            task_func = partial(
+                embed_query_in_subprocess,
+                embedding_model_path=self.embedding_model_path,
+                n_ctx_embed=self.n_ctx_embed,
+                n_gpu_layers_embed=self.n_gpu_layers_embed,
+                pooling_type_embed=self.pooling_type_embed
+            )
+            loop = asyncio.get_running_loop()
+            async_result = self._embedding_pool.apply_async(task_func, args=(processed_text,))
+            embedding_vector = await loop.run_in_executor(None, async_result.get, 60)
+
+            if embedding_vector is None:
+                 raise RuntimeError("Embedding subprocess returned None for query, possibly due to timeout or unhandled error in worker.")
+
+            logger.info(f"LMH Instance [{self.instance_id}]: Received query embedding from subprocess (len: {len(embedding_vector)}).")
+            return embedding_vector
+            
+        except multiprocessing.TimeoutError:
+            logger.error(f"LMH Instance [{self.instance_id}]: Timeout embedding query in subprocess.", exc_info=True)
+            return [0.0] * (self._embedding_model_dimension or 1024)
         except Exception as e_async_embed_query:
-            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for query embedding: {e_async_embed_query}", exc_info=True)
-            return [0.0] * self.embedding_model_dimension if self.embedding_model_dimension else []
+            logger.error(f"LMH Instance [{self.instance_id}]: Error submitting query embedding task to subprocess: {e_async_embed_query}", exc_info=True)
+            return [0.0] * (self._embedding_model_dimension or 1024)
     
     def get_embedding_dimension(self) -> Optional[int]:
-        if not self.embedding_model_dimension:
-             logger.warning(f"LocalModelHandler: get_embedding_dimension() called but dimension is not set. This should have been set during __init__.")
-        return self.embedding_model_dimension
+        if self._embedding_model_dimension is None:
+             logger.warning(f"LMH Instance [{self.instance_id}]: get_embedding_dimension() called but dimension is not yet known. "
+                            "It should be fetched by calling an embedding method first or during initialization.")
+        return self._embedding_model_dimension
 
     async def generate_text_with_local_llm(self, messages: List[Dict[str,str]], temperature: float = 0.1, max_tokens: int = 1024, stop: Optional[List[str]]=None) -> Optional[str]:
         if not self.llm_model:
-            logger.error("LocalModelHandler: LLM model is not loaded. Cannot generate text.")
+            logger.error(f"LMH Instance [{self.instance_id}]: LLM model is not loaded. Cannot generate text.")
             return None
         
-        logger.info(f"LocalModelHandler: Generating text with local ·LLM. Message count: {len(messages)}")
+        logger.info(f"LMH Instance [{self.instance_id}]: Generating text with local LLM. Message count: {len(messages)}")
         
         def _blocking_llm_call():
             try:
+                if not hasattr(self.llm_model, 'create_chat_completion'):
+                    logger.error(f"LMH Instance [{self.instance_id}]: self.llm_model is not a valid Llama instance for generation.")
+                    return None
+
                 completion_params = {
                     "messages": messages,
                     "temperature": temperature,
@@ -281,18 +267,45 @@ class LocalModelHandler:
                 
                 if response and response.get("choices") and response["choices"][0].get("message"):
                     content = response["choices"][0]["message"].get("content")
-                    logger.info(f"LocalModelHandler: LLM generation successful (sync part). Output (first 100 chars): {str(content)[:100]}...")
+                    logger.info(f"LMH Instance [{self.instance_id}]: LLM generation successful (sync part). Output (first 100 chars): {str(content)[:100]}...")
                     return content
                 else:
-                    logger.warning(f"LocalModelHandler: LLM generation did not return expected content (sync part). Response: {response}")
+                    logger.warning(f"LMH Instance [{self.instance_id}]: LLM generation did not return expected content (sync part). Response: {response}")
                     return None
             except Exception as e_sync:
-                logger.error(f"LocalModelHandler: Error during synchronous LLM call: {e_sync}", exc_info=True)
+                logger.error(f"LMH Instance [{self.instance_id}]: Error during synchronous LLM call: {e_sync}", exc_info=True)
                 return None
 
         try:
             generated_content = await asyncio.to_thread(_blocking_llm_call)
             return generated_content
         except Exception as e_async:
-            logger.error(f"LocalModelHandler: Error in asyncio.to_thread for LLM call: {e_async}", exc_info=True)
+            logger.error(f"LMH Instance [{self.instance_id}]: Error in asyncio.to_thread for LLM call: {e_async}", exc_info=True)
             return None
+
+    def close_embedding_pool(self):
+        """Safely close and join the multiprocessing pool."""
+        logger.info(f"LMH Instance [{self.instance_id}]: Attempting to close embedding pool...")
+        if self._embedding_pool:
+            try:
+                self._embedding_pool.close()
+                self._embedding_pool.join()
+                self._embedding_pool = None
+                logger.info(f"LMH Instance [{self.instance_id}]: Embedding pool closed and joined successfully.")
+            except Exception as e_close:
+                logger.error(f"LMH Instance [{self.instance_id}]: Error closing embedding pool: {e_close}", exc_info=True)
+                if self._embedding_pool:
+                    try:
+                        logger.warning(f"LMH Instance [{self.instance_id}]: Pool close/join failed, attempting terminate.")
+                        self._embedding_pool.terminate()
+                        self._embedding_pool.join()
+                    except Exception as e_term:
+                        logger.error(f"LMH Instance [{self.instance_id}]: Error terminating embedding pool: {e_term}", exc_info=True)
+                self._embedding_pool = None
+        else:
+            logger.info(f"LMH Instance [{self.instance_id}]: Embedding pool was not initialized or already closed.")
+
+    def __del__(self):
+        """Destructor to ensure the pool is closed when the object is garbage collected."""
+        logger.info(f"LMH Instance [{self.instance_id}]: __del__ called. Ensuring embedding pool is closed.")
+        self.close_embedding_pool()
