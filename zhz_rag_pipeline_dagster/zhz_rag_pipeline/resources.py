@@ -36,63 +36,40 @@ except ImportError as e_hal_import:
 try:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
 except ImportError as e:
-    print(f"FATAL: Could not import LocalModelHandler from zhz_rag.llm.local_model_handler. "
-          f"Please ensure 'zhz_rag' package is installed and accessible in the Dagster environment's PYTHONPATH. Error: {e}")
+    print(f"FATAL: Could not import LocalModelHandler from zhz_rag.llm.local_model_handler. Error: {e}")
     raise
 
-
-# --- 新的 GGUFEmbeddingResource 定义 ---
 class GGUFEmbeddingResourceConfig(dg.Config):
-    embedding_model_path: str = PydanticField(
-        description="Path to the GGUF embedding model file."
-    )
-    n_ctx: int = PydanticField(
-        default=2048,
-        description="Context size for the embedding model."
-    )
-    n_gpu_layers: int = PydanticField(
-        default=0,
-        description="Number of GPU layers to offload for the embedding model."
-    )
+    # --- 采纳外部AI建议的修改 ---
+    embedding_model_path: str  # 必需字段，直接类型注解
+    n_ctx: int = 2048          # 可选字段，直接赋予Python默认值
+    n_gpu_layers: int = 0      # 可选字段，直接赋予Python默认值
+    # --- 修改结束 ---
 
 class GGUFEmbeddingResource(dg.ConfigurableResource):
     embedding_model_path: str
     n_ctx: int
     n_gpu_layers: int
 
-    _model_handler: LocalModelHandler = PrivateAttr(default=None)
+    _model_handler: Optional[LocalModelHandler] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
+    _dimension: Optional[int] = PrivateAttr(default=None)
+    # _dimension_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock) # 在纯同步场景下暂时不需要
 
-    # --- 添加辅助方法 ---
     def _run_async_in_new_loop(self, coro):
-        """辅助函数，在当前线程中创建一个新事件循环来运行协程。"""
+        # 这个辅助函数在同步方法中运行异步协程是正确的
+        # 对于 Dagster 这种多进程/多线程环境，确保每次都用新循环可能更安全
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            # 尝试获取当前线程已有的循环，如果没有则创建一个新的
-            # 这对于 Dagster 这种可能在不同线程中执行资源初始化的场景更稳健
-            loop = asyncio.get_event_loop_policy().new_event_loop()
-            asyncio.set_event_loop(loop)
             result = loop.run_until_complete(coro)
+        finally:
             loop.close()
-            return result
-        except RuntimeError as e:
-            if "cannot run event loop while another loop is running" in str(e):
-                # 如果当前线程已经有一个正在运行的循环 (理论上 Dagster 资产执行时不会)
-                # 这种情况比较复杂，直接在同步代码中调用异步代码的最佳实践是使用 asyncio.to_thread
-                # 但这里资源方法是被同步资产调用的，我们期望它返回实际结果。
-                # 对于 Dagster 资源，更常见的是资源方法本身是同步的，如果它们需要调用异步操作，
-                # 它们需要自己管理事件循环的运行。
-                self._logger.error(f"GGUFEmbeddingResource: Nested event loop issue in _run_async_in_new_loop: {e}")
-                # 另一种选择是，如果 LocalModelHandler 的方法是纯CPU密集型，
-                # 也许 LocalModelHandler 的方法应该设计成同步的，然后在需要异步的地方用 to_thread。
-                # 但我们之前为了 LlamaCppEmbeddingFunction 的 asyncio.run 改成了 async.
-                # 这里我们先尝试创建一个新的循环。
-            self._logger.error(f"GGUFEmbeddingResource: Error running async task in new loop: {e}", exc_info=True)
-            raise # 将原始错误重新抛出
-    # --- 结束添加 ---
+        return result
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"Initializing GGUFEmbeddingResource...")
+        self._logger.info(f"Initializing GGUFEmbeddingResource with model: {self.embedding_model_path}")
         
         if not os.path.exists(self.embedding_model_path):
             error_msg = f"GGUF embedding model file not found at: {self.embedding_model_path}"
@@ -100,58 +77,65 @@ class GGUFEmbeddingResource(dg.ConfigurableResource):
             raise FileNotFoundError(error_msg)
 
         try:
-            # 只初始化嵌入功能
             self._model_handler = LocalModelHandler(
                 embedding_model_path=self.embedding_model_path,
                 n_ctx_embed=self.n_ctx,
-                n_gpu_layers_embed=self.n_gpu_layers
+                n_gpu_layers_embed=self.n_gpu_layers,
+                # embedding_pool_size 可以考虑从Config传入或使用默认
             )
-            if not self._model_handler.embedding_model:
-                raise RuntimeError("Failed to load GGUF embedding model inside LocalModelHandler.")
-            
-            self._logger.info(f"GGUFEmbeddingResource initialized successfully. Model: {self.embedding_model_path}")
+            self._logger.info(f"GGUFEmbeddingResource initialized. LocalModelHandler created. Dimension will be fetched on first use.")
         except Exception as e:
-            self._logger.error(f"Failed to initialize GGUFEmbeddingResource: {e}", exc_info=True)
+            self._logger.error(f"Failed to initialize GGUFEmbeddingResource (LocalModelHandler creation failed): {e}", exc_info=True)
             raise
 
-    def encode(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
-        """
-        提供与 SentenceTransformer.encode 类似的接口。
-        忽略 kwargs 以保持兼容性。
-        """
-        if not hasattr(self, '_model_handler'):
-            raise RuntimeError("GGUFEmbeddingResource is not initialized. Call setup_for_execution first.")
-        
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.debug(f"GGUFEmbeddingResource: Encoding {len(texts)} texts using LocalModelHandler.")
+    def _ensure_dimension_is_known(self) -> int:
+        if self._dimension is None:
+            if self._model_handler is None: # 确保 _model_handler 已初始化
+                self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in _ensure_dimension_is_known.")
+                raise RuntimeError("LocalModelHandler not initialized, cannot get dimension.")
+            
+            self._logger.info("GGUFEmbeddingResource: Dimension not yet known, attempting to fetch from LocalModelHandler...")
+            try:
+                # _get_embedding_dimension_from_worker_once() 是 LocalModelHandler 的异步方法
+                dim = self._run_async_in_new_loop(self._model_handler._get_embedding_dimension_from_worker_once())
+                if dim is None or dim <= 0:
+                    raise ValueError(f"LocalModelHandler returned invalid dimension: {dim}")
+                self._dimension = dim
+                self._logger.info(f"GGUFEmbeddingResource: Dimension fetched and cached: {self._dimension}")
+            except Exception as e:
+                self._logger.error(f"GGUFEmbeddingResource: Failed to fetch embedding dimension: {e}", exc_info=True)
+                raise RuntimeError(f"Could not determine embedding dimension: {e}") from e
+        return self._dimension
 
-        # --- 修改调用方式 ---
-        # LocalModelHandler.embed_documents 是 async def
-        # GGUFEmbeddingResource.encode 是同步方法，在 Dagster 资产中被同步调用
-        # 我们需要在这里同步地执行异步的 embed_documents 方法
+    def encode(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+        if self._model_handler is None:
+            self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in encode.")
+            raise RuntimeError("GGUFEmbeddingResource is not initialized (model_handler is None).")
+        
+        self._ensure_dimension_is_known() 
+
+        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
+        logger_instance.debug(f"GGUFEmbeddingResource: Encoding {len(texts)} texts using LocalModelHandler (async call).")
+        
         try:
-            # 使用辅助方法来运行异步的 embed_documents
             embeddings = self._run_async_in_new_loop(
                 self._model_handler.embed_documents(texts)
             )
             return embeddings
         except Exception as e:
-             logger_instance.error(f"GGUFEmbeddingResource: Error during encode by calling LocalModelHandler: {e}", exc_info=True)
-             # 根据上游资产的期望，这里可能需要返回一个特定格式的错误，或者让异常传播
-             # 为了简单，我们先让异常传播
+             logger_instance.error(f"GGUFEmbeddingResource: Error during encode: {e}", exc_info=True)
              raise
-        # --- 结束修改 ---
 
 
     def get_embedding_dimension(self) -> int:
-        """返回嵌入模型的维度大小。"""
-        if not hasattr(self, '_model_handler'):
-            raise RuntimeError("GGUFEmbeddingResource is not initialized.")
+        """返回嵌入模型的维度大小。如果尚未获取，则会尝试获取。"""
+        if not hasattr(self, '_model_handler') or self._model_handler is None: # 增加对 _model_handler 是否为 None 的检查
+            self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in get_embedding_dimension.")
+            raise RuntimeError("GGUFEmbeddingResource is not initialized (model_handler is None).")
         
-        dimension = self._model_handler.get_embedding_dimension()
-        if dimension is None:
-            raise ValueError("Could not determine embedding dimension from the loaded GGUF model.")
-        return dimension
+        # 直接调用内部方法来确保维度是已知的
+        # _ensure_dimension_is_known 会处理维度为 None 的情况，并主动去获取
+        return self._ensure_dimension_is_known()
 
 
 # --- ChromaDBResource ---

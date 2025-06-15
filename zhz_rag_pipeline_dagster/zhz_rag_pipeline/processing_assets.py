@@ -826,7 +826,7 @@ def vector_storage_asset(
 
     ids_to_store = [emb.chunk_id for emb in text_embeddings]
     embeddings_to_store = [emb.embedding_vector for emb in text_embeddings]
-    
+    documents_to_store = [emb.chunk_text for emb in text_embeddings] 
     cleaned_metadatas: List[Dict[str, Any]] = []
     for i, emb_output in enumerate(text_embeddings):
         meta = emb_output.original_chunk_metadata.copy() # 使用副本
@@ -874,7 +874,12 @@ def vector_storage_asset(
         context.log.debug(f"Sample of cleaned metadata for first item (id: {ids_to_store[0]}): {cleaned_metadatas[0]}")
 
     try:
-        chroma_db.add_embeddings(ids=ids_to_store, embeddings=embeddings_to_store, metadatas=cleaned_metadatas)
+        chroma_db.add_embeddings(
+            ids=ids_to_store, 
+            embeddings=embeddings_to_store, 
+            documents=documents_to_store, # <--- 新增：传递 documents
+            metadatas=cleaned_metadatas
+        )
         context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
         context.log.info(f"Successfully stored {len(ids_to_store)} embeddings.")
     except Exception as e_chroma_add:
