@@ -953,8 +953,9 @@ def keyword_index_asset(
         context.log.info("keyword_index_asset: BM25 model initialized.")
         
         bm25_model.index(corpus_tokenized_jieba)
-        context.log.info(f"keyword_index_asset: BM25 model indexing complete for {bm25_model.corpus_size} documents.") # bm25s有corpus_size属性
-
+        indexed_doc_count = len(bm25_model.doc_freqs) if hasattr(bm25_model, 'doc_freqs') and bm25_model.doc_freqs is not None else len(corpus_tokenized_jieba)
+        context.log.info(f"keyword_index_asset: BM25 model indexing complete for {indexed_doc_count} documents.")
+        
         index_directory = config.index_file_path
         context.log.info(f"keyword_index_asset: BM25 index will be saved to directory: {index_directory}")
         os.makedirs(index_directory, exist_ok=True)
@@ -982,7 +983,7 @@ def keyword_index_asset(
             metadata={
                 "num_documents_indexed": len(corpus_texts), 
                 "index_directory_path": index_directory,
-                "bm25_corpus_size_attr": bm25_model.corpus_size if hasattr(bm25_model, 'corpus_size') else 'N/A'
+                "bm25_corpus_size_actual": indexed_doc_count
             }
         )
         context.log.info("keyword_index_asset: BM25 indexing and saving completed successfully.")

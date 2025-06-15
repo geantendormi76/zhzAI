@@ -167,24 +167,46 @@ class ChromaDBResource(dg.ConfigurableResource):
             self._logger.error(f"Failed to initialize ChromaDB: {e}", exc_info=True)
             raise
 
-    def add_embeddings(self, ids: List[str], embeddings: List[List[float]], metadatas: List[Dict[str, Any]] = None):
+    def add_embeddings(
+        self, 
+        ids: List[str], 
+        embeddings: List[List[float]], 
+        documents: Optional[List[str]] = None, # <--- 添加 documents 参数，并设为可选
+        metadatas: Optional[List[Dict[str, Any]]] = None # <--- 将 metadatas 也设为可选，与ChromaDB客户端一致
+    ):
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         if self._collection is None:
             logger_instance.error("ChromaDB collection is not initialized. Cannot add embeddings.")
             raise RuntimeError("ChromaDB collection is not initialized.")
         
-        if not (len(ids) == len(embeddings) and (metadatas is None or len(ids) == len(metadatas))):
-            logger_instance.error("Length mismatch for ids, embeddings, or metadatas.")
-            raise ValueError("Length of ids, embeddings, and metadatas (if provided) must be the same.")
+        # 参数长度校验
+        num_ids = len(ids)
+        if not (num_ids == len(embeddings) and \
+                (documents is None or num_ids == len(documents)) and \
+                (metadatas is None or num_ids == len(metadatas))):
+            logger_instance.error(
+                f"Length mismatch: ids({num_ids}), embeddings({len(embeddings)}), "
+                f"documents({len(documents) if documents else 'None'}), metadatas({len(metadatas) if metadatas else 'None'})."
+            )
+            raise ValueError("Length of ids, embeddings, and documents/metadatas (if provided) must be the same.")
 
         if not ids:
             logger_instance.info("No ids provided to add_embeddings, skipping.")
             return
 
-        logger_instance.info(f"Adding/updating {len(ids)} embeddings to ChromaDB collection '{self.collection_name}'...")
-        self._collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
-        logger_instance.info(f"Embeddings added/updated. Collection count now: {self._collection.count()}")
-
+        logger_instance.info(f"Adding/updating {len(ids)} items to ChromaDB collection '{self.collection_name}'...")
+        try:
+            self._collection.add(
+                ids=ids, 
+                embeddings=embeddings, 
+                documents=documents, # <--- 将 documents 参数传递给 collection.add
+                metadatas=metadatas
+            )
+            logger_instance.info(f"Items added/updated. Collection count now: {self._collection.count()}")
+        except Exception as e_add:
+            logger_instance.error(f"Error during self._collection.add: {e_add}", exc_info=True)
+            raise
+        
     def query_embeddings(self, query_embeddings: List[List[float]], n_results: int = 5) -> chromadb.QueryResult:
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         if self._collection is None:
