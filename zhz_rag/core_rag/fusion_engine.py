@@ -1,11 +1,10 @@
-# zhz_agent/fusion.py
 import hashlib
 import jieba
 import torch
 import asyncio
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from typing import List, Dict, Any, Optional
-import logging 
+import logging
 import os
 
 # 从项目内部导入pydantic_models
@@ -16,7 +15,7 @@ class FusionEngine:
 
         self.reranker_model_path_from_env = os.getenv("RERANKER_MODEL_PATH")
         if not self.reranker_model_path_from_env:
-            default_fallback_path = "/home/zhz/models/Qwen3-Reranker-0.6B-seq-cls" 
+            default_fallback_path = "/home/zhz/models/Qwen3-Reranker-0.6B-seq-cls"
             logging.error(f"RERANKER_MODEL_PATH not found in environment variables! Falling back to default: {default_fallback_path}")
             self.reranker_model_path_from_env = default_fallback_path
 
@@ -160,7 +159,7 @@ class FusionEngine:
                     if doc.score > unique_docs_map[content_hash].score: # type: ignore
                         unique_docs_map[content_hash] = doc # 保留分数更高的
                 elif doc.score is not None: # 当前文档有分数，已存的没有
-                     unique_docs_map[content_hash] = doc
+                       unique_docs_map[content_hash] = doc
                 self.logger.debug(f"FusionEngine: Duplicate content hash found. Doc with score {doc.score} vs existing {unique_docs_map[content_hash].score}. Content: {doc.content[:50]}...")
         
         unique_docs = list(unique_docs_map.values())
@@ -189,9 +188,12 @@ class FusionEngine:
             doc_length = len(doc_content_str)
             
             # 长度筛选
-            min_len_chars = MIN_DOC_LENGTH_CHARS_KG if doc.source_type == "knowledge_graph" else MIN_DOC_LENGTH_CHARS_OTHER
+            min_len_chars = MIN_DOC_LENGTH_CHARS_OTHER
+            if doc.source_type == "knowledge_graph" or doc.source_type == "duckdb_kg":
+                 min_len_chars = MIN_DOC_LENGTH_CHARS_KG
+
             if not (min_len_chars <= doc_length <= MAX_DOC_LENGTH_CHARS):
-                self.logger.debug(f"  Screening: Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) failed length check. Length: {doc_length}, Expected: [{min_len_chars}-{MAX_DOC_LENGTH_CHARS}], Type: {doc.source_type}. Content: '{doc_content_str[:50]}...'")
+                self.logger.info(f"  Screening REJECT (Length): Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) Length: {doc_length}, Expected: [{min_len_chars}-{MAX_DOC_LENGTH_CHARS}], Type: {doc.source_type}. Content: '{doc_content_str[:50]}...'")
                 continue
 
             # Jaccard相似度筛选 (可选，如果query_tokens_set为空则跳过)
@@ -203,14 +205,13 @@ class FusionEngine:
                     jaccard_sim = self._calculate_jaccard_similarity(query_tokens_set, doc_tokens_set)
                 
                 if jaccard_sim < JACCARD_THRESHOLD:
-                    self.logger.debug(f"  Screening: Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) failed Jaccard check. Similarity: {jaccard_sim:.4f} < {JACCARD_THRESHOLD}. Content: '{doc_content_str[:50]}...'")
+                    self.logger.info(f"  Screening REJECT (Jaccard): Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) Similarity: {jaccard_sim:.4f} < {JACCARD_THRESHOLD}. Content: '{doc_content_str[:50]}...'")
                     continue
             else:
-                self.logger.debug(f"  Screening: Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) - Query tokens empty, skipping Jaccard check.")
-
+                self.logger.info(f"  Screening SKIP (Jaccard - Empty Query Tokens): Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'})")
 
             screened_results.append(doc)
-            self.logger.debug(f"  Screening: Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) passed light screening.")
+            self.logger.info(f"  Screening PASS: Doc {doc_idx} (ID: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}) passed light screening.")
         
         self.logger.info(f"FusionEngine: After light screening: {len(screened_results)} documents remain.")
         
@@ -234,7 +235,7 @@ class FusionEngine:
 
         self.logger.info(f"FusionEngine: After reranking: {len(final_fused_and_reranked_results)} documents.")
         for i_doc, doc_reranked in enumerate(final_fused_and_reranked_results[:top_n_final+5]): # 日志多打几条看看分数
-            self.logger.debug(f"  Reranked Doc {i_doc}: type={doc_reranked.source_type}, new_score={doc_reranked.score:.4f}, content='{str(doc_reranked.content)[:100]}...'")
+            self.logger.debug(f"   Reranked Doc {i_doc}: type={doc_reranked.source_type}, new_score={doc_reranked.score:.4f}, content='{str(doc_reranked.content)[:100]}...'")
 
         # 4. 根据 top_n_final 截取最终结果
         final_output_documents = final_fused_and_reranked_results[:top_n_final]

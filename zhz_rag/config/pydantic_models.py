@@ -7,34 +7,38 @@ import uuid
 
 # --- RAG Models ---
 class QueryRequest(BaseModel):
-    query: str = Field(description="用户提出的原始查询文本。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
-    top_k_vector: int = Field(description="期望检索的向量搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
-    top_k_kg: int = Field(description="期望检索的知识图谱结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
-    top_k_bm25: int = Field(description="期望检索的 BM25 关键词搜索结果数量。", json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
-    top_k_final: int = Field(default=3, description="最终融合后返回的文档数量。") 
-
-    @root_validator(pre=True)
-    @classmethod
-    def remove_internal_params(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if isinstance(values, dict):
-            values.pop('security_context', None)
-            values.pop('agent_fingerprint', None)
-        return values
+    query: str
+    # --- 修改：为所有 top_k 参数提供默认值，使其变为可选 ---
+    top_k_vector: int = Field(default=3, description="Number of results to retrieve from vector search.")
+    top_k_bm25: int = Field(default=3, description="Number of results to retrieve from BM25 search.")
+    top_k_kg: int = Field(default=2, description="Number of results to retrieve from Knowledge Graph search.")
+    top_k_final: int = Field(default=3, description="Number of final results after fusion and reranking.")
+    # --- 结束修改 ---
 
     class Config:
-        extra = 'forbid'
+        json_schema_extra = {
+            "example": {
+                "query": "What are the main objectives of the project?",
+                "top_k_vector": 3,
+                "top_k_bm25": 3,
+                "top_k_kg": 2,
+                "top_k_final": 3
+            }
+        }
+        # 移除了 root_validator 和 extra='forbid' 以简化并遵循新的实践
+        # 如果您仍需要严格的字段检查，可以将 extra='forbid' 放回
 
 class RetrievedDocument(BaseModel):
     source_type: str
     content: str
-    score: Optional[float] = Field(default=None, json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
-    metadata: Optional[Dict[str, Any]] = Field(default=None, json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
+    score: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 class HybridRAGResponse(BaseModel):
     original_query: str
     answer: str
     retrieved_sources: List[RetrievedDocument]
-    debug_info: Optional[Dict[str, Any]] = Field(default=None, json_schema_extra=lambda schema: schema.pop('default', None) if schema.get('default') is None else None)
+    debug_info: Optional[Dict[str, Any]] = None
 
 
 # --- Task Management Models ---
@@ -69,13 +73,8 @@ class TaskModel(BaseModel):
 
     class Config:
         use_enum_values = True
-        # Pydantic V2 uses model_config, or just rely on default behavior if orm_mode was for SQLAlchemy V1 style
-        # For Pydantic V2, if you need ORM mode (e.g. for SQLAlchemy integration):
-        # model_config = {"from_attributes": True} 
-        # However, if you are not directly using it with an ORM that way, orm_mode=True might be a V1 relic.
-        # For now, I will keep it as orm_mode = True as per your original file,
-        # but be aware it might need adjustment if you are on Pydantic V2 and using its ORM features.
-        orm_mode = True
+        # Pydantic v2 推荐使用 from_attributes 替代 orm_mode
+        from_attributes = True
 
 
 class CreateTaskRequest(BaseModel):

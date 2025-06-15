@@ -1,4 +1,4 @@
-# 文件: zhz_rag/api/rag_api_service.py (已修正，完整覆盖)
+# 文件: zhz_rag/api/rag_api_service.py
 
 import os
 import asyncio
@@ -15,9 +15,6 @@ from dotenv import load_dotenv
 # 获取 rag_api_service.py 文件所在的目录
 _current_file_dir = os.path.dirname(os.path.abspath(__file__))
 # .env 文件通常在项目根目录，即 zhz_rag 包的上两级目录 (zhz_agent/)
-# zhz_agent/zhz_rag/api/rag_api_service.py
-# zhz_agent/zhz_rag/
-# zhz_agent/  <-- .env 文件在这里
 _project_root_dir = os.path.abspath(os.path.join(_current_file_dir, "..", ".."))
 _dotenv_path = os.path.join(_project_root_dir, ".env")
 
@@ -70,7 +67,6 @@ async def lifespan(app: FastAPI):
     bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
     duckdb_file_path_for_api = os.getenv("DUCKDB_KG_FILE_PATH")
 
-    # --- 新增：读取进程池大小配置 ---
     embedding_pool_size_str = os.getenv("EMBEDDING_SUBPROCESS_POOL_SIZE")
     embedding_pool_size = None
     if embedding_pool_size_str and embedding_pool_size_str.isdigit():
@@ -90,8 +86,6 @@ async def lifespan(app: FastAPI):
 
     if missing_paths:
         api_logger.critical(f"Critical environment variables not set: {', '.join(missing_paths)}")
-        for name, path_val in required_paths_for_log.items():
-            api_logger.debug(f"Env check: {name} = {path_val}")
         app.state.rag_context = None
         yield
         return
@@ -109,9 +103,6 @@ async def lifespan(app: FastAPI):
             n_gpu_layers_llm=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
             embedding_pool_size=embedding_pool_size
         )
-        # --- 修改：由于嵌入模型在子进程加载，这里不再能直接检查 model_handler.embedding_model ---
-        if not model_handler.embedding_model_path:
-            raise RuntimeError("LocalModelHandler initialized without an embedding_model_path. Cannot proceed with embedding features.")
         api_logger.info("LocalModelHandler instance created. Embedding operations will use subprocess pool.")
 
         # 2. 创建 LlamaCppEmbeddingFunction
@@ -128,7 +119,7 @@ async def lifespan(app: FastAPI):
 
         # 4. 初始化 FileBM25Retriever
         api_logger.info(f"Initializing FileBM25Retriever with index_directory: {bm25_index_dir}")
-        file_bm25_retriever_instance = FileBM25Retriever(index_directory_path=bm25_index_dir)
+        file_bm25_retriever_instance = FileBM25Retriever(index_directory=bm25_index_dir)
 
         # 5. 初始化 KGRetriever
         api_logger.info(f"Initializing KGRetriever (DuckDB) with db_file_path: {duckdb_file_path_for_api}")
@@ -168,14 +159,13 @@ async def lifespan(app: FastAPI):
             except Exception as e_kg_close:
                 api_logger.error(f"Error closing KGRetriever: {e_kg_close}", exc_info=True)
 
-        # --- 新增：关闭 LocalModelHandler 的嵌入进程池 ---
         if rag_context_to_clean.model_handler:
             api_logger.info("Attempting to close LocalModelHandler's embedding pool...")
             try:
                 rag_context_to_clean.model_handler.close_embedding_pool()
             except Exception as e_pool_close:
                 api_logger.error(f"Error explicitly closing LocalModelHandler's embedding pool: {e_pool_close}", exc_info=True)
-        
+    
     api_logger.info("--- Cleanup complete. ---")
 
 # --- FastAPI 应用实例 ---
@@ -226,18 +216,14 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         for q_text in expanded_queries:
             api_logger.debug(f"Preparing retrieval tasks for query part: '{q_text}'")
 
-            # --- 修改：ChromaDBRetriever.retrieve 现在是异步的，使用 run_with_semaphore ---
             retrieval_tasks.append(
-                run_with_semaphore( # <--- 改回
+                run_with_semaphore(
                     cpu_bound_semaphore, 
                     "chroma_retriever.retrieve",
-                    # 调用异步方法返回协程
                     app_ctx.chroma_retriever.retrieve(q_text, query_request.top_k_vector) 
                 )
             )
-            # --- 结束修改 ---
 
-            # FileBM25Retriever.retrieve 是同步的，保持 run_sync_with_semaphore
             retrieval_tasks.append(
                 run_sync_with_semaphore(
                     cpu_bound_semaphore,
@@ -248,7 +234,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 )
             )
             
-            # KGRetriever.retrieve 是异步的，使用 run_with_semaphore 是正确的
             retrieval_tasks.append(
                 run_with_semaphore(
                     cpu_bound_semaphore,
@@ -261,54 +246,113 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
         api_logger.info("All retrieval tasks completed.")
 
+        # --- 从这里开始是采纳外部AI建议修改的核心逻辑 ---
         all_retrieved_docs: List[RetrievedDocument] = []
         bm25_results_to_enrich: List[Dict[str, Any]] = []
 
-        for i, result_group in enumerate(results_from_gather):
-            if isinstance(result_group, Exception):
-                api_logger.error(f"An error occurred in retrieval task {i}: {result_group}", exc_info=result_group)
+        for i, task_result_group in enumerate(results_from_gather):
+            if isinstance(task_result_group, Exception):
+                api_logger.error(f"An error occurred in retrieval task {i}: {task_result_group}", exc_info=task_result_group)
                 continue
-            if not result_group or not isinstance(result_group, list): 
-                api_logger.warning(f"Retrieval task {i} returned empty or non-list result: {result_group}")
+            if not task_result_group: 
+                api_logger.info(f"Retrieval task {i} returned empty result.")
+                continue
+            if not isinstance(task_result_group, list): 
+                api_logger.warning(f"Retrieval task {i} returned non-list result: {type(task_result_group)} - {str(task_result_group)[:100]}")
                 continue
 
-            for item in result_group:
-                if isinstance(item, RetrievedDocument):
-                    all_retrieved_docs.append(item)
-                # BM25 返回的是字典列表
-                elif isinstance(item, dict) and 'id' in item and 'score' in item:
-                    bm25_results_to_enrich.append(item)
+            for item_idx, item in enumerate(task_result_group):
+                if not isinstance(item, dict):
+                    api_logger.warning(f"Task {i}, Item {item_idx}: Skipping non-dict item: {type(item)} - {str(item)[:100]}")
+                    continue
 
-        api_logger.info(f"Processed gather results. Total vector/KG docs: {len(all_retrieved_docs)}. BM25 results to enrich: {len(bm25_results_to_enrich)}")
+                source_type = item.get("source_type")
+                item_content = item.get("content")
+                item_score = item.get("score")
+                item_metadata = item.get("metadata", {})
+                
+                api_logger.debug(f"Task {i}, Item {item_idx}: Processing item with source_type='{source_type}', content_present={item_content is not None}, score={item_score}")
+
+                if source_type == "duckdb_kg":
+                    try:
+                        if item_content is None:
+                            item_content = f"[Content missing for KG doc {item_metadata.get('duckdb_retrieved_id_prop', 'UNKNOWN_ID')}]"
+                            api_logger.warning(f"Task {i}, Item {item_idx} (KG): Content was None, using fallback. Metadata: {item_metadata}")
+                        
+                        doc_to_add = RetrievedDocument(
+                            source_type=str(source_type),
+                            content=str(item_content),
+                            score=item_score,
+                            metadata=item_metadata
+                        )
+                        all_retrieved_docs.append(doc_to_add)
+                        api_logger.debug(f"Task {i}, Item {item_idx} (KG): Added to all_retrieved_docs. Chunk ID from meta: {item_metadata.get('duckdb_retrieved_id_prop')}")
+                    except Exception as e_kg_parse:
+                        api_logger.error(f"Task {i}, Item {item_idx} (KG): Failed to parse into RetrievedDocument: {item}, error: {e_kg_parse}")
+                
+                elif source_type == "vector_chromadb":
+                    try:
+                        chroma_item_id = item.get("id")
+                        if item_content is None:
+                            item_content = f"[Content missing for ChromaDB doc {chroma_item_id or 'UNKNOWN_ID'}]"
+                            api_logger.warning(f"Task {i}, Item {item_idx} (ChromaDB): Content was None, using fallback. Chroma ID: {chroma_item_id}")
+
+                        final_metadata = item_metadata.copy()
+                        if "chunk_id" not in final_metadata and chroma_item_id:
+                            final_metadata["chunk_id_from_chroma_retrieve"] = chroma_item_id
+                        
+                        doc_to_add = RetrievedDocument(
+                            source_type=str(source_type),
+                            content=str(item_content),
+                            score=item_score,
+                            metadata=final_metadata
+                        )
+                        all_retrieved_docs.append(doc_to_add)
+                        api_logger.debug(f"Task {i}, Item {item_idx} (ChromaDB): Added to all_retrieved_docs. Chroma ID: {chroma_item_id}, Chunk ID in meta: {final_metadata.get('chunk_id') or final_metadata.get('chunk_id_from_chroma_retrieve')}")
+                    except Exception as e_chroma_parse:
+                        api_logger.error(f"Task {i}, Item {item_idx} (ChromaDB): Failed to parse into RetrievedDocument: {item}, error: {e_chroma_parse}")
+                
+                elif source_type == "keyword_bm25":
+                    bm25_item_id = item.get("id")
+                    if bm25_item_id is not None and item_score is not None:
+                        item_for_enrich = {"id": bm25_item_id, "score": item_score, "source_type": source_type}
+                        if item_metadata:
+                            item_for_enrich["metadata"] = item_metadata
+                        bm25_results_to_enrich.append(item_for_enrich)
+                        api_logger.debug(f"Task {i}, Item {item_idx} (BM25): Added to bm25_results_to_enrich. ID: {bm25_item_id}")
+                    else:
+                        api_logger.warning(f"Task {i}, Item {item_idx} (BM25): Item missing 'id' or 'score', skipped for enrichment: {item}")
+                
+                else: 
+                    api_logger.warning(f"Task {i}, Item {item_idx}: Unknown or unhandled source_type='{source_type}'. Item skipped: {str(item)[:200]}")
+        
+        api_logger.info(f"Processed gather results. Docs directly added (all_retrieved_docs): {len(all_retrieved_docs)}. BM25 results to enrich: {len(bm25_results_to_enrich)}")
         
         if bm25_results_to_enrich:
-            bm25_ids = list(set([res['id'] for res in bm25_results_to_enrich]))
+            bm25_ids = list(set([res['id'] for res in bm25_results_to_enrich if 'id' in res]))
             if bm25_ids:
-                api_logger.info(f"Enriching {len(bm25_ids)} BM25 results by fetching texts from ChromaDB.")
-                texts_map = await run_with_semaphore( 
-                    cpu_bound_semaphore,
-                    "chroma_retriever.get_texts_by_ids",
-                    app_ctx.chroma_retriever.get_texts_by_ids(bm25_ids) 
-                )
-                api_logger.debug(f"Texts map from ChromaDB for BM25 enrichment: {texts_map}")
+                api_logger.info(f"Enriching {len(bm25_ids)} unique BM25 document IDs by fetching texts from ChromaDB.")
+                texts_map = await app_ctx.chroma_retriever.get_texts_by_ids(bm25_ids)
+                
                 for res in bm25_results_to_enrich:
                     chunk_id = res['id']
-                    # --- 【关键修改，采纳外部AI建议】 ---
-                    content_text = texts_map.get(chunk_id) # 先尝试获取
-                    if content_text is None: # 显式检查 None
-                        content_text = f"[Content for BM25 chunk_id {chunk_id} not found in ChromaDB]"
-                        api_logger.warning(f"BM25 enrichment: Content for chunk_id {chunk_id} was not found. Using fallback text.")
-                    # --- 【修改结束】 ---
+                    content_text = texts_map.get(chunk_id)
                     
+                    if content_text is None or "[Content for chunk_id" in content_text:
+                        # 如果从ChromaDB未找到内容，或内容是占位符，记录警告
+                        api_logger.warning(f"BM25 enrichment: Content for chunk_id {chunk_id} was not found or invalid in ChromaDB. Using fallback text.")
+                        content_text = f"[Content for BM25 chunk_id {chunk_id} not found in ChromaDB]"
+
+                    # 将补全了内容的BM25结果转换为RetrievedDocument并添加到主列表
                     all_retrieved_docs.append(RetrievedDocument(
-                        # --- 建议：source_type 统一小写和下划线 ---
-                        source_type="keyword_bm25", # 或 "keyword_bm25s" 取决于你的实际库/偏好
-                        content=content_text, # 现在确保 content_text 是字符串
+                        source_type="keyword_bm25",
+                        content=content_text,
                         score=res.get('score'),
-                        metadata={"chunk_id": chunk_id}
+                        metadata=res.get('metadata', {"chunk_id": chunk_id})
                     ))
                 api_logger.info(f"BM25 results enriched. Total docs now: {len(all_retrieved_docs)}")
-        
+        # --- 核心修改逻辑结束 ---
+
         if not all_retrieved_docs:
             api_logger.info("No documents retrieved from any source after processing all tasks.")
             return HybridRAGResponse(answer=NO_ANSWER_PHRASE_ANSWER_CLEAN, original_query=query_request.query, retrieved_sources=[])
@@ -341,7 +385,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 "generate_answer_from_context",
                 generate_answer_from_context(query_request.query, fused_context)
             ) or NO_ANSWER_PHRASE_ANSWER_CLEAN
-            api_logger.info(f"Answer generation completed. Final answer: {final_answer[:200]}...")
+            api_logger.info(f"Answer generation completed.  {final_answer[:200]}...")
 
         return HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs)
 
@@ -352,4 +396,4 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
 # --- Main execution block ---
 if __name__ == "__main__":
     api_logger.info("Starting Standalone RAG API Service...")
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=True)
