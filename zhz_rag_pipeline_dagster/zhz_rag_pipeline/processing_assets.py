@@ -816,83 +816,91 @@ def generate_embeddings_asset(
 )
 def vector_storage_asset(
     context: dg.AssetExecutionContext,
-    text_embeddings: List[EmbeddingOutput],
-    chroma_db: ChromaDBResource
+    text_embeddings: List[EmbeddingOutput], # 这应该是来自 generate_embeddings_asset 的输出
+    chroma_db: ChromaDBResource # 这是注入的 ChromaDBResource 实例
 ) -> None:
     if not text_embeddings:
-        context.log.warning("No embeddings received, nothing to store.")
-        context.add_output_metadata(metadata={"num_embeddings_stored": 0}) # 明确输出
+        context.log.warning("vector_storage_asset: No embeddings received, nothing to store in ChromaDB.")
+        context.add_output_metadata(metadata={"num_embeddings_stored": 0})
         return
 
     ids_to_store = [emb.chunk_id for emb in text_embeddings]
     embeddings_to_store = [emb.embedding_vector for emb in text_embeddings]
-    documents_to_store = [emb.chunk_text for emb in text_embeddings] 
+    documents_to_store = [emb.chunk_text for emb in text_embeddings] # 获取真实的文本内容
+    
     cleaned_metadatas: List[Dict[str, Any]] = []
     for i, emb_output in enumerate(text_embeddings):
-        meta = emb_output.original_chunk_metadata.copy() # 使用副本
-        meta["chunk_text"] = emb_output.chunk_text # 添加 chunk_text
+        # 确保原始元数据存在且是字典
+        original_meta = emb_output.original_chunk_metadata if isinstance(emb_output.original_chunk_metadata, dict) else {}
+        meta = original_meta.copy() # 使用副本
+        
+        # 确保 chunk_text 也加入到元数据中（如果需要的话，或者仅依赖 documents 参数）
+        # ChromaDB 的 documents 参数用于存储主要文本，元数据用于附加信息
+        # 但为了调试和可能的回退，在元数据中也保留一份 chunk_text 是有益的
+        meta["chunk_text_in_meta"] = str(emb_output.chunk_text) if emb_output.chunk_text is not None else "[TEXT IS NULL]"
 
-        # --- 新增：清理元数据中的字典值 ---
         cleaned_meta_item: Dict[str, Any] = {}
         for key, value in meta.items():
             if isinstance(value, dict):
-                # 如果值是字典，将其转换为JSON字符串，或者根据情况特殊处理
-                # 对于 title_hierarchy，如果是空的，可以替换为 "None" 或删除
-                if key == "title_hierarchy" and not value: # 如果是 title_hierarchy 且为空字典
-                    cleaned_meta_item[key] = "None" # 或者直接 continue 跳过这个键
+                if key == "title_hierarchy" and not value: 
+                    cleaned_meta_item[key] = "None"
                     context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Replaced empty title_hierarchy dict with 'None' string.")
                 else:
                     try:
-                        # 尝试序列化为JSON字符串
                         cleaned_meta_item[key] = json.dumps(value, ensure_ascii=False)
-                        context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted dict value for key '{key}' to JSON string.")
                     except TypeError:
-                        # 如果无法序列化，则转换为普通字符串或跳过
                         cleaned_meta_item[key] = str(value)
-                        context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize dict for key '{key}', used str(). Value: {value}")
+                        context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize dict for key '{key}', used str(). Value: {str(value)[:100]}...")
             elif isinstance(value, list):
-                # ChromaDB 元数据值不接受列表，将其转换为JSON字符串
                 try:
                     cleaned_meta_item[key] = json.dumps(value, ensure_ascii=False)
-                    context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted list value for key '{key}' to JSON string.")
                 except TypeError:
-                    # 如果JSON序列化失败（不太可能对于简单列表），则回退为普通字符串表示
                     cleaned_meta_item[key] = str(value)
-                    context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize list for key '{key}', used str(). Value: {value}")
+                    context.log.warning(f"Metadata for chunk {emb_output.chunk_id}: Could not JSON serialize list for key '{key}', used str(). Value: {str(value)[:100]}...")
             elif value is None:
-                # 将 None 值转换为空字符串，以满足 ChromaDB 要求
-                cleaned_meta_item[key] = "" # 或者 "None" 字符串
-                context.log.debug(f"Metadata for chunk {emb_output.chunk_id}: Converted None value for key '{key}' to empty string.")
-            else: # str, int, float, bool 应该可以直接使用
+                cleaned_meta_item[key] = "" 
+            else: 
                 cleaned_meta_item[key] = value
         cleaned_metadatas.append(cleaned_meta_item)
-        # --- 结束清理 ---
 
-    context.log.info(f"Adding/updating {len(ids_to_store)} embeddings to ChromaDB collection '{chroma_db.collection_name}' after metadata cleaning.")
-    # 打印一个清理后的元数据样本以供调试
-    if cleaned_metadatas:
-        context.log.debug(f"Sample of cleaned metadata for first item (id: {ids_to_store[0]}): {cleaned_metadatas[0]}")
+    context.log.info(f"vector_storage_asset: Preparing to add/update {len(ids_to_store)} items to ChromaDB collection '{chroma_db.collection_name}'.")
+    if ids_to_store:
+        context.log.info(f"vector_storage_asset: Sample ID to store: {ids_to_store[0]}")
+        # 确保 documents_to_store 也有对应内容，并且不是 None
+        sample_doc_text = "[EMPTY DOCUMENT]"
+        if documents_to_store and documents_to_store[0] is not None:
+            sample_doc_text = str(documents_to_store[0])[:100] # 显示前100字符
+        elif documents_to_store and documents_to_store[0] is None:
+            sample_doc_text = "[DOCUMENT IS NULL]"
+        context.log.info(f"vector_storage_asset: Sample document to store (from documents_to_store, first 100 chars): '{sample_doc_text}'")
+        
+        sample_meta_text = "[NO METADATA]"
+        if cleaned_metadatas:
+            sample_meta_text = str(cleaned_metadatas[0])[:200] # 显示元数据摘要
+        context.log.info(f"vector_storage_asset: Sample cleaned metadata for first item: {sample_meta_text}")
 
     try:
         chroma_db.add_embeddings(
             ids=ids_to_store, 
             embeddings=embeddings_to_store, 
-            documents=documents_to_store, # <--- 新增：传递 documents
+            documents=documents_to_store, # 传递真实的文本内容给ChromaDB的documents字段
             metadatas=cleaned_metadatas
         )
-        context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store)})
-        context.log.info(f"Successfully stored {len(ids_to_store)} embeddings.")
-    except Exception as e_chroma_add:
-        context.log.error(f"Failed to add embeddings to ChromaDB after metadata cleaning: {e_chroma_add}", exc_info=True)
-        # 如果这里出错，可以打印出导致错误的具体元数据项
-        # for idx, m_data in enumerate(cleaned_metadatas):
-        #     try:
-        #         chroma_db._collection.add(ids=[ids_to_store[idx]], embeddings=[embeddings_to_store[idx]], metadatas=[m_data])
-        #     except Exception as e_item:
-        #         context.log.error(f"Error adding item with id {ids_to_store[idx]} and metadata {m_data}: {e_item}")
-        #         raise # 重新抛出原始错误或自定义错误
-        raise # 重新抛出原始错误
+        # 尝试获取并记录操作后的集合计数
+        # 注意: chroma_db._collection 可能是私有属性，直接访问不推荐，但为了调试可以尝试
+        # 更好的方式是 ChromaDBResource 提供一个 get_collection_count() 方法
+        collection_count_after_add = -1 # 默认值
+        try:
+            if chroma_db._collection: # 确保 _collection 不是 None
+                 collection_count_after_add = chroma_db._collection.count()
+        except Exception as e_count:
+            context.log.warning(f"vector_storage_asset: Could not get collection count after add: {e_count}")
 
+        context.add_output_metadata(metadata={"num_embeddings_stored": len(ids_to_store), "collection_count_after_add": collection_count_after_add})
+        context.log.info(f"vector_storage_asset: Successfully called add_embeddings. Stored {len(ids_to_store)} items. Collection count now: {collection_count_after_add}")
+    except Exception as e_chroma_add:
+        context.log.error(f"vector_storage_asset: Failed to add embeddings to ChromaDB: {e_chroma_add}", exc_info=True)
+        raise
 
 class BM25IndexConfig(dg.Config):
     index_file_path: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index/"
@@ -906,25 +914,81 @@ class BM25IndexConfig(dg.Config):
 )
 def keyword_index_asset(
     context: dg.AssetExecutionContext,
-    config: BM25IndexConfig,
+    config: BM25IndexConfig, # 确保 BM25IndexConfig 在文件某处已定义
     text_chunks: List[ChunkOutput]
 ) -> None:
     if not text_chunks:
-        context.log.warning("No text chunks received, skipping BM25 index building.")
+        context.log.warning("keyword_index_asset: No text chunks received, skipping BM25 index building.")
+        context.add_output_metadata(metadata={"num_documents_indexed": 0, "index_directory_path": config.index_file_path})
         return
-    corpus_texts = [chunk.chunk_text for chunk in text_chunks]
-    document_ids = [chunk.chunk_id for chunk in text_chunks]
-    corpus_tokenized_jieba = [list(jieba.cut_for_search(text)) for text in corpus_texts]
-    bm25_model = bm25s.BM25()
-    bm25_model.index(corpus_tokenized_jieba)
-    index_directory = config.index_file_path
-    os.makedirs(index_directory, exist_ok=True)
-    bm25_model.save(index_directory)
-    doc_ids_path = os.path.join(index_directory, "doc_ids.pkl")
-    with open(doc_ids_path, 'wb') as f_out:
-        pickle.dump(document_ids, f_out)
-    context.add_output_metadata(metadata={"num_documents_indexed": len(corpus_texts), "index_directory_path": index_directory})
 
+    # --- 新增：检查并记录空文本块 ---
+    valid_chunks_for_indexing: List[ChunkOutput] = []
+    for idx, chunk in enumerate(text_chunks):
+        if chunk.chunk_text and chunk.chunk_text.strip():
+            valid_chunks_for_indexing.append(chunk)
+        else:
+            context.log.warning(f"keyword_index_asset: Chunk {idx} (ID: {chunk.chunk_id}) has empty or whitespace-only text. Skipping for BM25 indexing.")
+    
+    if not valid_chunks_for_indexing:
+        context.log.warning("keyword_index_asset: All received text chunks have empty or whitespace-only text after filtering. Skipping BM25 index building.")
+        context.add_output_metadata(metadata={"num_documents_indexed": 0, "index_directory_path": config.index_file_path})
+        return
+    # --- 结束新增 ---
+
+    # 使用过滤后的有效块
+    corpus_texts = [chunk.chunk_text for chunk in valid_chunks_for_indexing]
+    document_ids = [chunk.chunk_id for chunk in valid_chunks_for_indexing] # 确保ID与有效文本对应
+
+    context.log.info(f"keyword_index_asset: Preparing to index {len(corpus_texts)} valid text chunks for BM25.")
+    if corpus_texts: # 仅在有数据时打印样本
+        context.log.info(f"keyword_index_asset: Sample document ID for BM25: {document_ids[0]}")
+        context.log.info(f"keyword_index_asset: Sample document text for BM25 (first 50 chars): '{str(corpus_texts[0])[:50]}'")
+
+    try:
+        corpus_tokenized_jieba = [list(jieba.cut_for_search(text)) for text in corpus_texts]
+        context.log.info(f"keyword_index_asset: Tokenized {len(corpus_tokenized_jieba)} texts for BM25.")
+        
+        bm25_model = bm25s.BM25() # 使用默认参数初始化
+        context.log.info("keyword_index_asset: BM25 model initialized.")
+        
+        bm25_model.index(corpus_tokenized_jieba)
+        context.log.info(f"keyword_index_asset: BM25 model indexing complete for {bm25_model.corpus_size} documents.") # bm25s有corpus_size属性
+
+        index_directory = config.index_file_path
+        context.log.info(f"keyword_index_asset: BM25 index will be saved to directory: {index_directory}")
+        os.makedirs(index_directory, exist_ok=True)
+        
+        bm25_model.save(index_directory) 
+        context.log.info(f"keyword_index_asset: bm25_model.save('{index_directory}') called.")
+        
+        doc_ids_path = os.path.join(index_directory, "doc_ids.pkl")
+        with open(doc_ids_path, 'wb') as f_out:
+            pickle.dump(document_ids, f_out)
+        context.log.info(f"keyword_index_asset: doc_ids.pkl saved to {doc_ids_path} with {len(document_ids)} IDs.")
+        
+        # 验证文件是否真的创建了
+        expected_params_file = os.path.join(index_directory, "params.index.json") # bm25s 保存时会创建这个
+        if os.path.exists(expected_params_file) and os.path.exists(doc_ids_path):
+            context.log.info(f"keyword_index_asset: Verified that BM25 index files (e.g., params.index.json, doc_ids.pkl) exist in {index_directory}.")
+        else:
+            context.log.error(f"keyword_index_asset: BM25 index files (e.g., params.index.json or doc_ids.pkl) NOT FOUND in {index_directory} after save operations!")
+            context.log.error(f"keyword_index_asset: Check - params.index.json exists: {os.path.exists(expected_params_file)}")
+            context.log.error(f"keyword_index_asset: Check - doc_ids.pkl exists: {os.path.exists(doc_ids_path)}")
+            # 如果文件未找到，可能需要抛出异常以使资产失败
+            # raise FileNotFoundError(f"BM25 index files not found in {index_directory} after save.")
+
+        context.add_output_metadata(
+            metadata={
+                "num_documents_indexed": len(corpus_texts), 
+                "index_directory_path": index_directory,
+                "bm25_corpus_size_attr": bm25_model.corpus_size if hasattr(bm25_model, 'corpus_size') else 'N/A'
+            }
+        )
+        context.log.info("keyword_index_asset: BM25 indexing and saving completed successfully.")
+    except Exception as e_bm25:
+        context.log.error(f"keyword_index_asset: Error during BM25 indexing or saving: {e_bm25}", exc_info=True)
+        raise
 
 # --- KG Extraction 相关的配置和资产 ---
 

@@ -335,66 +335,64 @@ class DuckDBResource(dg.ConfigurableResource):
     _conn: Optional[duckdb.DuckDBPyConnection] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
+    # --- 【用这个版本覆盖原来的 setup_for_execution 方法】 ---
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
         db_path_to_use = self.db_file_path
         
-        # 确保目录存在
         db_dir = os.path.dirname(db_path_to_use)
         if not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
             self._logger.info(f"Created directory for DuckDB database: {db_dir}")
 
         self._logger.info(f"Attempting to connect to DuckDB at: {db_path_to_use}")
-
         
         try:
+            # 连接数据库
             self._conn = duckdb.connect(database=db_path_to_use, read_only=False)
             self._logger.info(f"Successfully connected to DuckDB: {db_path_to_use}")
             
-            vss_setup_successful = False
+            # 强制加载VSS扩展
+            # 即使之前已加载，重复LOAD通常是安全的，或者会快速返回
+            # 关键在于确保当前连接的上下文中VSS是可用的
             try:
-                self._logger.info("DuckDB: Attempting to LOAD vss extension...")
-                self._conn.execute("LOAD vss;")
-                self._logger.info("DuckDB: VSS extension LOADED successfully.")
-                vss_setup_successful = True
-            except duckdb.IOException as e_load_io: # 通常表示扩展文件找不到或无法加载
-                self._logger.warning(f"DuckDB: Failed to LOAD vss extension (IOException): {e_load_io}. Will attempt to INSTALL.")
-            except duckdb.CatalogException as e_load_catalog: # 可能是 "already loaded"
-                 if "already loaded" in str(e_load_catalog).lower():
-                    self._logger.info("DuckDB: VSS extension reported as already loaded.")
-                    vss_setup_successful = True
-                 else:
-                    self._logger.warning(f"DuckDB: Failed to LOAD vss extension (CatalogException, not 'already loaded'): {e_load_catalog}. Will attempt to INSTALL.")
-            except Exception as e_load_other: # 其他加载错误
-                self._logger.warning(f"DuckDB: Failed to LOAD vss extension (Other Exception): {e_load_other}. Will attempt to INSTALL.")
-
-            if not vss_setup_successful:
-                try:
-                    self._logger.info("DuckDB: Attempting to INSTALL vss extension...")
-                    self._conn.execute("INSTALL vss;")
-                    self._logger.info("DuckDB: VSS extension INSTALLED successfully. Now attempting to LOAD again...")
-                    self._conn.execute("LOAD vss;") # 安装后需要再次加载
-                    self._logger.info("DuckDB: VSS extension LOADED successfully after INSTALL.")
-                    vss_setup_successful = True
-                except Exception as e_install:
-                    self._logger.error(f"DuckDB: Failed to INSTALL and LOAD vss extension: {e_install}", exc_info=True)
-                    # 根据策略，这里可以选择是否抛出异常。如果VSS是必须的，应该抛出。
-                    # raise RuntimeError(f"Failed to setup VSS extension for DuckDB: {e_install}") from e_install
-
-            if vss_setup_successful:
+                self._logger.info("DuckDBResource: Forcefully attempting to INSTALL and LOAD vss extension for current connection.")
+                self._conn.execute("INSTALL vss;")      # 尝试安装（如果未安装）
+                self._conn.execute("LOAD vss;")         # 尝试加载
+                self._logger.info("DuckDBResource: VSS extension INSTALL and LOAD sequence completed for current connection.")
+                
+                # 启用HNSW持久化（如果需要）
                 try:
                     self._conn.execute("SET hnsw_enable_experimental_persistence=true;")
-                    self._logger.info("DuckDB: HNSW experimental persistence enabled.")
+                    self._logger.info("DuckDBResource: HNSW experimental persistence enabled for current connection.")
                 except Exception as e_persistence:
-                    self._logger.warning(f"DuckDB: Failed to enable HNSW experimental persistence: {e_persistence}. This might affect index persistence.")
-            else:
-                self._logger.error("DuckDB: VSS extension setup failed. Vector operations may not work.")
-                # 考虑是否在这里抛出异常，如果VSS对后续操作至关重要
-                # raise RuntimeError("Critical VSS extension setup failed for DuckDB.")
+                    self._logger.warning(f"DuckDBResource: Failed to enable HNSW experimental persistence: {e_persistence}. This might affect index persistence if new HNSW indexes are created by this resource/asset.")
+            
+            except duckdb.CatalogException as e_vss_cat:
+                if "already loaded" in str(e_vss_cat).lower() or "already installed" in str(e_vss_cat).lower():
+                    self._logger.info(f"DuckDBResource: VSS extension reported as already installed/loaded: {e_vss_cat}")
+                    # 即使已加载，也尝试再次LOAD以确保当前会话可用
+                    try:
+                        self._conn.execute("LOAD vss;")
+                        self._logger.info("DuckDBResource: VSS extension re-LOADED successfully.")
+                    except Exception as e_reload:
+                        self._logger.error(f"DuckDBResource: Failed to re-LOAD VSS extension even if reported as installed/loaded: {e_reload}", exc_info=True)
+                        raise RuntimeError(f"Critical: Failed to ensure VSS is loaded for DuckDB connection: {e_reload}") from e_reload
+                else:
+                    self._logger.error(f"DuckDBResource: CatalogException during VSS setup (not 'already loaded/installed'): {e_vss_cat}", exc_info=True)
+                    raise RuntimeError(f"Failed to setup VSS extension for DuckDB: {e_vss_cat}") from e_vss_cat
+            except Exception as e_vss_other:
+                self._logger.error(f"DuckDBResource: Other exception during VSS setup: {e_vss_other}", exc_info=True)
+                raise RuntimeError(f"Failed to setup VSS extension for DuckDB: {e_vss_other}") from e_vss_other
 
-        except Exception as e:
-            self._logger.error(f"Failed to connect to DuckDB at {db_path_to_use}: {e}", exc_info=True)
+        except duckdb.duckdb.Error as e_connect_wal: # 捕获包括WAL重放错误在内的DuckDB连接错误
+            self._logger.error(f"Failed to connect to DuckDB at {db_path_to_use} or error during WAL replay: {e_connect_wal}", exc_info=True)
+            # 检查错误信息是否与VSS有关
+            if "unknown index type 'HNSW'" in str(e_connect_wal):
+                self._logger.error("DuckDBResource: WAL replay failed due to HNSW index. This strongly indicates VSS was not loaded prior to the operation that created/modified the index or during this connection attempt before WAL replay.")
+            raise # 将原始的DuckDB连接错误重新抛出
+        except Exception as e_connect_generic: # 捕获其他可能的连接错误
+            self._logger.error(f"Generic error connecting to DuckDB at {db_path_to_use}: {e_connect_generic}", exc_info=True)
             raise
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
