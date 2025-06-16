@@ -95,9 +95,19 @@ async def lifespan(app: FastAPI):
         )
         file_bm25_retriever_instance = FileBM25Retriever(index_directory=bm25_index_dir)
         kg_retriever_instance = KGRetriever(db_file_path=duckdb_file_path_for_api, embedder=model_handler)
+       
         # use_rrf_env = os.getenv("FUSION_USE_RRF", "true").lower() == "true"
-        fusion_engine_instance = FusionEngine(logger=api_logger, use_rrf=False, rrf_k=60)
-
+        rrf_k_env_str = os.getenv("RRF_K_VALUE", "60")
+        try:
+            rrf_k_setting = int(rrf_k_env_str)
+        except ValueError:
+            api_logger.warning(f"Invalid RRF_K_VALUE '{rrf_k_env_str}' in environment. Defaulting to 60.")
+            rrf_k_setting = 60
+        api_logger.info(f"FusionEngine will use RRF with k={rrf_k_setting}") # <--- 添加日志确认k值
+        
+        fusion_engine_instance = FusionEngine(logger=api_logger, rrf_k=rrf_k_setting) # <--- 修改这里，只传递rrf_k
+        
+        
         app.state.rag_context = RAGAppContext(
             model_handler=model_handler, chroma_retriever=chroma_retriever_instance,
             kg_retriever=kg_retriever_instance, file_bm25_retriever=file_bm25_retriever_instance,
