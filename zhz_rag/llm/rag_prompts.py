@@ -179,39 +179,46 @@ Parameters Needed: {', '.join(selected_template['params_needed'])}
 def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str, str]]:
     """
     构建用于从用户查询中提取核心实体和关系意图的LLM输入messages。
-    目标是输出一个符合 ExtractedEntitiesAndRelationIntent Pydantic 模型结构的JSON。
+    目标是输出一个符合 ExtractedEntitiesAndRelationIntent Pydantic 模型结构的纯净JSON对象。
+    这个版本的Prompt极度强调JSON输出格式。
     """
-    # 从 NEW_KG_SCHEMA_DESCRIPTION 中提取允许的实体标签，以便在提示中告知LLM
-    # 这是一个简化的提取，实际应用中可能需要更精确地从Schema中获取
-    # 假设 NEW_KG_SCHEMA_DESCRIPTION 中有类似 "label: STRING (实体类型。允许的值: "PERSON", "ORGANIZATION", "TASK")" 的描述
     import re
     match = re.search(r'label\s*:\s*STRING\s*\(实体类型。\s*允许的值\s*:\s*("([^"]+)"(?:,\s*"([^"]+)")*)\)', NEW_KG_SCHEMA_DESCRIPTION)
-    allowed_entity_labels_str = "PERSON, ORGANIZATION, TASK" # 默认值
+    allowed_entity_labels_str = "PERSON, ORGANIZATION, TASK, DOCUMENT, PROJECT, REGION, PRODUCT, OTHER"
     if match:
-        # 提取所有带引号的标签
         labels_group = match.group(1)
         extracted_labels = re.findall(r'"([^"]+)"', labels_group)
         if extracted_labels:
             allowed_entity_labels_str = ", ".join(extracted_labels)
-    
-    system_prompt_for_entity_extraction = f"""你的任务是仔细分析用户提供的【用户问题】，并识别出其中与知识图谱查询相关的核心信息。
+            if "OTHER" not in extracted_labels:
+                 allowed_entity_labels_str += ", OTHER"
 
-**你需要识别以下内容：**
-1.  **核心实体**：问题中提到的1到2个最关键的实体（人名、组织名、任务名等）。
-2.  **实体类型**：为每个识别出的实体，从以下参考类型中推断其最可能的类型：{allowed_entity_labels_str}。如果无法确定，可以不指定类型。
-3.  **关系意图**：如果用户问题暗示了实体间的特定关系，请用简洁的文本描述这个关系意图（例如 “查询工作地点”, “查找负责人”, “获取销售额”）。如果只是查询单个实体的属性，则关系意图不明确。
+    # --- V3 "最最严格" Prompt ---
+    system_prompt_for_entity_extraction = f"""<|im_start|>system
+USER_QUERY_TO_PROCESS:
+{user_question}
 
-请在你的回答中清晰地包含这些分析结果。最终的结构化输出将由系统根据你的分析自动完成。
-你只需要专注于准确地理解和提取这些信息。
-"""
-    # 移除了所有关于JSON输出格式的指令和示例，因为将由response_format处理
-    # 也不再需要 /no_think，因为我们期望约束生成能处理好输出
+TASK: Analyze USER_QUERY_TO_PROCESS. Output ONLY a valid JSON object.
+NO EXPLANATIONS. NO EXTRA TEXT. NO MARKDOWN. JUST JSON.
 
-    user_content = f"用户问题: {user_question}\n\n请分析此问题并提取相关实体和关系意图："
+JSON_OUTPUT_SCHEMA:
+{{
+  "entities": [
+    {{"text": "string, extracted entity text from USER_QUERY_TO_PROCESS", "label": "string, entity type from: [{allowed_entity_labels_str}], or OTHER"}}
+  ],
+  "relation_hint": "string, relation described in USER_QUERY_TO_PROCESS, or empty string"
+}}
+
+RULES:
+1. Max 2 entities in "entities" array. If none, "entities" is `[]`.
+2. "label" MUST be from the provided list or "OTHER".
+3. If no relation_hint, value is `""`.
+4. If USER_QUERY_TO_PROCESS yields no entities or relation, output: `{{"entities": [], "relation_hint": ""}}`
+
+YOUR_VALID_JSON_OUTPUT_ONLY:<|im_end|>""" # <--- 结尾引导更加直接
 
     messages = [
-        {"role": "system", "content": system_prompt_for_entity_extraction},
-        {"role": "user", "content": user_content}
+        {"role": "system", "content": system_prompt_for_entity_extraction}
     ]
     return messages
 
@@ -264,4 +271,19 @@ KG_EXTRACTION_BATCH_PROMPT_TEMPLATE_V1 = """
 
 【待处理的文本块列表】:
 {formatted_text_block_list}
-""" # <--- 末尾引导词已删除
+""" 
+
+# GBNF for Knowledge Graph Extraction (proven stable with Qwen3-1.7B and create_completion)
+KG_EXTRACTION_GBNF_STRING = r"""
+root ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
+
+space ::= ([ \t\n\r])*
+string ::= "\"" (char)* "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+
+entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
+entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
+
+relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
+relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
+"""

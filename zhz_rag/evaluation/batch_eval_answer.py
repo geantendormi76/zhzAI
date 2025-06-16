@@ -141,7 +141,8 @@ async def run_answer_batch_evaluation(
     for line_number, interaction_log in enumerate(interaction_logs, 1):
         processed_count += 1
         current_task_type = interaction_log.get("task_type")
-
+        batch_answer_eval_logger.debug(f"Log entry {line_number} has task_type: '{current_task_type}'")
+        
         if current_task_type not in target_task_types_list:
             skipped_task_type_mismatch +=1
             continue

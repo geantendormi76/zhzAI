@@ -170,14 +170,11 @@ class FusionEngine:
 
         # 2. 初步筛选 (基于长度和Jaccard相似度)
         # 定义阈值
-        JACCARD_THRESHOLD = 0.05  # Jaccard相似度阈值，低于此则可能被过滤
-        MIN_DOC_LENGTH_CHARS_KG = 10    # 知识图谱结果的最小字符长度
-        MIN_DOC_LENGTH_CHARS_OTHER = 10 # 其他来源（向量、BM25）的最小字符长度
-        # Reranker (如BGE-Reranker) 通常处理的token上限是512。
-        # 一个中文字符大致对应1-3个token，英文单词大致对应1个token。
-        # 为安全起见，可以设置一个字符上限，例如 1000-1500 字符，避免超长输入给Reranker。
-        # 如果Reranker的tokenizer有max_length参数，它会自动截断，但预先过滤可以减少不必要的处理。
-        MAX_DOC_LENGTH_CHARS = 1500 # 文档的最大字符长度，防止过长输入给reranker
+        JACCARD_THRESHOLD = 0.02  # 原为 0.05，我们先尝试降低到 0.02
+        # --- 【修改结束】 ---
+        MIN_DOC_LENGTH_CHARS_KG = 10    
+        MIN_DOC_LENGTH_CHARS_OTHER = 10 
+        MAX_DOC_LENGTH_CHARS = 1500 
 
         query_tokens_set = self._tokenize_text(user_query)
         screened_results: List[RetrievedDocument] = []

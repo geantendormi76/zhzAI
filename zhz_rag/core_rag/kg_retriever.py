@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
-from zhz_rag.utils.common_utils import normalize_text_for_id 
+from zhz_rag.utils.common_utils import normalize_text_for_id
 
 # 日志配置
 kg_logger = logging.getLogger(__name__)
@@ -136,39 +136,44 @@ class KGRetriever:
             entity_label = record_data.get("label") or record_data.get("target_label") or record_data.get("source_label")
             relation_type = record_data.get("relation_type")
             
-            if entity_text:
-                content_parts.append(f"Entity: {entity_text}")
-            if entity_label:
-                content_parts.append(f"Label: {entity_label}")
-            if relation_type:
-                content_parts.append(f"Relation: {relation_type}")
-            
             if "source_text" in record_data and "target_text" in record_data and relation_type:
+                # 格式化关系记录
                 content_parts = [
                     f"Source: {record_data['source_text']} ({record_data.get('source_label', 'Entity')})",
                     f"Relation: {relation_type}",
                     f"Target: {record_data['target_text']} ({record_data.get('target_label', 'Entity')})"
                 ]
-            elif not content_parts:
+            elif entity_text:
+                # 格式化单个实体记录
+                content_parts.append(f"Entity: {entity_text}")
+                if entity_label:
+                    content_parts.append(f"Label: {entity_label}")
+            else:
+                # 通用回退格式
                 content_parts.append(f"Retrieved KG data: {json.dumps({k:v for k,v in record_data.items() if k != 'embedding'}, ensure_ascii=False, default=str)[:100]}")
 
             content_str = " | ".join(content_parts)
             
             doc_metadata = {
                 "original_user_query_for_kg": query_context,
-                "duckdb_retrieved_id_prop": record_data.get("id_prop") or record_data.get("source_id_prop") or record_data.get("target_id_prop"),
+                "duckdb_retrieved_id_prop": record_data.get("id_prop") or record_data.get("source_id_prop"),
                 "duckdb_retrieved_data": {k:v for k,v in record_data.items() if k != 'embedding'}
             }
+            # 添加来源策略到元数据中
+            if record_data.get("_source_strategy"):
+                doc_metadata["_source_strategy"] = record_data.get("_source_strategy")
 
             score_value = record_data.get("distance")
             if score_value is None:
                 score_value = record_data.get("_score")
 
             if record_data.get("distance") is not None:
+                # 将距离转换为相似度分数 (0-1)，距离越小分数越高
                 similarity_score = 1.0 / (1.0 + float(score_value)) if score_value is not None else 0.5 
             elif isinstance(score_value, (int, float)):
                 similarity_score = float(score_value)
             else:
+                # 对于非评分的查找，给一个默认分数
                 similarity_score = 0.5
 
             doc_data = {
@@ -194,20 +199,19 @@ class KGRetriever:
         try:
             extracted_info = await extract_entities_for_kg_query(user_query)
             if extracted_info:
-                kg_logger.info(f"LLM extracted for KG: Entities: {[e.model_dump() for e in extracted_info.entities]}, Relation Hint: {extracted_info.relation_hint}")
+                entities_log = [e.model_dump() for e in extracted_info.entities]
+                relations_log = [r.model_dump() for r in extracted_info.relations]
+                kg_logger.info(f"LLM extracted for KG: Entities: {entities_log}, Relations: {relations_log}")
             else:
                 kg_logger.info("LLM did not extract specific entities/relations for KG query.")
         except Exception as e_extract:
             kg_logger.error(f"Error during entity/relation extraction for KG: {e_extract}", exc_info=True)
 
-        # 2. 向量搜索
+        # 2. 向量搜索 (可选, 作为补充)
         if self._embedder:
-            search_text_for_vector = user_query
-            pass
-
             try:
-                kg_logger.info(f"Generating embedding for vector search text: '{search_text_for_vector}'")
-                query_vector_list = await self._embedder.embed_query(search_text_for_vector)
+                kg_logger.info(f"Generating embedding for vector search text: '{user_query}'")
+                query_vector_list = await self._embedder.embed_query(user_query)
 
                 if query_vector_list:
                     vector_search_sql = """
@@ -217,111 +221,92 @@ class KGRetriever:
                     LIMIT ?;
                     """
                     kg_logger.info(f"Executing DuckDB vector search. Top K: {top_k}")
-                    vector_results = self._execute_duckdb_sql_query_sync(
-                        vector_search_sql, 
-                        parameters=[query_vector_list, top_k]
-                    )
+                    vector_results = self._execute_duckdb_sql_query_sync(vector_search_sql, [query_vector_list, top_k])
                     if vector_results:
+                        for rec in vector_results: rec["_source_strategy"] = "vector_search"
                         all_retrieved_records.extend(vector_results)
+                        processed_entity_ids.update(rec.get("id_prop") for rec in vector_results)
                         kg_logger.info(f"Retrieved {len(vector_results)} records via DuckDB vector search.")
-                        for rec in vector_results: processed_entity_ids.add(rec.get("id_prop"))
                 else:
-                     kg_logger.warning("Failed to generate query embedding for vector search.")
+                    kg_logger.warning("Failed to generate query embedding for vector search.")
             except Exception as e_vec_search:
                 kg_logger.error(f"Error during DuckDB vector search: {e_vec_search}", exc_info=True)
         
-        # 3. 基于LLM提取的实体进行属性查找和关系查找
+        # 3. 基于LLM提取的实体进行精确查找
         if extracted_info and extracted_info.entities:
             for entity_info in extracted_info.entities:
-                if not entity_info.text:
-                    continue
-                
                 entity_text_norm = normalize_text_for_id(entity_info.text)
-                entity_label_norm = entity_info.label.upper() if entity_info.label else None
+                entity_label_norm = entity_info.label.upper()
                 
-                # a. 精确查找实体
-                exact_entity_sql = "SELECT id_prop, text, label FROM ExtractedEntity WHERE text = ?"
-                exact_entity_params = [entity_text_norm]
-                if entity_label_norm:
-                    exact_entity_sql += " AND label = ?"
-                    exact_entity_params.append(entity_label_norm)
-                exact_entity_sql += " LIMIT 1;"
+                exact_entity_sql = "SELECT id_prop, text, label FROM ExtractedEntity WHERE text = ? AND label = ? LIMIT 1;"
                 kg_logger.info(f"Executing exact entity lookup for: text='{entity_text_norm}', label='{entity_label_norm}'")
-                entity_lookup_results = self._execute_duckdb_sql_query_sync(exact_entity_sql, exact_entity_params)
+                entity_lookup_results = self._execute_duckdb_sql_query_sync(exact_entity_sql, [entity_text_norm, entity_label_norm])
+                
                 for rec in entity_lookup_results:
                     if rec.get("id_prop") not in processed_entity_ids:
                         rec["_source_strategy"] = "exact_entity_match"
                         all_retrieved_records.append(rec)
                         processed_entity_ids.add(rec.get("id_prop"))
 
-                # b. 查找关系（使用映射和精确匹配）
-                if extracted_info.relation_hint and entity_lookup_results:
-                    source_entity_id_prop = entity_lookup_results[0].get("id_prop")
-                    if extracted_info.relation_hint and source_entity_id_prop:
-                        relation_hint_lower = extracted_info.relation_hint.lower()
-                        mapped_relation_types = []
+        # 4. 【核心修改】基于LLM提取的结构化关系进行精确查询
+        if extracted_info and extracted_info.relations:
+            kg_logger.info(f"Found {len(extracted_info.relations)} structured relations to process.")
+            for rel_item in extracted_info.relations:
+                try:
+                    head_text = normalize_text_for_id(rel_item.head_entity_text)
+                    head_label = rel_item.head_entity_label.upper()
+                    tail_text = normalize_text_for_id(rel_item.tail_entity_text)
+                    tail_label = rel_item.tail_entity_label.upper()
+                    rel_type = rel_item.relation_type.upper()
 
-                        # 定义映射规则
-                        if any(kw in relation_hint_lower for kw in ["work", "工作", "公司", "单位", "在哪"]):
-                            mapped_relation_types.append("WORKS_AT")
-                        if any(kw in relation_hint_lower for kw in ["assign", "负责", "任务是", "谁负责"]):
-                            mapped_relation_types.append("ASSIGNED_TO")
-                        # 可以根据需要添加更多或更精确的映射规则
+                    kg_logger.info(f"Processing relation: ({head_text}:{head_label})-[{rel_type}]->({tail_text}:{tail_label})")
 
-                        kg_logger.info(f"Relation hint '{extracted_info.relation_hint}' mapped to types: {mapped_relation_types} for entity ID {source_entity_id_prop}")
+                    relation_query_sql = """
+                    SELECT 
+                        r.relation_type,
+                        s.id_prop AS source_id_prop, s.text AS source_text, s.label AS source_label,
+                        t.id_prop AS target_id_prop, t.text AS target_text, t.label AS target_label
+                    FROM KGExtractionRelation r
+                    JOIN ExtractedEntity s ON r.source_node_id_prop = s.id_prop
+                    JOIN ExtractedEntity t ON r.target_node_id_prop = t.id_prop
+                    WHERE s.text = ? AND s.label = ?
+                      AND t.text = ? AND t.label = ?
+                      AND r.relation_type = ?
+                    LIMIT 1;
+                    """
+                    params = [head_text, head_label, tail_text, tail_label, rel_type]
+                    
+                    relation_results = self._execute_duckdb_sql_query_sync(relation_query_sql, params)
+                    
+                    if relation_results:
+                        kg_logger.info(f"Successfully verified relation in KG: {rel_type}")
+                        for rec in relation_results:
+                            rec["_source_strategy"] = f"structured_relation_match_{rel_type}"
+                            # 关系查询返回的结果更相关，即使实体已经存在，也值得加入
+                            all_retrieved_records.append(rec)
+                    else:
+                        kg_logger.info(f"Relation not found in KG via exact match. Consider broadening search.")
 
-                        for rel_type in mapped_relation_types:
-                            # 查询从该实体出发的关系
-                            relation_query_sql_from = f"""
-                            SELECT 
-                                r.relation_type,
-                                r.source_node_id_prop AS source_id_prop, 
-                                s.text AS source_text, 
-                                s.label AS source_label,
-                                r.target_node_id_prop AS target_id_prop, 
-                                t.text AS target_text, 
-                                t.label AS target_label
-                            FROM KGExtractionRelation r
-                            JOIN ExtractedEntity s ON r.source_node_id_prop = s.id_prop
-                            JOIN ExtractedEntity t ON r.target_node_id_prop = t.id_prop
-                            WHERE r.source_node_id_prop = ? AND r.relation_type = ?
-                            LIMIT {top_k};
-                            """
-                            relation_params_from = [source_entity_id_prop, rel_type]
-                            kg_logger.info(f"Executing relation lookup (FROM) for source_id='{source_entity_id_prop}', rel_type='{rel_type}'")
-                            relation_results_from = self._execute_duckdb_sql_query_sync(relation_query_sql_from, relation_params_from)
-                            for rec in relation_results_from: 
-                                rec["_source_strategy"] = f"relation_traversal_from_{rel_type}"
-                                all_retrieved_records.append(rec)
+                except Exception as e_rel_proc:
+                    kg_logger.error(f"Error processing structured relation item {rel_item.model_dump_json()}: {e_rel_proc}", exc_info=True)
 
-                            # 查询指向该实体的关系
-                            relation_query_sql_to = f"""
-                            SELECT 
-                                r.relation_type,
-                                r.source_node_id_prop AS source_id_prop, 
-                                s.text AS source_text, 
-                                s.label AS source_label,
-                                r.target_node_id_prop AS target_id_prop, 
-                                t.text AS target_text, 
-                                t.label AS target_label
-                            FROM KGExtractionRelation r
-                            JOIN ExtractedEntity s ON r.source_node_id_prop = s.id_prop
-                            JOIN ExtractedEntity t ON r.target_node_id_prop = t.id_prop
-                            WHERE r.target_node_id_prop = ? AND r.relation_type = ?
-                            LIMIT {top_k};
-                            """
-                            relation_params_to = [source_entity_id_prop, rel_type]
-                            kg_logger.info(f"Executing relation lookup (TO) for target_id='{source_entity_id_prop}', rel_type='{rel_type}'")
-                            relation_results_to = self._execute_duckdb_sql_query_sync(relation_query_sql_to, relation_params_to)
-                            for rec in relation_results_to: 
-                                rec["_source_strategy"] = f"relation_traversal_to_{rel_type}"
-                                all_retrieved_records.append(rec)
-        
         if not all_retrieved_records:
             kg_logger.info(f"No records retrieved from DuckDB KG for query: '{user_query}' after all strategies.")
             return []
 
-        formatted_docs = self._format_duckdb_records_for_retrieval(all_retrieved_records, user_query, "duckdb_kg")
+        # 去重，因为多种策略可能找到相同的结果
+        unique_records = []
+        seen_ids = set()
+        for record in all_retrieved_records:
+            record_id = record.get("id_prop") or record.get("source_id_prop")
+            if record_id and record_id in seen_ids:
+                continue
+            unique_records.append(record)
+            if record_id:
+                seen_ids.add(record_id)
+        
+        # 格式化最终输出
+        formatted_docs = self._format_duckdb_records_for_retrieval(unique_records, user_query, "duckdb_kg")
         
         kg_logger.info(f"KGRetriever (DuckDB) retrieve method finished. Returning {len(formatted_docs)} formatted documents for fusion.")
         return formatted_docs

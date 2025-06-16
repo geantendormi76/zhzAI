@@ -111,6 +111,16 @@ class IdentifiedEntity(BaseModel):
     text: str = Field(description="识别出的实体文本。")
     label: Optional[str] = Field(None, description="推断的实体类型 (例如 PERSON, ORGANIZATION, TASK)。")
 
+class ExtractedRelationItem(BaseModel): # 新建一个类名以避免与可能的其他同名类冲突
+    head_entity_text: str
+    head_entity_label: str
+    relation_type: str
+    tail_entity_text: str
+    tail_entity_label: str
+
 class ExtractedEntitiesAndRelationIntent(BaseModel):
-    entities: List[IdentifiedEntity] = Field(default_factory=list, description="从用户查询中识别出的核心实体列表（通常1-2个）。")
-    relation_hint: Optional[str] = Field(None, description="如果用户查询暗示了实体间的特定关系，这里是关系的文本描述或关键词（例如 “工作于”, “负责”, “销售额”）。")
+    entities: List[IdentifiedEntity] = Field(default_factory=list, description="从用户查询中识别出的核心实体列表。")
+    # --- 新增 "relations" 字段 ---
+    relations: List[ExtractedRelationItem] = Field(default_factory=list, description="从用户查询中识别出的关系列表。")
+    # --- "relation_hint" 字段可以保留，或者如果您觉得 "relations" 列表更全面，可以考虑移除或标记为废弃 ---
+    relation_hint: Optional[str] = Field(None, description="[可选的旧字段] 如果用户查询暗示了实体间的特定关系，这里是关系的文本描述或关键词。新的 'relations' 列表更推荐。")

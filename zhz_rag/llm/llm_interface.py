@@ -14,11 +14,13 @@ from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导�
 from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
 # 提示词导入
+from llama_cpp import Llama, LlamaGrammar 
 from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
     get_clarification_question_messages,
     get_entity_relation_extraction_messages, # <--- 添加导入
-    # get_cypher_generation_messages_with_templates # 这个可以暂时保留或注释掉
+    get_cypher_generation_messages_with_templates,
+    KG_EXTRACTION_GBNF_STRING  
 )
 
 
@@ -666,42 +668,157 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
 
 # --- 新增：用于提取实体和关系意图的函数 ---
 async def extract_entities_for_kg_query(user_question: str) -> Optional[ExtractedEntitiesAndRelationIntent]:
-    """
-    调用LLM从用户查询中提取核心实体和关系意图，并返回一个结构化的Pydantic对象。
-    """
-    llm_py_logger.info(f"Attempting to extract entities and relation intent for KG query from: '{user_question}'")
+    llm_py_logger.info(f"Attempting to extract entities and relation intent for KG query (with GBNF) from: '{user_question}'")
 
-    messages_for_llm = get_entity_relation_extraction_messages(user_question)
-
-    llm_response_json_str = await call_llm_via_openai_api_local_only(
-        prompt=messages_for_llm,
-        temperature=0.1, # 较低的温度
-        max_new_tokens=512, # 应该足够输出期望的JSON
-        stop_sequences=['<|im_end|>', '```'], # 尝试在代码块结束时停止
-        task_type="kg_entity_relation_extraction",
-        user_query_for_log=user_question,
-        model_name_for_log="qwen3_gguf_kg_entity_extraction"
+    # --- 使用您在 test_gbnf_extraction.py 中验证成功的 One-Shot Prompt 构建逻辑 ---
+    one_shot_example = """
+--- 示例 ---
+输入文本: "Alice在ACME公司担任工程师。"
+输出JSON:
+{
+  "entities": [
+    {"text": "Alice", "label": "PERSON"},
+    {"text": "ACME公司", "label": "ORGANIZATION"},
+    {"text": "工程师", "label": "TASK"}
+  ],
+  "relations": [
+    {"head_entity_text": "Alice", "head_entity_label": "PERSON", "relation_type": "WORKS_AT", "tail_entity_text": "ACME公司", "tail_entity_label": "ORGANIZATION"}
+  ]
+}
+--- 任务开始 ---"""
+    
+    # system_content 部分与您的测试脚本保持一致
+    system_content_for_prompt = (
+        f"你是一个严格的JSON知识图谱提取器。请根据用户提供的文本，严格按照示例格式，生成一个包含'entities'和'relations'的JSON对象。\n"
+        f"{one_shot_example}"
     )
 
-    if not llm_response_json_str:
-        llm_py_logger.warning(f"LLM call for KG entity/relation extraction returned None or empty. User question: '{user_question}'")
+    # user_content 部分也与您的测试脚本保持一致
+    user_content_for_prompt = (
+        f"输入文本: \"{user_question}\"\n" # 注意：这里用的是 user_question，而不是固定的 sample_text_to_extract
+        f"输出JSON:\n"
+    )
+
+    full_prompt_for_extraction = (
+        f"<|im_start|>system\n{system_content_for_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_content_for_prompt}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    # --- Prompt 构建结束 ---
+
+    llm_response_str = await call_local_llm_with_gbnf(
+        full_prompt=full_prompt_for_extraction,
+        grammar_str=KG_EXTRACTION_GBNF_STRING, # 使用我们定义的GBNF字符串
+        temperature=0.1,
+        max_tokens=1024, # 与您的测试脚本一致
+        repeat_penalty=1.2, # 与您的测试脚本一致
+        stop_sequences=["<|im_end|>"], # Qwen的停止标记
+        task_type="kg_entity_relation_extraction_gbnf",
+        user_query_for_log=user_question,
+        model_name_for_log="qwen3_gguf_kg_ext_gbnf"
+    )
+
+    if not llm_response_str:
+        llm_py_logger.warning(f"LLM call for KG entity/relation extraction (GBNF) returned None or empty. User question: '{user_question}'")
         return None
 
-    cleaned_json_str = llm_response_json_str.strip()
-
-    # --- 修改/添加这一行 ---
-    llm_py_logger.info(f"FULL Cleaned JSON string from LLM for entity extraction: >>>{cleaned_json_str}<<<")
-    # --- 修改/添加结束 ---
-
+    # GBNF应该确保输出是有效的JSON，所以我们可以直接尝试解析
     try:
-        parsed_data = json.loads(cleaned_json_str)
-        # 使用Pydantic模型进行验证和转换
+        # .strip() 以防万一有额外的空白被GBNF的 space 规则匹配但未被移除
+        parsed_data = json.loads(llm_response_str.strip())
         extracted_info = ExtractedEntitiesAndRelationIntent(**parsed_data)
-        llm_py_logger.info(f"Successfully parsed Pydantic model from LLM output: {extracted_info.model_dump_json(indent=2)}")
+        llm_py_logger.info(f"Successfully parsed Pydantic model from GBNF LLM output: {extracted_info.model_dump_json(indent=2)}")
         return extracted_info
     except json.JSONDecodeError as e_json:
-        llm_py_logger.error(f"Failed to decode JSON from LLM for entity extraction: '{cleaned_json_str}'. Error: {e_json}", exc_info=True)
+        llm_py_logger.error(f"Failed to decode JSON from GBNF LLM output: '{llm_response_str}'. Error: {e_json}", exc_info=True)
         return None
-    except Exception as e_pydantic: # Catch Pydantic validation errors or other issues
-        llm_py_logger.error(f"Failed to validate or parse Pydantic model from LLM JSON for entity extraction: '{cleaned_json_str}'. Error: {e_pydantic}", exc_info=True)
+    except Exception as e_pydantic: # Catch Pydantic validation errors
+        llm_py_logger.error(f"Failed to validate Pydantic model from GBNF LLM JSON: '{llm_response_str}'. Error: {e_pydantic}", exc_info=True)
         return None
+    
+
+# 新的LLM调用函数，用于create_completion和GBNF
+async def call_local_llm_with_gbnf(
+    full_prompt: str,
+    grammar_str: str, # GBNF语法字符串
+    temperature: float = 0.1,
+    max_tokens: int = 1024,
+    repeat_penalty: float = 1.2, # 从您的成功脚本中获取
+    stop_sequences: Optional[List[str]] = None,
+    task_type: str = "gbnf_constrained_generation",
+    user_query_for_log: Optional[str] = None, # 用于日志记录
+    model_name_for_log: str = "local_qwen_gguf_gbnf",
+    application_version_for_log: str = "0.1.0_gbnf"
+) -> Optional[str]:
+    llm_py_logger.info(f"Calling LOCAL LLM with GBNF for task: {task_type}. Prompt length: {len(full_prompt)}")
+
+    # 获取模型路径 (与 test_gbnf_extraction.py 逻辑类似)
+    # 注意: 这里的模型加载是临时的，理想情况下 LocalModelHandler 应该能处理这个
+    # 但为了快速集成您的成功方案，我们先在这里直接加载。
+    # 后续可以考虑将 create_completion 与 GBNF 的能力集成到 LocalModelHandler 中。
+    model_path_from_env = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
+    if not model_path_from_env or not os.path.exists(model_path_from_env):
+        llm_py_logger.error(f"LLM model path not found or not set in .env for GBNF call: {model_path_from_env}")
+        # 记录错误日志
+        log_error_data = {
+            "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task_type": task_type + "_model_load_error", "user_query_for_task": user_query_for_log,
+            "llm_input_prompt": full_prompt[:500] + "...", # 截断长prompt
+            "error_details": "LLM model path not configured or invalid.",
+            "application_version": application_version_for_log
+        }
+        await log_interaction_data(log_error_data) # 确保 log_interaction_data 已导入并可用
+        return None
+    
+    raw_llm_output_text = None
+    error_info = None
+    
+    try:
+        # 编译GBNF语法
+        compiled_grammar = LlamaGrammar.from_string(grammar_str)
+
+        # 初始化Llama模型实例 (每次调用都初始化可能效率不高，后续优化点)
+        llm_instance = Llama(
+            model_path=model_path_from_env,
+            n_gpu_layers=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
+            n_ctx=int(os.getenv("LLM_N_CTX", 4096)),
+            verbose=False
+        )
+
+        def _blocking_llm_call(): # 封装阻塞操作
+            response = llm_instance.create_completion(
+                prompt=full_prompt,
+                grammar=compiled_grammar,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                repeat_penalty=repeat_penalty,
+                stop=stop_sequences
+            )
+            return response['choices'][0]['text']
+
+        raw_llm_output_text = await asyncio.to_thread(_blocking_llm_call)
+        llm_py_logger.info(f"GBNF Call: Raw LLM Output for task '{task_type}': >>>{raw_llm_output_text}<<<")
+
+    except Exception as e:
+        llm_py_logger.error(f"Error calling local LLM service with GBNF: {e}", exc_info=True)
+        error_info = str(e)
+        log_error_data = {
+            "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task_type": task_type + "_error", "user_query_for_task": user_query_for_log,
+            "llm_input_prompt": full_prompt[:500] + "...",
+            "llm_parameters": {"temperature": temperature, "max_tokens": max_tokens, "repeat_penalty": repeat_penalty, "stop": stop_sequences},
+            "raw_llm_output": f"Error: {error_info}. Partial raw output: {str(raw_llm_output_text)[:200] if raw_llm_output_text else 'N/A'}",
+            "error_details": traceback.format_exc(), "application_version": application_version_for_log
+        }
+        await log_interaction_data(log_error_data)
+        return None
+
+    log_success_data = {
+        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "task_type": task_type, "user_query_for_task": user_query_for_log,
+        "llm_input_prompt": full_prompt[:500] + "...",
+        "llm_parameters": {"temperature": temperature, "max_tokens": max_tokens, "repeat_penalty": repeat_penalty, "stop": stop_sequences, "grammar_used": True},
+        "raw_llm_output": raw_llm_output_text, "application_version": application_version_for_log
+    }
+    await log_interaction_data(log_success_data)
+    return raw_llm_output_text

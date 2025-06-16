@@ -1,5 +1,3 @@
-# 文件: zhz_rag/api/rag_api_service.py
-
 import os
 import asyncio
 from contextlib import asynccontextmanager
@@ -10,6 +8,8 @@ import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from dataclasses import dataclass
 from dotenv import load_dotenv
+import uuid
+from datetime import datetime, timezone
 
 # --- 添加开始：明确指定 .env 文件路径 ---
 # 获取 rag_api_service.py 文件所在的目录
@@ -35,6 +35,8 @@ from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
 from zhz_rag.core_rag.kg_retriever import KGRetriever
 from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
 from zhz_rag.core_rag.fusion_engine import FusionEngine
+# 外部AI建议新增的导入
+from zhz_rag.utils.interaction_logger import log_interaction_data
 
 # --- 日志配置 ---
 api_logger = logging.getLogger("RAGApiServiceLogger")
@@ -387,7 +389,22 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             ) or NO_ANSWER_PHRASE_ANSWER_CLEAN
             api_logger.info(f"Answer generation completed.  {final_answer[:200]}...")
 
-        return HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs)
+        final_response = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs)
+
+        # --- 外部AI建议新增的代码块 ---
+        interaction_log_entry = {
+            "interaction_id": str(uuid.uuid4()), 
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task_type": "rag_query_processing_full_log", # <--- 确认这里的值
+            "original_user_query": query_request.query,
+            "final_answer_from_llm": final_answer,
+            "final_context_docs_full": [doc.model_dump(exclude_none=True) for doc in final_context_docs],
+            "retrieval_parameters": query_request.model_dump() 
+        }
+        await log_interaction_data(interaction_log_entry)
+        # --- 新增代码块结束 ---
+        
+        return final_response
 
     except Exception as e:
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
