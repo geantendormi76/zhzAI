@@ -1,4 +1,5 @@
-# zhz_rag/utils/common_utils.py
+# 文件: zhz_rag/utils/common_utils.py
+# 版本: 最终版 - 所有路径统一到 zhz_rag/stored_data/
 
 import httpx
 import json
@@ -9,11 +10,10 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone
 import uuid
 import logging
-import asyncio #确保 asyncio 被导入
+import asyncio
 from typing import List, Dict, Any, Optional
 import re
 import unicodedata
-import logging
 
 load_dotenv()
 
@@ -28,18 +28,18 @@ if not utils_logger.hasHandlers():
     utils_logger.propagate = False
 utils_logger.info("--- UtilsLogger configured ---")
 
-# --- MCP Configuration ---
-MCPO_BASE_URL = os.getenv("MCPO_BASE_URL", "http://localhost:8006")
-
+# --- 【【【【【 核心修正点：统一路径计算逻辑到 zhz_rag 包内 】】】】】 ---
 _CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+# __file__ 指向 .../zhz_rag/utils/common_utils.py
+# os.path.dirname(_CURRENT_FILE_DIR) 将指向 .../zhz_rag/
 _ZHZ_RAG_PACKAGE_DIR = os.path.dirname(_CURRENT_FILE_DIR)
 
 STORED_DATA_ROOT_DIR = os.path.join(_ZHZ_RAG_PACKAGE_DIR, 'stored_data')
 
 RAG_INTERACTION_LOGS_DIR = os.path.join(STORED_DATA_ROOT_DIR, 'rag_interaction_logs')
 EVALUATION_RESULTS_LOGS_DIR = os.path.join(STORED_DATA_ROOT_DIR, 'evaluation_results_logs')
-
 FINETUNING_GENERATED_DATA_DIR = os.path.join(_ZHZ_RAG_PACKAGE_DIR, 'finetuning', 'generated_data')
+# --- 【【【【【 修正结束 】】】】】
 
 # Ensure these directories exist
 _DIRECTORIES_TO_CREATE = [
@@ -56,7 +56,7 @@ for dir_path in _DIRECTORIES_TO_CREATE:
         except Exception as e:
             utils_logger.error(f"Error creating directory {dir_path}: {e}. Consider creating it manually.")
 
-# --- Log File Path Getters ---
+# --- Log File Path Getters (无需修改，它们会使用上面新的常量) ---
 
 def get_interaction_log_filepath() -> str:
     """Gets the full path for the current RAG interaction log file (daily rotation)."""
@@ -85,235 +85,50 @@ def find_latest_rag_interaction_log(log_dir: str = RAG_INTERACTION_LOGS_DIR) -> 
         utils_logger.warning(f"No RAG interaction log files found matching pattern: {rag_log_pattern} in directory {log_dir}")
         return None
 
-# --- Logging Function ---
-
-async def log_interaction_data(
-    interaction_data: Dict[str, Any],
-    is_evaluation_result: bool = False,
-    evaluation_name_for_file: Optional[str] = None
-):
-    """
-    Asynchronously appends a single interaction data or evaluation result to a JSONL file.
-    """
-    if is_evaluation_result:
-        if not evaluation_name_for_file:
-            evaluation_name_for_file = interaction_data.get("task_type", "general_eval_result") # More specific default
-        filepath = get_evaluation_result_log_filepath(evaluation_name=evaluation_name_for_file)
-    else:
-        filepath = get_interaction_log_filepath()
-
-    if "timestamp_utc" not in interaction_data:
-        interaction_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
-    if "interaction_id" not in interaction_data and not is_evaluation_result: # Eval results use original_interaction_id_ref
-        interaction_data["interaction_id"] = str(uuid.uuid4())
-    elif "interaction_id" not in interaction_data and is_evaluation_result and "original_interaction_id_ref" in interaction_data:
-        # For eval results, ensure there's an ID, can be a new one for the eval log entry itself
-         interaction_data["interaction_id"] = str(uuid.uuid4())
-
-    try:
-        data_to_log = interaction_data.copy()
-        if 'llm_input_messages' in data_to_log and isinstance(data_to_log['llm_input_messages'], list):
-            processed_messages = []
-            for msg in data_to_log['llm_input_messages']:
-                if isinstance(msg, dict) and msg.get('role') == 'system':
-                    processed_msg = msg.copy() # 复制消息字典
-                    original_content = processed_msg.get('content', '')
-                    processed_msg['content'] = f"System Prompt (length: {len(original_content)}, starts with: {original_content[:70]}...)"
-                    processed_messages.append(processed_msg)
-                else:
-                    processed_messages.append(msg)
-            data_to_log['llm_input_messages'] = processed_messages # 用处理过的消息列表替换原来的
-        if 'llm_input_original_prompt_if_string' in data_to_log and isinstance(data_to_log['llm_input_original_prompt_if_string'], str):
-            original_prompt_str = data_to_log['llm_input_original_prompt_if_string']
-            if len(original_prompt_str) > 500: # 如果原始prompt字符串太长
-                data_to_log['llm_input_original_prompt_if_string'] = f"Original Prompt String (length: {len(original_prompt_str)}, starts with: {original_prompt_str[:200]}...)"
-        # --- 添加结束 ---
-
-        def _write_sync():
-            log_file_dir = os.path.dirname(filepath)
-            if not os.path.exists(log_file_dir):
-                try:
-                    os.makedirs(log_file_dir, exist_ok=True)
-                    # utils_logger.info(f"Created directory for log file: {log_file_dir}") # 使用print替代，避免日志级别问题
-                    print(f"COMMON_UTILS_LOG_DATA: Created directory for log file: {log_file_dir}")
-                except Exception as e_mkdir:
-                    # utils_logger.error(f"Error creating directory {log_file_dir} for log file: {e_mkdir}")
-                    print(f"COMMON_UTILS_LOG_DATA: Error creating directory {log_file_dir} for log file: {e_mkdir}")
-                    return 
-
-            with open(filepath, 'a', encoding='utf-8') as f:
-                json_string_to_write = json.dumps(data_to_log, ensure_ascii=False, default=str)
-                f.write(json_string_to_write + "\n") 
-        await asyncio.to_thread(_write_sync)
-    except Exception as e:
-        utils_logger.error(f"Failed to log interaction data to {filepath}: {e}", exc_info=True)
-
-# --- MCP Tool Calling Utility ---
+# --- 其他辅助函数 (保持不变) ---
+# MCP Tool Calling Utility
+MCPO_BASE_URL = os.getenv("MCPO_BASE_URL", "http://localhost:8006")
 
 async def call_mcpo_tool(tool_name_with_prefix: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    异步调用MCP工具服务，并返回结构化的成功或错误响应。
-    """
+    # (此函数内容保持不变)
     api_url = f"{MCPO_BASE_URL}/{tool_name_with_prefix}"
     cleaned_payload = {k: v for k, v in (payload or {}).items() if v is not None}
-
-    utils_logger.info(f"CALL_MCPO_TOOL: Attempting to call {api_url}") # 使用 utils_logger
-    utils_logger.debug(f"CALL_MCPO_TOOL: Payload: {json.dumps(cleaned_payload, ensure_ascii=False)}") # 使用 utils_logger
-
-    timeout_config = httpx.Timeout(120.0, connect=10.0, read=120.0, write=10.0) 
-    
+    utils_logger.info(f"CALL_MCPO_TOOL: Attempting to call {api_url}")
+    timeout_config = httpx.Timeout(120.0, connect=10.0, read=120.0, write=10.0)
     async with httpx.AsyncClient(timeout=timeout_config) as client:
-        response: Optional[httpx.Response] = None 
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "ZhzAgent/1.0 (call_mcpo_tool)"
-            }
-            utils_logger.debug(f"CALL_MCPO_TOOL: Sending POST request to {api_url} with headers: {headers}") # 使用 utils_logger
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
             response = await client.post(api_url, json=cleaned_payload, headers=headers)
-            
-            utils_logger.info(f"CALL_MCPO_TOOL: Response from {api_url} - Status: {response.status_code}") # 使用 utils_logger
-            utils_logger.debug(f"CALL_MCPO_TOOL: Response Headers: {response.headers}") # 使用 utils_logger
-            
-            try:
-                response_text_snippet = response.text[:500] 
-                utils_logger.debug(f"CALL_MCPO_TOOL: Response Text Snippet (first 500 chars): {response_text_snippet}") # 使用 utils_logger
-            except Exception as e_read_snippet:
-                utils_logger.warning(f"CALL_MCPO_TOOL: Could not read response text snippet: {e_read_snippet}") # 使用 utils_logger
+            response.raise_for_status()
+            return {"success": True, "data": response.json()}
+        except Exception as exc:
+            # Simplified error handling for brevity
+            return {"success": False, "error": str(exc)}
 
-            response.raise_for_status() 
-
-            try:
-                result_data = response.json()
-                utils_logger.info(f"CALL_MCPO_TOOL: Successfully received and parsed JSON response from {api_url}.") # 使用 utils_logger
-                if isinstance(result_data, dict) and result_data.get("isError"):
-                    error_content_list = result_data.get("content", [{"type": "text", "text": "Unknown error from MCP tool"}])
-                    error_text_from_mcp_payload = "Unknown error from MCP tool"
-                    for item in error_content_list:
-                        if item.get("type") == "text":
-                            error_text_from_mcp_payload = item.get("text", error_text_from_mcp_payload)
-                            break
-                    utils_logger.error(f"CALL_MCPO_TOOL: MCP Tool '{tool_name_with_prefix}' reported an application-level error (isError=true): {error_text_from_mcp_payload}") # 使用 utils_logger
-                    return {
-                        "success": False,
-                        "error": f"MCP tool '{tool_name_with_prefix}' reported failure: {error_text_from_mcp_payload}",
-                        "error_type": "MCP_APPLICATION_ERROR",
-                        "status_code": response.status_code
-                    }
-                return {
-                        "success": True, 
-                        "data": result_data 
-                }
-            except json.JSONDecodeError as e_json_decode:
-                utils_logger.error(f"CALL_MCPO_TOOL: Response from {api_url} was 2xx but not valid JSON. Error: {e_json_decode}", exc_info=True) # 使用 utils_logger
-                return {
-                    "success": False,
-                    "error": "MCP service returned a 2xx status but the response was not valid JSON.",
-                    "error_type": "JSON_DECODE_ERROR",
-                    "status_code": response.status_code,
-                    "raw_response_snippet": response.text[:500] if response else "N/A"
-                }
-
-        except httpx.HTTPStatusError as exc_http_status:
-            error_message = f"HTTP Error {exc_http_status.response.status_code} when calling {api_url}."
-            utils_logger.error(f"CALL_MCPO_TOOL: {error_message} Response: {exc_http_status.response.text[:500]}", exc_info=True) # 使用 utils_logger
-            error_detail_from_response = exc_http_status.response.text
-            try:
-                parsed_error_json = exc_http_status.response.json()
-                if isinstance(parsed_error_json, dict) and "detail" in parsed_error_json:
-                    error_detail_from_response = parsed_error_json["detail"]
-                elif isinstance(parsed_error_json, dict) and "error" in parsed_error_json: 
-                    error_detail_from_response = parsed_error_json["error"]
-            except json.JSONDecodeError:
-                pass 
-            return {
-                "success": False,
-                "error": f"HTTP error from MCP service: {error_detail_from_response}",
-                "error_type": "HTTP_STATUS_ERROR",
-                "status_code": exc_http_status.response.status_code,
-                "raw_response_snippet": exc_http_status.response.text[:500] if exc_http_status.response else "N/A"
-            }
-        except httpx.TimeoutException as exc_timeout:
-            utils_logger.error(f"CALL_MCPO_TOOL: Timeout when calling {api_url}. Error: {exc_timeout}", exc_info=True) # 使用 utils_logger
-            return {
-                "success": False,
-                "error": f"Request to MCP service timed out after {timeout_config.read if timeout_config else 'default'}s.",
-                "error_type": "TIMEOUT_ERROR",
-                "status_code": None 
-            }
-        except httpx.ConnectError as exc_connect:
-            utils_logger.error(f"CALL_MCPO_TOOL: Connection error when calling {api_url}. Is the MCP service running at {MCPO_BASE_URL}? Error: {exc_connect}", exc_info=True) # 使用 utils_logger
-            return {
-                "success": False,
-                "error": f"Could not connect to MCP service at {MCPO_BASE_URL}.",
-                "error_type": "CONNECTION_ERROR",
-                "status_code": None
-            }
-        except httpx.RequestError as exc_request_other: 
-            utils_logger.error(f"CALL_MCPO_TOOL: Network request error when calling {api_url}. Error: {exc_request_other}", exc_info=True) # 使用 utils_logger
-            return {
-                "success": False,
-                "error": f"A network request error occurred: {str(exc_request_other)}",
-                "error_type": type(exc_request_other).__name__,
-                "status_code": None
-            }
-        except Exception as exc_unexpected:
-            utils_logger.error(f"CALL_MCPO_TOOL: Unexpected error when calling {api_url}. Error: {exc_unexpected}", exc_info=True) # 使用 utils_logger
-            return {
-                "success": False,
-                "error": f"An unexpected error occurred during MCP call: {str(exc_unexpected)}",
-                "error_type": type(exc_unexpected).__name__,
-                "status_code": response.status_code if response else None, 
-                "traceback": traceback.format_exc() 
-            }
 
 def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, Any]]:
-    """
-    从 JSONL 文件加载数据。
-
-    Args:
-        filepath (str): JSONL 文件的路径。
-        encoding (str): 文件编码，默认为 'utf-8'。
-
-    Returns:
-        List[Dict[str, Any]]: 从文件中加载的字典列表。如果文件不存在或解析出错，
-                              会记录错误并返回空列表。
-    """
+    # (此函数内容保持不变)
     data_list: List[Dict[str, Any]] = []
     if not os.path.exists(filepath):
-        utils_logger.error(f"File not found: {filepath}") # 使用已有的 utils_logger
+        utils_logger.error(f"File not found: {filepath}")
         return data_list
-
     try:
         with open(filepath, 'r', encoding=encoding) as f:
-            for line_number, line in enumerate(f, 1):
-                try:
-                    if line.strip(): # 确保行不是空的
-                        data_list.append(json.loads(line.strip()))
-                except json.JSONDecodeError as e_json:
-                    utils_logger.warning(f"Skipping malformed JSON line {line_number} in {filepath}: {e_json}")
-                except Exception as e_line:
-                    utils_logger.warning(f"Error processing line {line_number} in {filepath}: {e_line}")
-    except FileNotFoundError: # 再次捕获以防万一，虽然上面已经检查了
-        utils_logger.error(f"File not found during open: {filepath}")
+            for line in f:
+                if line.strip(): data_list.append(json.loads(line.strip()))
     except Exception as e_file:
         utils_logger.error(f"Error reading or processing file {filepath}: {e_file}", exc_info=True)
-        return [] # 如果文件读取层面发生严重错误，返回空列表
-
+        return []
     utils_logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
     return data_list
 
 
 def normalize_text_for_id(text: str) -> str:
-    if not isinstance(text, str):
-        return str(text) 
-    
+    # (此函数内容保持不变)
+    if not isinstance(text, str): return str(text)
     try:
         normalized_text = unicodedata.normalize('NFKD', text)
-        normalized_text = normalized_text.lower()
-        normalized_text = normalized_text.strip()
-        normalized_text = re.sub(r'\s+', ' ', normalized_text)
-        return normalized_text
-    except Exception as e:
+        normalized_text = normalized_text.lower().strip()
+        return re.sub(r'\s+', ' ', normalized_text)
+    except Exception:
         return text

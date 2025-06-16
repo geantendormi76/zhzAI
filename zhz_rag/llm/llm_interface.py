@@ -1,6 +1,7 @@
 # zhz_agent/llm.py (renamed to llm_interface.py as per typical module naming)
 # or more accurately, this is the content for llm_interface.py based on the inputs
 
+from cachetools import TTLCache
 import os
 import httpx  # 用于异步HTTP请求
 import json  # 用于处理JSON数据
@@ -9,9 +10,9 @@ from typing import List, Dict, Any, Optional, Union # Added Union
 from dotenv import load_dotenv
 import traceback  # Ensure traceback is imported
 
-from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
+from zhz_rag.utils.interaction_logger import log_interaction_data # 导入修复后的健壮日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
-from zhz_rag.utils.common_utils import log_interaction_data # 导入通用日志函数
+
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
 # 提示词导入
 from llama_cpp import Llama, LlamaGrammar 
@@ -22,7 +23,6 @@ from zhz_rag.llm.rag_prompts import (
     get_cypher_generation_messages_with_templates,
     KG_EXTRACTION_GBNF_STRING  
 )
-
 
 import logging
 import re
@@ -317,7 +317,25 @@ async def generate_simulated_kg_query_response(user_query: str, kg_schema_descri
         user_query_for_log=user_query
     )
 
+# --- 新增：为查询扩展结果定义一个缓存 ---
+# 使用 TTLCache，例如缓存1小时，最多缓存100个不同的原始查询的扩展结果
+# TTL (time-to-live) in seconds. 3600 seconds = 1 hour.
+# maxsize is the maximum number of items the cache will hold.
+_expanded_queries_cache = TTLCache(maxsize=100, ttl=3600)
+_expanded_queries_cache_lock = asyncio.Lock() # 用于异步环境下的锁
+# --- 缓存定义结束 ---
+
+
 async def generate_expanded_queries(original_query: str) -> List[str]:
+    
+    # --- 添加：缓存检查 ---
+    async with _expanded_queries_cache_lock:
+        if original_query in _expanded_queries_cache:
+            llm_py_logger.info(f"Expanded queries CACHE HIT for original query: '{original_query[:50]}...'")
+            return _expanded_queries_cache[original_query]
+    llm_py_logger.info(f"Expanded queries CACHE MISS for original query: '{original_query[:50]}...'. Generating new expanded queries.")
+    # --- 缓存检查结束 ---
+
     prompt_str = f"""<|im_start|>system
 你是一个专家查询分析师。根据用户提供的查询，生成3个不同但相关的子问题，以探索原始查询的不同方面。这些子问题将用于检索更全面的信息。
 你的回答必须是一个JSON数组（列表），其中每个元素是一个字符串（子问题）。
@@ -340,7 +358,7 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     llm_py_logger.info(f"调用LLM API进行查询扩展 (Prompt长度: {len(prompt_str)} 字符)...")
     llm_output = await call_llm_via_openai_api_local_only(
         prompt=prompt_str,
-        temperature=0.7,
+        temperature=0.1,
         max_new_tokens=512,
         stop_sequences=stop_sequences,
         task_type="query_expansion",
@@ -371,6 +389,12 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     # Always include the original query
     if original_query not in expanded_queries:
         expanded_queries.append(original_query)
+    # --- 添加：存储到缓存 ---
+    async with _expanded_queries_cache_lock:
+        _expanded_queries_cache[original_query] = expanded_queries
+        llm_py_logger.info(f"CACHED {len(expanded_queries)} expanded queries for original query: '{original_query[:50]}...'")
+    # --- 缓存存储结束 ---
+
     return expanded_queries
 
 

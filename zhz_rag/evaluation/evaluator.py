@@ -2,11 +2,11 @@
 import os
 import json
 import traceback
-from typing import Dict, Any, Optional, TYPE_CHECKING
+from typing import Dict, Any, Optional, TYPE_CHECKING, List
 
 # 导入共享的Schema描述 和 通用日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION as KG_SCHEMA_FOR_EVALUATION
-from zhz_rag.utils.common_utils import log_interaction_data
+from zhz_rag.utils.interaction_logger import log_interaction_data
 
 # --- 类型检查时导入资源类，避免循环导入 ---
 if TYPE_CHECKING:

@@ -5,7 +5,7 @@ import duckdb
 from typing import List, Dict, Any, Optional, Iterator, TYPE_CHECKING
 import logging
 from contextlib import contextmanager
-
+import asyncio
 if TYPE_CHECKING:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
 
@@ -35,6 +35,8 @@ class KGRetriever:
     def __init__(self, db_file_path: Optional[str] = None, embedder: Optional['LocalModelHandler'] = None):
         self.db_file_path = db_file_path if db_file_path else self.DUCKDB_KG_FILE_PATH_ENV
         self._embedder = embedder
+        self._retrieval_cache: Dict[str, List[Dict[str, Any]]] = {} # <--- 添加此行
+        self._retrieval_cache_lock = asyncio.Lock() # <--- 添加此行
         kg_logger.info(f"KGRetriever (DuckDB) initialized. DB file path set to: {self.db_file_path}")
 
         if not os.path.exists(self.db_file_path):
@@ -176,6 +178,16 @@ class KGRetriever:
 
     async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         kg_logger.info(f"Starting DuckDB KG retrieval for query: '{user_query}', top_k: {top_k}")
+
+        # --- 添加：缓存检查 ---
+        cache_key = f"{user_query}_{top_k}"
+        async with self._retrieval_cache_lock:
+            if cache_key in self._retrieval_cache:
+                kg_logger.info(f"KG CACHE HIT for key: '{cache_key[:100]}...'")
+                return self._retrieval_cache[cache_key]
+        kg_logger.info(f"KG CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
+        # --- 缓存检查结束 ---
+
 
         if not self._embedder:
             kg_logger.error("Embedder not configured for KGRetriever. Vector search will be skipped.")
@@ -336,6 +348,12 @@ class KGRetriever:
         # 格式化最终输出
         formatted_docs = self._format_duckdb_records_for_retrieval(unique_records, user_query, "duckdb_kg")
         
+        # --- 添加：存储到缓存 ---
+        async with self._retrieval_cache_lock:
+            self._retrieval_cache[cache_key] = formatted_docs
+            kg_logger.info(f"KG CACHED {len(formatted_docs)} results for key: '{cache_key[:100]}...'")
+        # --- 缓存存储结束 ---
+
         kg_logger.info(f"KGRetriever (DuckDB) retrieve method finished. Returning {len(formatted_docs)} formatted documents for fusion.")
         return formatted_docs
 
