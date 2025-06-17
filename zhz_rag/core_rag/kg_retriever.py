@@ -12,6 +12,9 @@ if TYPE_CHECKING:
 from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
 from zhz_rag.utils.common_utils import normalize_text_for_id
+from zhz_rag.utils.interaction_logger import log_interaction_data # <--- 确保这行存在
+import uuid # <--- 添加导入
+from datetime import datetime, timezone # <--- 添加导入
 
 # 日志配置
 kg_logger = logging.getLogger(__name__)
@@ -85,6 +88,7 @@ class KGRetriever:
     def _execute_duckdb_sql_query_sync(self, query: str, parameters: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         """
         执行DuckDB SQL查询并返回结果列表。
+        （此版本不再包含通用日志记录逻辑）
         """
         kg_logger.info(f"--- Executing DuckDB SQL --- Query: {query.strip()}")
         if parameters:
@@ -116,7 +120,7 @@ class KGRetriever:
         except Exception as e:
             kg_logger.error(f"Unexpected error executing DuckDB SQL query: '{query}'. Error: {e}", exc_info=True)
         return results_list
-
+    
     def _format_duckdb_records_for_retrieval(
         self, 
         records: List[Dict[str, Any]], 
@@ -216,7 +220,7 @@ class KGRetriever:
                 if query_vector_list:
                     vector_search_sql = "SELECT id_prop, text, label, list_distance(embedding, ?) AS distance FROM ExtractedEntity ORDER BY distance ASC LIMIT ?;"
                     kg_logger.info(f"Executing DuckDB vector search. Top K: {top_k}")
-                    vector_results = self._execute_duckdb_sql_query_sync(vector_search_sql, [query_vector_list, top_k])
+                    vector_results = self._execute_duckdb_sql_query_sync(vector_search_sql, [query_vector_list, top_k], user_query_context=user_query)
                     if vector_results:
                         for rec in vector_results: rec["_source_strategy"] = "vector_search"
                         all_retrieved_records.extend(vector_results)
@@ -263,6 +267,21 @@ class KGRetriever:
                     WHERE s.text = ? AND s.label = ? AND t.text = ? AND t.label = ? AND r.relation_type = ? LIMIT 1;
                     """
                     relation_verification_params = [head_text_norm, head_label_norm, tail_text_norm, tail_label_norm, relation_type_norm]
+                    
+                    # --- 在这里添加精准日志记录 ---
+                    log_entry = {
+                        "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "task_type": "kg_executed_query_for_eval", "user_query_for_task": user_query,
+                        "generated_query_language": "SQL_DuckDB", "generated_query": relation_verification_sql.strip(),
+                        "query_parameters": [str(p) for p in relation_verification_params], # 记录参数
+                        "application_version": "kg_retriever_0.2_rel_verify"
+                    }
+                    try:
+                        asyncio.create_task(log_interaction_data(log_entry))
+                    except Exception as e_log:
+                        kg_logger.error(f"Error queuing precise log for relation verification query: {e_log}", exc_info=True)
+                    # --- 日志记录结束 ---
+
                     relation_verification_results = self._execute_duckdb_sql_query_sync(relation_verification_sql, relation_verification_params)
                     
                     if relation_verification_results:

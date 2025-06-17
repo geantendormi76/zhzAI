@@ -104,22 +104,16 @@ async def run_cypher_batch_evaluation(
         original_id = get_field_value(interaction_log, "interaction_id")
 
         if user_question and original_id:
-            generated_cypher_to_eval = None
-            if isinstance(generated_cypher_raw, str):
-                try:
-                    # Cypher gen logs store the JSON string {"status": ..., "query": ...} in raw_llm_output
-                    cypher_data = json.loads(generated_cypher_raw)
-                    if isinstance(cypher_data, dict) and cypher_data.get("status") == "success":
-                        generated_cypher_to_eval = cypher_data.get("query")
-                    elif isinstance(cypher_data, dict) and cypher_data.get("status") == "unable_to_generate":
-                        generated_cypher_to_eval = cypher_data.get("query") # Should be "无法生成Cypher查询."
-                    else: # Not the expected JSON structure
-                         batch_cypher_eval_logger.warning(f"Cypher log {original_id} has raw_llm_output but not in expected JSON format: {generated_cypher_raw[:100]}")
-                except json.JSONDecodeError:
-                    # If raw_llm_output is not JSON, it might be the Cypher directly (older log format?) or "无法生成..."
-                    generated_cypher_to_eval = generated_cypher_raw 
-            
-            if not generated_cypher_to_eval or not str(generated_cypher_to_eval).strip():
+            generated_cypher_to_eval = None # 初始化
+            if isinstance(generated_cypher_raw, str) and generated_cypher_raw.strip():
+                # 对于 "kg_executed_query_for_eval" 类型的日志，"generated_query" 字段直接包含SQL语句
+                # 我们假设字段映射已将 "generated_query" 映射到 generated_cypher_raw
+                generated_cypher_to_eval = generated_cypher_raw.strip()
+                batch_cypher_eval_logger.debug(f"Extracted query for eval (ID: {original_id}): '{generated_cypher_to_eval[:100]}...'")
+            else:
+                batch_cypher_eval_logger.warning(f"Log entry for ID {original_id} (task_type: {current_task_type}) has empty or non-string 'generated_query' (mapped to generated_cypher_raw). Value: {generated_cypher_raw}")
+
+            if not generated_cypher_to_eval: # 再次检查，确保 generated_cypher_to_eval 有有效值
                 batch_cypher_eval_logger.info(f"Skipping evaluation for interaction_id '{original_id}' as extracted Cypher is empty.")
                 skipped_no_cypher_count += 1
                 continue
@@ -204,13 +198,11 @@ if __name__ == "__main__":
         app_version_tag_env += "_simulated"
 
     # --- 配置目标 task_type 和字段映射 ---
-    # llm_interface.py 中的 generate_cypher_query 记录的 task_type 是 "cypher_generation_final_attempt_local_service"
-    # 其 "raw_llm_output" 字段包含的是 local_llm_service 返回的 JSON 字符串: {"status": ..., "query": ...}
-    cypher_gen_task_types = ["cypher_generation_final_attempt_local_service", "cypher_generation"] # 包含旧的以防万一
+    cypher_gen_task_types = ["kg_executed_query_for_eval"] # <--- 查找新的 task_type
     cypher_gen_field_map = {
-        "user_query": "user_query_for_task", # 在 "cypher_generation_final_attempt_local_service" 中是这个
-        "generated_cypher": "raw_llm_output", # 在 "cypher_generation_final_attempt_local_service" 中是这个
-        "interaction_id": "interaction_id"
+        "user_query": "user_query_for_task",      # 这个字段名在新的日志条目中是存在的
+        "generated_cypher": "generated_query",    # 新的日志条目中，查询语句存储在 "generated_query" 字段
+        "interaction_id": "interaction_id"        # interaction_id 仍然是主键
     }
 
     if not gemini_eval_resource:
@@ -223,9 +215,10 @@ if __name__ == "__main__":
             app_version=app_version_tag_env,
             use_simulated_api=use_simulated_env,
             api_call_delay=api_delay_env,
-            target_task_types=cypher_gen_task_types,
+            target_task_types=cypher_gen_task_types, # <--- 使用修改后的 task_types
             field_mapping=cypher_gen_field_map
         ))
+
     elif use_simulated_env:
         batch_cypher_eval_logger.warning(f"RAG interaction log file not found, but USE_SIMULATED_GEMINI_CYPHER_EVAL is true. Running with a dummy path.")
         if gemini_eval_resource:

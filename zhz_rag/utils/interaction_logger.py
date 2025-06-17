@@ -25,13 +25,17 @@ if not interaction_logger_module_logger.hasHandlers():
     interaction_logger_module_logger.info("--- InteractionLoggerUtil configured ---")
 
 
-# --- 定义日志存储目录常量 (可以从 config.constants 导入，或在此处定义) ---
-# 获取当前文件所在目录的父目录的父目录 (即 zhz_rag 的父目录，应该是 zhz_agent)
-_PROJECT_ROOT_FOR_LOGS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# --- 定义日志存储目录常量 ---
+# __file__ 指向 .../zhz_rag/utils/interaction_logger.py
+_CURRENT_FILE_DIR_IL = os.path.dirname(os.path.abspath(__file__))
+# _ZHZ_RAG_PACKAGE_DIR_IL 指向 .../zhz_rag
+_ZHZ_RAG_PACKAGE_DIR_IL = os.path.dirname(_CURRENT_FILE_DIR_IL)
 
-RAG_INTERACTION_LOGS_DIR_DEFAULT = os.path.join(_PROJECT_ROOT_FOR_LOGS, 'stored_data', 'rag_interaction_logs')
-EVALUATION_RESULTS_LOGS_DIR_DEFAULT = os.path.join(_PROJECT_ROOT_FOR_LOGS, 'stored_data', 'evaluation_results_logs')
+# STORED_DATA_ROOT_DIR_IL 指向 .../zhz_rag/stored_data
+_STORED_DATA_ROOT_DIR_IL = os.path.join(_ZHZ_RAG_PACKAGE_DIR_IL, 'stored_data')
 
+RAG_INTERACTION_LOGS_DIR_DEFAULT = os.path.join(_STORED_DATA_ROOT_DIR_IL, 'rag_interaction_logs')
+EVALUATION_RESULTS_LOGS_DIR_DEFAULT = os.path.join(_STORED_DATA_ROOT_DIR_IL, 'evaluation_results_logs')
 
 def _sync_write_to_jsonl_robust(filepath: str, interaction_json_string: str):
     """

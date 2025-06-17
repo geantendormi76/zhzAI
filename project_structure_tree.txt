@@ -1,0 +1,119 @@
+项目结构树: /home/zhz/zhz_agent
+├── core/
+│   ├── agents/
+│   │   └── __init__.py
+│   ├── grammars/
+│   │   └── cypher_or_unable_output.gbnf
+│   ├── llms/
+│   │   ├── __init__.py
+│   │   └── custom_litellm_wrapper.py
+│   ├── prompts/
+│   │   └── manager_prompts.py
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── calculator_tool.py
+│   │   ├── enhanced_rag_tool.py
+│   │   ├── excel_tool.py
+│   │   ├── search_tool.py
+│   │   └── time_tool.py
+│   ├── __init__.py
+│   └── llm_manager.py
+├── scripts/
+│   ├── manual_tests/
+│   │   ├── __init__.py
+│   │   ├── test_duckdb_kg_retriever.py
+│   │   └── test_kg_retriever_new_strategy.py
+│   ├── __init__.py
+│   └── test_kg_retriever_directly.py
+├── utils/
+│   ├── __init__.py
+│   ├── common_utils.py
+│   └── hardware_manager.py
+├── zhz_rag/
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── main_api.py
+│   │   ├── rag_api_service.py
+│   │   ├── rag_mcp_service.py
+│   │   └── task_manager_api.py
+│   ├── config/
+│   │   ├── constants.py
+│   │   └── pydantic_models.py
+│   ├── core_rag/
+│   │   ├── retrievers/
+│   │   │   ├── __init__.py
+│   │   │   ├── chromadb_retriever.py
+│   │   │   ├── embedding_functions.py
+│   │   │   └── file_bm25_retriever.py
+│   │   ├── __init__.py
+│   │   ├── fusion_engine.py
+│   │   └── kg_retriever.py
+│   ├── crewai_integration/
+│   │   ├── __init__.py
+│   │   ├── run_crew.py
+│   │   └── tools.py
+│   ├── evaluation/
+│   │   ├── __init__.py
+│   │   ├── analyze_answer.py
+│   │   ├── analyze_cypher.py
+│   │   ├── batch_eval_answer.py
+│   │   ├── batch_eval_cypher.py
+│   │   └── evaluator.py
+│   ├── finetuning/
+│   │   ├── generated_data/
+│   │   ├── __init__.py
+│   │   ├── refine_answer_data.py
+│   │   └── refine_cypher_data.py
+│   ├── llm/
+│   │   ├── rag_eval_data/
+│   │   ├── __init__.py
+│   │   ├── custom_crewai_llms.py
+│   │   ├── embedding_process_worker.py
+│   │   ├── llm_interface.py
+│   │   ├── local_model_handler.py
+│   │   └── rag_prompts.py
+│   ├── task_management/
+│   │   ├── __init__.py
+│   │   ├── db_models.py
+│   │   └── jobs.py
+│   ├── utils/
+│   │   ├── __init__.py
+│   │   ├── common_utils.py
+│   │   ├── db_utils.py
+│   │   ├── interaction_logger.py
+│   │   ├── load_neo4j_data.py
+│   ├── __init__.py
+│   └── setup.py
+├── zhz_rag_pipeline_dagster/
+│   ├── zhz_rag_pipeline/
+│   │   ├── parsers/
+│   │   │   ├── __init__.py
+│   │   │   ├── docx_parser.py
+│   │   │   ├── html_parser.py
+│   │   │   ├── md_parser.py
+│   │   │   ├── pdf_parser.py
+│   │   │   ├── txt_parser.py
+│   │   │   └── xlsx_parser.py
+│   │   ├── __init__.py
+│   │   ├── custom_io_managers.py
+│   │   ├── definitions.py
+│   │   ├── document_parsers.py
+│   │   ├── evaluation_assets.py
+│   │   ├── ingestion_assets.py
+│   │   ├── processing_assets.py
+│   │   ├── pydantic_models_dagster.py
+│   │   └── resources.py
+│   ├── pyproject.toml
+│   └── setup.py
+├── __init__.py
+├── agent_orchestrator_service.py
+├── batch_rename_and_replace.py
+├── config.yaml
+├── llm_setup.py
+├── local_llm_service.py
+├── mcp_servers.json
+├── README.md
+├── requirements.txt
+├── 目录结构树.py
+└── 目录结构树.py:Zone.Identifier
+----------------------------------------
