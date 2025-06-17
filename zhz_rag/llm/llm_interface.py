@@ -5,10 +5,10 @@ import os
 import httpx  # 用于异步HTTP请求
 import json  # 用于处理JSON数据
 import asyncio  # 用于 asyncio.to_thread
-from typing import List, Dict, Any, Optional, Union # Added Union
+from typing import List, Dict, Any, Optional, Union, Callable 
 from dotenv import load_dotenv
 import traceback  # Ensure traceback is imported
-
+from pydantic import ValidationError
 from zhz_rag.utils.interaction_logger import log_interaction_data # 导入修复后的健壮日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 
@@ -265,29 +265,39 @@ async def generate_cypher_query(user_question: str) -> Optional[str]: # kg_schem
              return json.dumps({"status": "success", "query": cleaned_json_str})
         return json.dumps({"status": "unable_to_generate", "query": "LLM输出非JSON格式."})
 
-async def generate_answer_from_context(user_query: str, context_str: str) -> Optional[str]: # context 参数名改为 context_str
-    llm_py_logger.info(f"Generating answer for query: '{user_query[:100]}...' using provided context.")
-    messages_for_llm = get_answer_generation_messages(user_query, context_str)
-    raw_answer = await call_llm_via_openai_api_local_only(
-        prompt=messages_for_llm, 
-        temperature=0.05,
-        max_new_tokens=1024, 
-        stop_sequences=['<|im_end|>', UNIQUE_STOP_TOKEN],
-        task_type="answer_generation_from_context",
-        user_query_for_log=user_query,
-        model_name_for_log="qwen3_gguf_answer_gen"
+async def generate_answer_from_context(
+    user_query: str,
+    context_str: str,
+    prompt_builder: Optional[Callable[[str, str], List[Dict[str, str]]]] = None
+) -> Optional[str]:
+    """
+    Generates an answer from context.
+    V2: Can accept a dynamic prompt builder for specialized tasks like Table-QA.
+    """
+    from .rag_prompts import get_answer_generation_messages # 默认的 prompt builder
+
+    # 如果没有提供特定的 prompt_builder，就使用默认的通用版本
+    if prompt_builder is None:
+        prompt_builder = get_answer_generation_messages
+    
+    llm_py_logger.info(f"Generating answer for query: '{user_query[:50]}...' using prompt builder: {prompt_builder.__name__}")
+    
+    # 使用 prompt_builder 来构建 messages
+    messages = prompt_builder(user_query, context_str)
+    
+    final_answer = await call_llm_via_openai_api_local_only(
+        prompt=messages, # <--- 将 messages 列表传递给 prompt 参数
+        task_type=f"answer_generation_using_{prompt_builder.__name__}",
+        model_name_for_log="qwen3_gguf_answer_gen_v2"
+        # 其他参数如 temperature, max_tokens 会使用该函数的默认值
     )
     
-    if raw_answer and raw_answer.strip() and \
-       raw_answer.strip() != "[[LLM_RESPONSE_MALFORMED_CHOICES_OR_MESSAGE]]" and \
-       raw_answer.strip() != "[[CONTENT_NOT_FOUND]]":
-        
-        final_answer = raw_answer.strip()
-        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN: # NO_ANSWER_PHRASE_ANSWER_CLEAN 可以从 rag_prompts.py 导入或在 llm_interface.py 中也定义
-            llm_py_logger.info("LLM indicated unable to answer from context.")
+    if final_answer and final_answer != NO_ANSWER_PHRASE_ANSWER_CLEAN:
         return final_answer
-    else:
-        llm_py_logger.warning(f"Answer generation returned None, empty, or placeholder. Query: {user_query}")
+    elif final_answer: # 如果是 "无法找到信息"
+        return final_answer
+    else: # 如果返回None或空字符串
+        llm_py_logger.warning("Answer generation returned None or empty string. Falling back to default no-answer phrase.")
         return NO_ANSWER_PHRASE_ANSWER_CLEAN
 
 async def generate_simulated_kg_query_response(user_query: str, kg_schema_description: str, kg_data_summary_for_prompt: str) -> Optional[str]:
@@ -847,43 +857,53 @@ async def call_local_llm_with_gbnf(
 
 async def generate_expansion_and_entities(user_query: str) -> Optional[QueryExpansionAndKGExtractionOutput]:
     """
-    Performs a single LLM call to get both expanded queries and KG entities using GBNF.
+    Performs a single LLM call to get an execution plan: expanded queries, KG entities, and a metadata filter.
+    Uses GBNF for structured output.
+    V2: Includes metadata_filter generation.
     """
-    from .rag_prompts import COMBINED_EXPANSION_KG_PROMPT_TEMPLATE, COMBINED_EXPANSION_KG_GBNF_STRING
+    # 使用新的Prompt和GBNF
+    from .rag_prompts import COMBINED_PLANNING_PROMPT_TEMPLATE, COMBINED_PLANNING_GBNF_STRING
     from ..config.pydantic_models import QueryExpansionAndKGExtractionOutput
 
-    llm_py_logger.info(f"Generating expanded queries and KG entities for: '{user_query[:100]}...'")
+    llm_py_logger.info(f"Generating execution plan for: '{user_query[:100]}...'")
 
     # 1. 准备 Prompt
-    full_prompt = COMBINED_EXPANSION_KG_PROMPT_TEMPLATE.format(user_query=user_query)
+    full_prompt = COMBINED_PLANNING_PROMPT_TEMPLATE.format(user_query=user_query)
 
     # 2. 调用带有 GBNF 约束的 LLM
     llm_response_str = await call_local_llm_with_gbnf(
         full_prompt=full_prompt,
-        grammar_str=COMBINED_EXPANSION_KG_GBNF_STRING,
-        temperature=0.1,
+        grammar_str=COMBINED_PLANNING_GBNF_STRING,
+        temperature=0.05, # 对于这种结构化任务，温度可以更低
         max_tokens=1024,
-        task_type="combined_expansion_kg_extraction",
+        task_type="planning_expansion_kg_filter", # 新的任务类型
         user_query_for_log=user_query,
-        model_name_for_log="qwen3_gguf_combined_task"
+        model_name_for_log="qwen3_gguf_planning_task"
     )
 
     if not llm_response_str:
-        llm_py_logger.warning("Combined LLM call returned no response.")
+        llm_py_logger.warning("LLM Planner call returned no response.")
         return None
 
     # 3. 解析结果并返回 Pydantic 对象
     try:
-        parsed_data = json.loads(llm_response_str.strip())
+        # 在解析前清理可能存在的```json ... ```包装
+        cleaned_response = llm_response_str.strip()
+        if cleaned_response.startswith("```json"):
+            cleaned_response = cleaned_response[7:].strip()
+        if cleaned_response.endswith("```"):
+            cleaned_response = cleaned_response[:-3].strip()
+            
+        parsed_data = json.loads(cleaned_response)
         structured_output = QueryExpansionAndKGExtractionOutput(**parsed_data)
         
         # 确保原始查询在扩展查询列表中
         if user_query not in structured_output.expanded_queries:
             structured_output.expanded_queries.append(user_query)
-            
-        llm_py_logger.info(f"Successfully parsed combined output. Expanded queries: {len(structured_output.expanded_queries)}, Entities: {len(structured_output.extracted_entities_for_kg.entities)}")
+        
+        llm_py_logger.info(f"Successfully parsed plan. Queries: {len(structured_output.expanded_queries)}, Entities: {len(structured_output.extracted_entities_for_kg.entities)}, Filter: {structured_output.metadata_filter}")
         return structured_output
         
-    except (json.JSONDecodeError, TypeError) as e:
-        llm_py_logger.error(f"Failed to parse or validate combined LLM output. Error: {e}. Raw output: '{llm_response_str}'", exc_info=True)
+    except (json.JSONDecodeError, TypeError, ValidationError) as e:
+        llm_py_logger.error(f"Failed to parse or validate LLM plan. Error: {e}. Raw output: '{llm_response_str}'", exc_info=True)
         return None

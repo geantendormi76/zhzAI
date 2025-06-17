@@ -135,3 +135,7 @@ class QueryExpansionAndKGExtractionOutput(BaseModel):
         default_factory=ExtractedEntitiesAndRelationIntent,
         description="Structured entities and relations extracted for Knowledge Graph querying."
     )
+    metadata_filter: Optional[Dict[str, Any]] = Field( # <--- 新增字段
+        default=None,
+        description="An optional metadata filter (e.g., {'filename': 'report.docx'}) to apply during retrieval, if a specific source is mentioned."
+    )

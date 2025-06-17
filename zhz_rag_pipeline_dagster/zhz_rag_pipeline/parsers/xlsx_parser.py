@@ -59,12 +59,9 @@ def parse_xlsx_to_structured_output(
         return None
 
     elements: List[Any] = []
-    all_sheets_text_parts: List[str] = []
 
     try:
         # Read all sheets into a dictionary of DataFrames
-        # Setting header=0 to use the first row as column names.
-        # If a sheet has no header, pandas will infer column names like 0, 1, 2...
         xls = pd.read_excel(file_path, sheet_name=None, header=0) 
         logger.info(f"Pandas opened XLSX. Sheets: {list(xls.keys())}")
 
@@ -73,54 +70,53 @@ def parse_xlsx_to_structured_output(
                 logger.info(f"Sheet '{sheet_name}' (index {sheet_idx}) is empty. Skipping.")
                 continue
 
-            sheet_md_representation = None
-            sheet_text_representation = None
-            
+            # -- 核心修改点：将每个sheet作为一个独立的TableElement --
             try:
-                # Attempt to convert DataFrame to Markdown
-                sheet_md_representation = df.to_markdown(index=False)
-                all_sheets_text_parts.append(f"Sheet: {sheet_name}\n{sheet_md_representation}")
-                logger.info(f"Successfully converted sheet '{sheet_name}' to Markdown.")
+                # 优先使用Markdown格式，因为它对LLM最友好
+                # `tabulate` 库是 to_markdown 的一个依赖，需要确保已安装
+                md_representation = df.to_markdown(index=False)
+                
+                # 创建一个描述性的标题，包含文件名和工作表名
+                table_caption = f"Content from sheet '{sheet_name}' in file '{os.path.basename(file_path)}'."
+
+                element_metadata = _create_xlsx_element_metadata(sheet_index=sheet_idx)
+
+                if _PYDANTIC_MODELS_AVAILABLE_XLSX:
+                    table_el = TableElement(
+                        markdown_representation=md_representation,
+                        caption=table_caption,
+                        metadata=element_metadata # type: ignore
+                    )
+                    elements.append(table_el)
+                else:
+                    elements.append({
+                        "element_type": "table",
+                        "markdown_representation": md_representation,
+                        "caption": table_caption,
+                        "metadata": element_metadata
+                    })
+                logger.info(f"Successfully created a TableElement for sheet '{sheet_name}'.")
+
             except Exception as e_markdown:
-                logger.warning(f"Failed to convert sheet '{sheet_name}' to Markdown (tabulate library might be missing): {e_markdown}. Falling back to string representation.")
-                try:
-                    sheet_text_representation = df.to_string(index=False)
-                    all_sheets_text_parts.append(f"Sheet: {sheet_name}\n{sheet_text_representation}")
-                    logger.info(f"Successfully converted sheet '{sheet_name}' to string representation.")
-                except Exception as e_string:
-                    logger.error(f"Failed to convert sheet '{sheet_name}' even to string: {e_string}")
-                    all_sheets_text_parts.append(f"Sheet: {sheet_name}\n[Error converting sheet to text]")
-
-            element_metadata = _create_xlsx_element_metadata(sheet_index=sheet_idx)
-            if _PYDANTIC_MODELS_AVAILABLE_XLSX:
-                table_el = TableElement(
-                    markdown_representation=sheet_md_representation,
-                    # html_representation can be df.to_html(index=False) if needed later
-                    caption=str(sheet_name), # Ensure caption is string
-                    metadata=element_metadata # type: ignore
-                )
-                elements.append(table_el)
-            else:
-                elements.append({
-                    "element_type": "table",
-                    "markdown_representation": sheet_md_representation,
-                    "caption": str(sheet_name),
-                    "metadata": element_metadata
-                })
+                logger.error(f"Failed to convert sheet '{sheet_name}' to Markdown. It will be skipped. Error: {e_markdown}. Ensure 'tabulate' is installed (`pip install tabulate`).")
+                # 如果转换失败，我们可以选择跳过这个sheet或记录一个错误元素
+                continue # 这里选择跳过
         
-        linear_text = "\n\n\n".join(all_sheets_text_parts).strip() # Use more newlines to separate sheets
-
+        # -- 核心修改点：不再生成一个巨大的、拼接的 parsed_text --
+        # 我们只返回一个包含所有独立表格元素的列表
         if _PYDANTIC_MODELS_AVAILABLE_XLSX:
             return ParsedDocumentOutput(
-                parsed_text=linear_text,
+                parsed_text="",  # 主文本字段留空
                 elements=elements, # type: ignore
-                original_metadata=original_metadata
+                original_metadata=original_metadata,
+                summary=f"Parsed {len(elements)} sheets as structured tables from {os.path.basename(file_path)}."
             )
         else:
             return {
-                "parsed_text": linear_text,
+                "parsed_text": "",
                 "elements": elements,
-                "original_metadata": original_metadata
+                "original_metadata": original_metadata,
+                "summary": f"Parsed {len(elements)} sheets as structured tables from {os.path.basename(file_path)}."
             }
 
     except FileNotFoundError:
@@ -128,15 +124,4 @@ def parse_xlsx_to_structured_output(
         return None
     except Exception as e:
         logger.error(f"Error parsing XLSX file {file_path} with pandas: {e}", exc_info=True)
-        # Fallback: try to read as raw text if pandas fails catastrophically
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f_raw:
-                raw_content = f_raw.read(5000) # Limit raw read
-            error_text = f"[Failed to parse XLSX with pandas. Raw content preview (first 5000 chars)]:\n{raw_content}"
-            if _PYDANTIC_MODELS_AVAILABLE_XLSX:
-                return ParsedDocumentOutput(parsed_text=error_text, elements=[], original_metadata=original_metadata) # type: ignore
-            else:
-                return {"parsed_text": error_text, "elements": [], "original_metadata": original_metadata}
-        except Exception as e_raw:
-            logger.error(f"Failed to even read XLSX as raw text after pandas error: {e_raw}")
-            return None
+        return None

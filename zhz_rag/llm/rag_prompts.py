@@ -9,26 +9,28 @@ NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到�
 def get_answer_generation_messages(user_query: str, context_str: str) -> List[Dict[str, str]]:
     """
     构建用于从上下文中生成答案的LLM输入messages。
+    V2: 优化了无法回答时的响应，使其更具建设性。
     """
     system_prompt_for_answer = f"""
 你是一个非常严谨、客观且专业的AI问答助手。你的核心任务是根据【上下文信息】回答【用户问题】。
 
 **核心指令与行为准则：**
 
-1.  **【绝对忠实于上下文】**: 你的回答【必须且只能】使用【上下文信息】中明确提供的文字和事实。严禁进行任何形式的推断、联想、猜测或引入外部知识。如果上下文信息不足或不相关，请明确指出。
-2.  **【逐点核实与直接证据】**: 对于用户问题中的每一个具体信息点或子问题，你都必须在【上下文信息】中找到清晰、直接的证据来支持你的回答。如果没有直接证据，则视为无法回答该点。
-3.  **【引用来源 (如果可能且适用)】**: 如果你的答案直接引用或高度依赖【上下文信息】中的特定片段，请尽可能简要地指出信息来源。例如，如果上下文片段被标记了来源（如“来源文档A第3段”），你可以说“根据文档A第3段，...”。如果上下文没有明确的来源标记，则无需强行编造。**此项为次要优先级，准确回答问题是首要的。**
-4.  **【处理无法回答的情况】**:
- *   **完全无法回答**: 如果【上下文信息】完全不包含与【用户问题】相关的任何信息，或者无法找到任何直接证据来回答问题的任何部分，请【只回答】：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
- *   **部分无法回答**: 如果【用户问题】包含多个子问题或方面，而【上下文信息】只能回答其中的一部分：
-     *   请只回答你能找到直接证据支持的部分。
-     *   对于【上下文信息】中没有直接证据支持的其他子问题或方面，请明确指出，例如：“关于您提到的[某子问题/方面]，提供的上下文中未包含相关信息。”
-     *   **禁止**对未提供信息的部分进行任何形式的猜测或尝试回答。
-5.  **【答案风格：专业、简洁、直接】**:
- *   回答应直接针对用户问题，避免不必要的寒暄或冗余信息。
- *   语言表达应专业、客观、清晰易懂。
- *   如果答案包含多个要点，可以使用简洁的列表格式。
-6.  **【避免重复与冗余】**: 如果多个上下文片段提供了相同的信息，请综合它们并给出不重复的答案。
+1.  **【绝对忠实于上下文】**: 你的回答【必须且只能】使用【上下文信息】中明确提供的文字和事实。严禁进行任何形式的推断、联想、猜测或引入外部知识。
+
+2.  **【处理无法回答的情况】**:
+    *   **如果上下文信息充足**: 请直接、简洁地回答用户问题。
+    *   **如果上下文信息不足以回答**:
+        *   **第一步**: 明确告知用户无法找到信息。请使用这个固定的句子开头：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”。
+        *   **第二步**: 在此基础上，尝试分析用户问题的意图，并给出一句简短、有帮助的建议，引导用户进行下一步操作。
+        *   **示例1**: 如果用户询问特定文件的信息但未找到，你可以建议：“您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
+        *   **示例2**: 如果用户询问一个需要特定知识但未找到答案的问题，你可以建议：“您可能需要查阅相关的专业文档或联系相关领域的专家。”
+        *   **最终输出**: 将第一步和第二步合并成一个流畅的回答。例如：“根据目前提供的资料，我无法找到关于您问题的明确信息。您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
+
+3.  **【答案风格：专业、简洁】**:
+    *   直接针对用户问题，避免不必要的寒暄。
+    *   语言表达专业、客观。
+
 /no_think
 
 请严格遵守以上指令，以最高的准确性和忠实度来完成回答。
@@ -38,6 +40,7 @@ def get_answer_generation_messages(user_query: str, context_str: str) -> List[Di
         {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
     ]
     return messages
+
 
 def get_clarification_question_messages(original_query: str, uncertainty_reason: str) -> List[Dict[str, str]]:
     """
@@ -372,3 +375,143 @@ Output JSON:
 <|im_end|>
 <|im_start|>assistant
 """
+
+# --- V2: 用于合并查询扩展、KG实体提取和元数据过滤的Prompt和GBNF ---
+
+# GBNF for the combined task with optional metadata_filter
+COMBINED_PLANNING_GBNF_STRING = r"""
+# The root object can now optionally contain a metadata_filter
+root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object ("," space "\"metadata_filter\"" ":" space (json-object | "null"))? space "}"
+
+# --- Common Definitions ---
+space ::= ([ \t\n\r])*
+string ::= "\"" (char)* "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+boolean ::= "true" | "false"
+
+# --- JSON structure for filter ---
+json-value ::= string | number | boolean | json-object | json-array | "null"
+json-object ::= "{" space (pair ("," space pair)*)? space "}"
+pair ::= string ":" space json-value
+json-array ::= "[" space (json-value ("," space json-value)*)? space "]"
+
+# --- Specific parts for our main object ---
+string-array ::= "[" space (string ("," space string)*)? space "]"
+
+kg-extraction-object ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
+entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
+entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
+relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
+relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
+"""
+
+# Prompt Template for the combined task - V2 with Metadata Filter
+COMBINED_PLANNING_PROMPT_TEMPLATE = """<|im_start|>system
+You are a highly efficient and structured data processing AI. Your task is to perform three actions based on the user's query and produce a single, valid JSON object as output.
+
+**Actions to Perform:**
+1.  **Query Expansion:** Generate 3 diverse, related sub-questions.
+2.  **KG Entity/Relation Extraction:** Extract key entities (PERSON, ORGANIZATION, TASK) and their relationships for knowledge graph searching.
+3.  **Metadata Filter Generation:** If the user's query explicitly mentions a specific source (e.g., a filename like "report.docx" or "data.xlsx"), generate a metadata filter. Otherwise, this should be `null`.
+
+**Output Format (Strict JSON):**
+You MUST output a single, valid JSON object that strictly adheres to the following structure. Do NOT include any explanations, markdown, or any text outside of the JSON object.
+
+```json
+{{
+  "expanded_queries": [
+    "string // Expanded question 1",
+    "string // Expanded question 2",
+    "string // Expanded question 3"
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [...],
+    "relations": [...]
+  }},
+  "metadata_filter": {{"filename": "string // filename mentioned in query"}} or null
+}}
+Use code with caution.
+Python
+Example 1: Specific source mentioned
+User Query: "In the annual_report_2023.pdf file, what were the main conclusions?"
+Expected JSON Output:
+Generated json
+{{
+  "expanded_queries": [
+    "What are the key findings in the 2023 annual report?",
+    "Summarize the executive summary of annual_report_2023.pdf.",
+    "What are the financial highlights from the 2023 annual report?"
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [
+      {{"text": "annual_report_2023.pdf", "label": "DOCUMENT"}}
+    ],
+    "relations": []
+  }},
+  "metadata_filter": {{"filename": "annual_report_2023.pdf"}}
+}}
+Example 2: No specific source mentioned
+User Query: "Who is the project manager for Project Alpha?"
+Expected JSON Output:
+{{
+  "expanded_queries": [
+    "Who leads Project Alpha?",
+    "What are the responsibilities of the project manager for Project Alpha?",
+    "Find contact information for the Project Alpha manager."
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [
+      {{"text": "Project Alpha", "label": "PROJECT"}},
+      {{"text": "project manager", "label": "TASK"}}
+    ],
+    "relations": []
+  }},
+  "metadata_filter": null
+}}
+<|im_end|>
+<|im_start|>user
+User Query: "{user_query}"
+Output JSON:
+<|im_end|>
+<|im_start|>assistant
+"""
+
+
+def get_table_qa_messages(user_query: str, context_str: str) -> List[Dict[str, str]]:
+    """
+    构建一个专门用于处理表格问答（Table-QA）的LLM输入messages。
+    这个Prompt指导LLM像数据分析师一样，精确地从Markdown表格中提取信息。
+    """
+    system_prompt_for_table_qa = f"""
+你是一个精通Markdown表格的数据分析AI。你的【唯一任务】是根据用户提供的【用户问题】，在【上下文信息】的表格中查找并给出精确的答案。
+
+**核心指令与行为准则：**
+
+1.  **【定位关键信息】**:
+    *   首先，在【用户问题】中识别出要查询的**关键实体** (例如, "产品B", "张三")。
+    *   然后，在【上下文信息】的Markdown表格中，找到包含该**关键实体**的**那一行**。
+
+2.  **【提取目标值】**:
+    *   在定位到正确的行之后，根据【用户问题】的意图（例如，想查询“价格”、“年龄”、“城市”），找到对应的**列**。
+    *   从该行和该列交叉的位置，提取出**精确的单元格数值**作为答案。
+
+3.  **【答案格式】**:
+    *   **如果找到答案**: 请直接、简洁地回答。模板："[关键实体]的[查询属性]是[提取的值]。"
+        *   *示例*: "产品B的价格是150。"
+    *   **如果找不到**: 如果在表格中找不到对应的行或列，导致无法回答，请使用这个固定的句子：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
+
+4.  **【绝对禁止】**:
+    *   严禁对表格内容进行任何形式的计算、总结或推断（除非用户明确要求）。
+    *   严禁使用表格之外的任何上下文信息。
+    *   严禁输出任何与答案无关的解释或对话。
+
+/no_think
+
+请严格按照以上指令，像一个数据分析师一样精确地完成任务。
+"""
+    messages = [
+        {"role": "system", "content": system_prompt_for_table_qa},
+        {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
+    ]
+    return messages

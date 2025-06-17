@@ -30,7 +30,15 @@ else:
 
 # --- 导入应用模块 (保持不变) ---
 from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
-from zhz_rag.llm.llm_interface import generate_answer_from_context, generate_expansion_and_entities, NO_ANSWER_PHRASE_ANSWER_CLEAN
+from zhz_rag.llm.llm_interface import (
+    generate_answer_from_context, 
+    generate_expansion_and_entities, 
+    NO_ANSWER_PHRASE_ANSWER_CLEAN
+)
+from zhz_rag.llm.rag_prompts import ( # <--- 新增的导入块
+    get_answer_generation_messages, 
+    get_table_qa_messages
+)
 from zhz_rag.llm.local_model_handler import LocalModelHandler
 from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
 from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
@@ -169,7 +177,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     log_data_for_finally: Dict[str, Any] = {}
 
     try:
-        # --- 答案缓存检查 (逻辑保持不变) ---
         cache_key = hashlib.md5(query_request.model_dump_json().encode('utf-8')).hexdigest()
         cached_response = app_ctx.answer_cache.get(cache_key)
         if cached_response is not None:
@@ -180,12 +187,11 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 "final_docs": [doc.model_dump() for doc in response_to_return.retrieved_sources],
                 "expanded_queries": ["FROM_CACHE"],
             }
-            return response_to_return # 直接返回，finally块会在之后执行
+            return response_to_return
 
         api_logger.info(f"FINAL ANSWER CACHE MISS for query: '{query_request.query}'")
         
-        # --- 1. 统一的LLM调用（规划阶段） ---
-        api_logger.info("--- Step 1: Performing unified LLM call for planning (Expansion & KG Extraction) ---")
+        api_logger.info("--- Step 1: Performing unified LLM call for planning (Expansion, KG Extraction, Filter) ---")
         llm_planning_output = await generate_expansion_and_entities(query_request.query)
 
         if not llm_planning_output:
@@ -193,25 +199,41 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
 
         expanded_queries = llm_planning_output.expanded_queries
         kg_extraction_info = llm_planning_output.extracted_entities_for_kg
+        # --- 核心修改：获取元数据过滤器 ---
+        metadata_filter = llm_planning_output.metadata_filter
         
-        # --- 2. 并行召回 ---
-        api_logger.info(f"--- Step 2: Starting parallel retrieval for {len(expanded_queries)} queries ---")
+        api_logger.info(f"--- Step 2: Starting parallel retrieval for {len(expanded_queries)} queries. Metadata Filter: {metadata_filter} ---")
         
-        # KG Retriever现在接收预处理好的实体信息
         kg_task = app_ctx.kg_retriever.retrieve(query_request.query, kg_extraction_info, query_request.top_k_kg)
         
-        # 其他召回器使用扩展后的查询列表
-        retrieval_tasks = [
-            run_with_semaphore(cpu_bound_semaphore, f"chroma.retrieve({q[:20]}..)", app_ctx.chroma_retriever.retrieve(q, query_request.top_k_vector)) for q in expanded_queries
-        ] + [
-            run_sync_with_semaphore(cpu_bound_semaphore, f"bm25.retrieve({q[:20]}..)", app_ctx.file_bm25_retriever.retrieve, q, query_request.top_k_bm25) for q in expanded_queries
-        ] + [
-            run_with_semaphore(cpu_bound_semaphore, "kg.retrieve", kg_task) # 将KG任务也加入列表
+        # --- 核心修改：将过滤器应用到 ChromaDB 召回任务中 ---
+        # 注意：我们只对ChromaDB使用元数据过滤，因为它支持最灵活的过滤。BM25和KG有自己的逻辑。
+        chroma_tasks = [
+            run_with_semaphore(
+                cpu_bound_semaphore, 
+                f"chroma.retrieve({q[:20]}..)", 
+                app_ctx.chroma_retriever.retrieve(
+                    q, 
+                    query_request.top_k_vector, 
+                    where_filter=metadata_filter  # <--- 将过滤器传递进去
+                )
+            ) for q in expanded_queries
         ]
+
+        bm25_tasks = [
+            run_sync_with_semaphore(
+                cpu_bound_semaphore, 
+                f"bm25.retrieve({q[:20]}..)", 
+                app_ctx.file_bm25_retriever.retrieve, 
+                q, 
+                query_request.top_k_bm25
+            ) for q in expanded_queries
+        ]
+
+        retrieval_tasks = chroma_tasks + bm25_tasks + [run_with_semaphore(cpu_bound_semaphore, "kg.retrieve", kg_task)]
 
         results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
         
-        # (处理召回结果的循环逻辑基本保持不变)
         all_retrieved_docs: List[RetrievedDocument] = []
         bm25_results_to_enrich: List[Dict[str, Any]] = []
         for task_result_group in results_from_gather:
@@ -230,7 +252,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 for res in bm25_results_to_enrich:
                     all_retrieved_docs.append(RetrievedDocument(source_type="keyword_bm25", content=texts_map.get(res['id'], ""), score=res.get('score'), metadata={"chunk_id": res['id']}))
         
-        # --- 3. 融合与答案生成 (逻辑保持不变) ---
         api_logger.info(f"--- Step 3: Fusing {len(all_retrieved_docs)} raw documents and generating final answer ---")
         if not all_retrieved_docs:
             final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
@@ -247,8 +268,29 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     for doc in final_context_docs_obj
                 ]
                 fused_context = "\n\n---\n\n".join(context_strings)
-                generated_final_answer = await generate_answer_from_context(query_request.query, fused_context)
-                final_answer = generated_final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN
+
+                # --- 核心修改：智能路由选择Prompt ---
+                # 检查最终上下文中是否包含表格元素
+                contains_table = any(
+                    doc.metadata.get("source_element_type") == "table" or  # <--- 修改键名
+                    doc.metadata.get("source_element_type") == "table_row_chunk" # <--- 修改键名
+                    for doc in final_context_docs_obj if doc.metadata
+                )
+
+                if contains_table:
+                    api_logger.info("Table detected in context. Using Table-QA prompt builder.")
+                    prompt_builder_to_use = get_table_qa_messages
+                else:
+                    api_logger.info("No table detected in context. Using general answer prompt builder.")
+                    prompt_builder_to_use = get_answer_generation_messages
+                
+                # 使用新的 V2 答案生成函数
+                generated_final_answer = await generate_answer_from_context(
+                    user_query=query_request.query, 
+                    context_str=fused_context,
+                    prompt_builder=prompt_builder_to_use
+                )
+                final_answer = generated_final_answer # v2函数已处理了None的情况
         
         response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs_obj)
         
@@ -263,6 +305,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
              api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
 
     except Exception as e:
+        # ... (异常处理逻辑保持不变)
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
         exception_occurred = e
         response_to_return = HybridRAGResponse(
@@ -272,7 +315,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         log_data_for_finally = { "final_answer": response_to_return.answer, "final_docs": [], "expanded_queries": [], }
 
     finally:
-        # (finally 块的日志记录逻辑保持不变)
+        # ... (日志记录逻辑保持不变)
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         interaction_log_entry = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -300,7 +343,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
              raise HTTPException(status_code=500, detail="Internal Server Error: Response generation failed unexpectedly.")
         
         return response_to_return
-
 
 if __name__ == "__main__":
     api_logger.info("Starting Standalone RAG API Service with Producer-Consumer Logger...")

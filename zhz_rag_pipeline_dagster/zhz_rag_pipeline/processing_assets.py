@@ -424,15 +424,24 @@ def clean_chunk_text_asset(
                 source_element_metadata_from_element_obj["item_level"] = element.level if hasattr(element, 'level') else element.get("level")
                 source_element_metadata_from_element_obj["ordered"] = element.ordered if hasattr(element, 'ordered') else element.get("ordered")
                 source_element_metadata_from_element_obj["item_number"] = element.item_number if hasattr(element, 'item_number') else element.get("item_number")
+            
+            
             elif isinstance(element, TableElement) or (isinstance(element, dict) and element.get("element_type") == "table"):
+                # --- 新逻辑开始 ---
+                element_text_content = "" # 先初始化
                 if hasattr(element, 'markdown_representation') and element.markdown_representation:
                     element_text_content = element.markdown_representation
-                elif hasattr(element, 'text_representation') and element.text_representation:
-                    element_text_content = element.text_representation
-                elif isinstance(element, dict):
-                    element_text_content = element.get("markdown_representation") or element.get("text_representation", "")
+                elif isinstance(element, dict): # 兼容字典形式
+                    element_text_content = element.get("markdown_representation", "")
+                
                 element_type_str = "table"
-                source_element_metadata_from_element_obj["caption"] = element.caption if hasattr(element, 'caption') else element.get("caption")
+                source_element_metadata_from_element_obj["caption"] = getattr(element, 'caption', element.get("caption") if isinstance(element, dict) else None)
+                
+                # 如果表格的Markdown表示本身不长，就直接把它作为一个完整的块
+                if element_text_content and len(element_text_content) <= config.max_element_text_length_before_split:
+                    context.log.info(f"  Table Element {element_idx} is short enough (len: {len(element_text_content)}). Treating as a single chunk.")
+                
+
             elif isinstance(element, CodeBlockElement) or (isinstance(element, dict) and element.get("element_type") == "code_block"):
                 element_text_content = element.code if hasattr(element, 'code') else element.get("code", "")
                 element_type_str = "code_block"

@@ -1,6 +1,7 @@
 # 文件: zhz_rag/core_rag/retrievers/chromadb_retriever.py
 
 import asyncio
+import json
 from typing import List, Dict, Any, Optional
 import chromadb
 import logging
@@ -66,47 +67,57 @@ class ChromaDBRetriever:
             logger.error(f"Failed to initialize ChromaDB client or collection: {e}", exc_info=True)
             raise
 
-    async def retrieve(self, query_text: str, n_results: int = 5, include_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]: 
+    async def retrieve(
+        self, 
+        query_text: str, 
+        n_results: int = 5, 
+        include_fields: Optional[List[str]] = None,
+        where_filter: Optional[Dict[str, Any]] = None  # <--- 新增参数
+    ) -> List[Dict[str, Any]]:
         if self._collection is None or self._embedding_function is None:
             logger.error("Retriever is not properly initialized.")
             return []
 
-        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
-        cache_key = f"{query_text}_{n_results}"
+        # --- 更新缓存键以包含过滤器 ---
+        cache_key_parts = [query_text, str(n_results)]
+        if where_filter:
+            # 将过滤器字典转换为稳定的字符串表示
+            filter_str = json.dumps(where_filter, sort_keys=True)
+            cache_key_parts.append(filter_str)
+        cache_key = "_".join(cache_key_parts)
+        
         async with self._retrieval_cache_lock:
-            # TTLCache 会自动处理过期，所以直接 get 即可
             cached_result = self._retrieval_cache.get(cache_key)
         
         if cached_result is not None:
-            logger.info(f"ChromaDB CACHE HIT for key: '{cache_key[:100]}...'")
+            logger.info(f"ChromaDB CACHE HIT for key with filter: '{cache_key[:100]}...'")
             return cached_result
         
         logger.info(f"ChromaDB CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
-        # --- 缓存检查结束 ---
+        if where_filter:
+            logger.info(f"Applying metadata filter: {where_filter}")
 
         logger.info(f"Retrieving documents for query: '{query_text[:100]}...' with n_results={n_results}")
         
         try:
-            # 1. (异步) 将查询文本向量化
-            logger.debug(f"Calling _embedding_function.embed_query with query: '{query_text[:50]}...'")
             query_embedding = await self._embedding_function.embed_query(query_text)
             
             if not query_embedding: 
                 logger.error(f"Failed to generate embedding for query: {query_text[:100]}")
                 return []
             
-            # 2. (异步) 在ChromaDB中查询
             def _blocking_query():
                 include_fields_query = include_fields if include_fields is not None else ["metadatas", "documents", "distances"]
+                # --- 核心修改：在查询时应用 where_filter ---
                 return self._collection.query(
                     query_embeddings=[query_embedding], 
                     n_results=n_results,
-                    include=include_fields_query 
+                    include=include_fields_query,
+                    where=where_filter  # <--- 应用过滤器
                 )
 
             results = await asyncio.to_thread(_blocking_query)
             
-            # 3. 处理并格式化结果
             retrieved_docs = []
             if results and results.get("ids") and results.get("ids")[0]:
                 ids_list = results["ids"][0]
@@ -130,22 +141,20 @@ class ChromaDBRetriever:
                         "source_type": "vector_chromadb"
                     })
                 
-                logger.info(f"Retrieved {len(retrieved_docs)} documents from ChromaDB.")
+                logger.info(f"Retrieved {len(retrieved_docs)} documents from ChromaDB (with filter: {where_filter is not None}).")
             else:
                 logger.info("No documents retrieved from ChromaDB for the query.")
 
-            # --- 更新: 存储到 TTLCache ---
             async with self._retrieval_cache_lock:
                 self._retrieval_cache[cache_key] = retrieved_docs
             logger.info(f"ChromaDB CACHED {len(retrieved_docs)} results for key: '{cache_key[:100]}...'")
-            # --- 缓存存储结束 ---
             return retrieved_docs
 
         except Exception as e:
             logger.error(f"Error during ChromaDB retrieval: {e}", exc_info=True)
             return []
-
-
+        
+        
     async def get_texts_by_ids(self, ids: List[str]) -> Dict[str, str]:
         """
         (异步) 根据提供的ID列表从ChromaDB集合中获取文档的文本内容。
