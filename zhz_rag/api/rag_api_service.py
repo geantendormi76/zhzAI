@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 import uuid
 from datetime import datetime, timezone
+from cachetools import TTLCache
+import hashlib # <--- 添加这一行
 
 # --- .env 文件加载 (保持不变) ---
 _current_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -69,7 +71,8 @@ class RAGAppContext:
     kg_retriever: KGRetriever
     file_bm25_retriever: FileBM25Retriever
     fusion_engine: FusionEngine
-
+    answer_cache: TTLCache
+    
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # (这部分所有组件的初始化代码都保持不变)
@@ -107,12 +110,15 @@ async def lifespan(app: FastAPI):
         
         fusion_engine_instance = FusionEngine(logger=api_logger, rrf_k=rrf_k_setting) # <--- 修改这里，只传递rrf_k
         
+        final_answer_cache = TTLCache(maxsize=100, ttl=900) # 缓存100个最终答案，存活15分钟
         
         app.state.rag_context = RAGAppContext(
             model_handler=model_handler, chroma_retriever=chroma_retriever_instance,
             kg_retriever=kg_retriever_instance, file_bm25_retriever=file_bm25_retriever_instance,
-            fusion_engine=fusion_engine_instance
+            fusion_engine=fusion_engine_instance,
+            answer_cache=final_answer_cache # <--- 添加这一行
         )
+        
         api_logger.info("--- RAG components initialized successfully. ---")
         asyncio.create_task(log_writer_task())
     except Exception as e:
@@ -152,7 +158,6 @@ async def run_sync_with_semaphore(semaphore: asyncio.Semaphore, func_name: str, 
 # --- API 端点 ---
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
-    # (try 块之前的所有代码都保持不变)
     api_logger.info(f"\n--- Received RAG query: '{query_request.query}' ---")
     start_time_total = datetime.now(timezone.utc)
     cpu_bound_semaphore = asyncio.Semaphore(int(os.getenv("RAG_CPU_CONCURRENCY_LIMIT", "2")))
@@ -160,17 +165,31 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     if not app_ctx:
         raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
 
-    final_answer_for_log = "Error: Processing incomplete"
-    final_context_docs_for_log: List[Dict[str, Any]] = []
-    expanded_queries_for_log: Optional[List[str]] = None
     response_to_return: Optional[HybridRAGResponse] = None
     exception_occurred: Optional[Exception] = None
     interaction_id_for_log = str(uuid.uuid4())
+    log_data_for_finally: Dict[str, Any] = {}
 
     try:
-        # (召回和融合的逻辑保持不变)
+        # --- 答案缓存检查 ---
+        cache_key = hashlib.md5(query_request.model_dump_json().encode('utf-8')).hexdigest()
+        cached_response = app_ctx.answer_cache.get(cache_key)
+        if cached_response is not None:
+            api_logger.info(f"FINAL ANSWER CACHE HIT for query: '{query_request.query}'")
+            response_to_return = cached_response
+            log_data_for_finally = {
+                "final_answer": response_to_return.answer,
+                "final_docs": [doc.model_dump() for doc in response_to_return.retrieved_sources],
+                "expanded_queries": ["FROM_CACHE"],
+            }
+            # 直接跳到 finally 块
+            return response_to_return
+
+        api_logger.info(f"FINAL ANSWER CACHE MISS for query: '{query_request.query}'")
+        
+        # --- 完整RAG流程 ---
         expanded_queries = await run_with_semaphore(cpu_bound_semaphore, "generate_expanded_queries", generate_expanded_queries(query_request.query))
-        expanded_queries_for_log = expanded_queries
+        
         retrieval_tasks = [
             run_with_semaphore(cpu_bound_semaphore, "chroma.retrieve", app_ctx.chroma_retriever.retrieve(q, query_request.top_k_vector)) for q in expanded_queries
         ] + [
@@ -179,7 +198,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             run_with_semaphore(cpu_bound_semaphore, "kg.retrieve", app_ctx.kg_retriever.retrieve(q, query_request.top_k_kg)) for q in expanded_queries
         ]
         results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
-        # (处理召回结果的循环保持不变)
+        
         all_retrieved_docs: List[RetrievedDocument] = []
         bm25_results_to_enrich: List[Dict[str, Any]] = []
         for task_result_group in results_from_gather:
@@ -199,19 +218,16 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     all_retrieved_docs.append(RetrievedDocument(source_type="keyword_bm25", content=texts_map.get(res['id'], ""), score=res.get('score'), metadata={"chunk_id": res['id']}))
         
         if not all_retrieved_docs:
-            final_answer_for_log = NO_ANSWER_PHRASE_ANSWER_CLEAN
-            response_to_return = HybridRAGResponse(answer=final_answer_for_log, original_query=query_request.query, retrieved_sources=[])
-        
-        if response_to_return is None:
+            final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+            final_context_docs_obj = []
+        else:
             final_context_docs_obj = await run_with_semaphore(
                 cpu_bound_semaphore, "fusion_engine.fuse_results",
                 app_ctx.fusion_engine.fuse_results(all_retrieved_docs, query_request.query, query_request.top_k_final)
             )
-            final_context_docs_for_log = [doc.model_dump(exclude_none=True) for doc in final_context_docs_obj]
             if not final_context_docs_obj:
-                final_answer_for_log = NO_ANSWER_PHRASE_ANSWER_CLEAN
+                final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
             else:
-                # 【【【【【 这里的 f-string 已被修复 】】】】】
                 context_strings = [
                     f"Source Type: {doc.source_type}, Score: {f'{doc.score:.4f}' if isinstance(doc.score, float) else doc.score}\nContent: {doc.content}"
                     for doc in final_context_docs_obj
@@ -221,32 +237,41 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     cpu_bound_semaphore, "generate_answer_from_context",
                     generate_answer_from_context(query_request.query, fused_context)
                 )
-                final_answer_for_log = generated_final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN
-            
-            response_to_return = HybridRAGResponse(answer=final_answer_for_log, original_query=query_request.query, retrieved_sources=final_context_docs_obj if final_context_docs_obj else [])
+                final_answer = generated_final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN
+        
+        response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs_obj)
+        
+        log_data_for_finally = {
+            "final_answer": final_answer,
+            "final_docs": [doc.model_dump() for doc in final_context_docs_obj],
+            "expanded_queries": expanded_queries,
+        }
+        
+        if response_to_return.answer != "Error: Processing failed due to " and not response_to_return.debug_info:
+             app_ctx.answer_cache[cache_key] = response_to_return
+             api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
 
     except Exception as e:
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
         exception_occurred = e
-        # (异常处理逻辑保持不变)
-        final_answer_for_log = f"Error: Processing failed due to {type(e).__name__}"
         response_to_return = HybridRAGResponse(
             answer=f"An internal error occurred: {str(e)}", original_query=query_request.query,
             retrieved_sources=[], debug_info={"error": str(e), "type": type(e).__name__}
         )
+        log_data_for_finally = {
+            "final_answer": response_to_return.answer,
+            "final_docs": [], "expanded_queries": [],
+        }
 
     finally:
-        # (finally 块中的所有逻辑，包括放入队列，都保持不变)
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
-        api_logger.info(f"!!!!!!!!!! FINALLY BLOCK ENTERED. ... !!!!!!!!!!")
-        current_final_answer = final_answer_for_log if 'final_answer_for_log' in locals() and final_answer_for_log is not None else "Error: final_answer_for_log not set in finally"
-        current_final_docs = final_context_docs_for_log if 'final_context_docs_for_log' in locals() and final_context_docs_for_log is not None else []
-        current_expanded_q_count = len(expanded_queries_for_log) if 'expanded_queries_for_log' in locals() and expanded_queries_for_log is not None else 0
         interaction_log_entry = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "task_type": "rag_query_processing_full_log", "original_user_query": query_request.query,
-            "final_answer_from_llm": current_final_answer, "final_context_docs_full": current_final_docs,
-            "retrieval_parameters": query_request.model_dump(), "expanded_queries_count": current_expanded_q_count,
+            "final_answer_from_llm": log_data_for_finally.get("final_answer", "N/A"),
+            "final_context_docs_full": log_data_for_finally.get("final_docs", []),
+            "retrieval_parameters": query_request.model_dump(),
+            "expanded_queries_count": len(log_data_for_finally.get("expanded_queries", [])),
             "processing_time_seconds": round(processing_time_seconds, 3)
         }
         if exception_occurred:
@@ -255,17 +280,20 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         
         try:
             await log_queue.put(interaction_log_entry)
-            api_logger.info(f"!!!!!!!!!! FINALLY BLOCK: Full RAG interaction log ADDED TO QUEUE. !!!!!!!!!!")
+            api_logger.info(f"Log queue put successful for interaction: {interaction_id_for_log}")
         except Exception as log_e_final:
-            api_logger.error(f"!!!!!!!!!! FINALLY BLOCK CRITICAL ERROR: ...", exc_info=True)
+            api_logger.error(f"Failed to queue log for interaction {interaction_id_for_log}: {log_e_final}", exc_info=True)
         
         if exception_occurred:
             raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(exception_occurred)}")
+        
         if response_to_return is None:
              raise HTTPException(status_code=500, detail="Internal Server Error: Response generation failed unexpectedly.")
+        
         return response_to_return
 
-# --- Main execution block (保持不变) ---
+
+
 if __name__ == "__main__":
     api_logger.info("Starting Standalone RAG API Service with Producer-Consumer Logger...")
     uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=False)

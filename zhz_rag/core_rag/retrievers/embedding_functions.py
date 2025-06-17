@@ -5,6 +5,7 @@ from typing import List, Dict, TYPE_CHECKING, Optional, Sequence
 import numpy as np
 from chromadb import Documents, Embeddings
 import asyncio # 确保 asyncio 已导入
+from cachetools import TTLCache
 
 if TYPE_CHECKING:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
@@ -52,7 +53,7 @@ class LlamaCppEmbeddingFunction:
         self._dimension: Optional[int] = None
         
         # --- 新增：初始化查询缓存和异步锁 ---
-        self._query_cache: Dict[str, List[float]] = {}
+        self._query_cache: TTLCache = TTLCache(maxsize=200, ttl=3600) # 缓存200个查询向量，存活1小时
         self._cache_lock = asyncio.Lock()
         
         try:
@@ -113,7 +114,7 @@ class LlamaCppEmbeddingFunction:
         return await self.__call__(input=list(texts))
 
     async def embed_query(self, text: str) -> List[float]:
-        if not text:
+        if not text or not text.strip():
             async with self._cache_lock:
                 if self._dimension is None:
                     dim_from_handler = self.model_handler.get_embedding_dimension()
@@ -121,14 +122,16 @@ class LlamaCppEmbeddingFunction:
                         dim_from_handler = await self.model_handler._get_embedding_dimension_from_worker_once()
                     self._dimension = dim_from_handler
             return [0.0] * (self._dimension or 1024) if self._dimension else []
-        
-        # --- 缓存检查 (Cache Check) ---
+
+        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
         async with self._cache_lock:
-            if text in self._query_cache:
-                logger.info(f"Cache HIT for query: '{text[:50]}...'")
-                return self._query_cache[text]
+            cached_result = self._query_cache.get(text)
         
-        logger.info(f"Cache MISS for query: '{text[:50]}...'. Generating new embedding.")
+        if cached_result is not None:
+            logger.info(f"Query Vector CACHE HIT for query: '{text[:50]}...'")
+            return cached_result
+        
+        logger.info(f"Query Vector CACHE MISS for query: '{text[:50]}...'. Generating new embedding.")
         
         # 调用模型生成向量
         embedding_vector = await self.model_handler.embed_query(text)
@@ -146,14 +149,16 @@ class LlamaCppEmbeddingFunction:
                 # 存储到缓存
                 self._query_cache[text] = embedding_vector
                 logger.info(f"Cached new embedding for query: '{text[:50]}...'")
-            return embedding_vector
         else: # embed_query 返回了 None 或空列表
             logger.warning(f"Failed to generate embedding for query: '{text[:50]}...'. Returning empty list or zero vector.")
             async with self._cache_lock:
                 if self._dimension is None:
                     dim_from_handler = await self.model_handler._get_embedding_dimension_from_worker_once()
                     self._dimension = dim_from_handler
-            return [0.0] * (self._dimension or 1024) if self._dimension else []
+            # 即使生成失败，也返回一个正确维度的零向量
+            embedding_vector = [0.0] * (self._dimension or 1024) if self._dimension else []
+
+        return embedding_vector
     
     async def get_dimension(self) -> Optional[int]:
         if self._dimension is None:

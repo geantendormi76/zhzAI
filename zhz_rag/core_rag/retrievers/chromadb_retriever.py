@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import chromadb
 import logging
 from .embedding_functions import LlamaCppEmbeddingFunction
+from cachetools import TTLCache # <--- 添加这一行
 
 # 配置ChromaDBRetriever的日志记录器
 logger = logging.getLogger(__name__)
@@ -34,8 +35,10 @@ class ChromaDBRetriever:
         self._collection: Optional[chromadb.Collection] = None
         self._dimension: Optional[int] = None
 
-        # --- 新增: 初始化召回结果缓存和异步锁 ---
-        self._retrieval_cache: Dict[str, List[Dict[str, Any]]] = {}
+    # --- 新增: 初始化TTLCache召回结果缓存和异步锁 ---
+        # maxsize=100: 最多缓存100个查询结果
+        # ttl=300: 缓存条目存活300秒（5分钟）
+        self._retrieval_cache: TTLCache = TTLCache(maxsize=100, ttl=300)
         self._retrieval_cache_lock = asyncio.Lock()
 
         # 初始化依然是同步的，在服务启动时执行
@@ -68,12 +71,16 @@ class ChromaDBRetriever:
             logger.error("Retriever is not properly initialized.")
             return []
 
-        # --- 新增: 缓存检查 ---
-        cache_key = f"{query_text}_{n_results}" # 使用查询文本和n_results作为联合键
+        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
+        cache_key = f"{query_text}_{n_results}"
         async with self._retrieval_cache_lock:
-            if cache_key in self._retrieval_cache:
-                logger.info(f"ChromaDB CACHE HIT for key: '{cache_key[:100]}...'")
-                return self._retrieval_cache[cache_key]
+            # TTLCache 会自动处理过期，所以直接 get 即可
+            cached_result = self._retrieval_cache.get(cache_key)
+        
+        if cached_result is not None:
+            logger.info(f"ChromaDB CACHE HIT for key: '{cache_key[:100]}...'")
+            return cached_result
+        
         logger.info(f"ChromaDB CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
         # --- 缓存检查结束 ---
 
@@ -127,17 +134,18 @@ class ChromaDBRetriever:
             else:
                 logger.info("No documents retrieved from ChromaDB for the query.")
 
-            # --- 新增: 存储到缓存 ---
+            # --- 更新: 存储到 TTLCache ---
             async with self._retrieval_cache_lock:
                 self._retrieval_cache[cache_key] = retrieved_docs
-                logger.info(f"ChromaDB CACHED {len(retrieved_docs)} results for key: '{cache_key[:100]}...'")
+            logger.info(f"ChromaDB CACHED {len(retrieved_docs)} results for key: '{cache_key[:100]}...'")
             # --- 缓存存储结束 ---
             return retrieved_docs
 
         except Exception as e:
             logger.error(f"Error during ChromaDB retrieval: {e}", exc_info=True)
             return []
-            
+
+
     async def get_texts_by_ids(self, ids: List[str]) -> Dict[str, str]:
         """
         (异步) 根据提供的ID列表从ChromaDB集合中获取文档的文本内容。
@@ -172,56 +180,3 @@ class ChromaDBRetriever:
         except Exception as e:
             logger.error(f"ChromaDBRetriever: Error during get_texts_by_ids: {e}", exc_info=True)
             return {id_val: f"[Error retrieving content for ID {id_val}]" for id_val in ids}
-
-# 简单的本地测试代码
-async def main_test():
-    logger.info("--- ChromaDBRetriever Async Test ---")
-    
-    try:
-        from zhz_rag.llm.local_model_handler import LocalModelHandler
-        from dotenv import load_dotenv
-        import os
-        load_dotenv()
-        
-        # 假设 LocalModelHandler 已经正确配置并可以实例化
-        model_handler = LocalModelHandler(
-            embedding_model_path=os.getenv("EMBEDDING_MODEL_PATH"),
-            n_gpu_layers_embed=int(os.getenv("EMBEDDING_N_GPU_LAYERS", 0))
-        )
-        
-        embed_fn = LlamaCppEmbeddingFunction(model_handler)
-        
-        retriever = ChromaDBRetriever(
-            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"),
-            persist_directory=os.getenv("CHROMA_PERSIST_DIRECTORY"),
-            embedding_function=embed_fn
-        )
-        
-        test_query = "人工智能的应用有哪些？"
-        
-        print("\n--- First Retrieval ---")
-        retrieved_results = await retriever.retrieve(test_query, n_results=3)
-        
-        if retrieved_results:
-            print(f"Retrieved {len(retrieved_results)} results.")
-        else:
-            print("No results retrieved.")
-
-        print("\n--- Second Retrieval (should hit cache) ---")
-        retrieved_results_cached = await retriever.retrieve(test_query, n_results=3)
-
-        if retrieved_results_cached:
-            print(f"Retrieved {len(retrieved_results_cached)} results from cache.")
-        else:
-            print("No results retrieved from cache.")
-        
-        # 关闭模型处理器中的进程池
-        model_handler.close_embedding_pool()
-            
-    except Exception as e:
-        print(f"An error occurred during the test: {e}")
-        import traceback
-        traceback.print_exc()
-
-if __name__ == '__main__':
-    asyncio.run(main_test())

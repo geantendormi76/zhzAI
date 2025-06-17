@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional, Iterator, TYPE_CHECKING
 import logging
 from contextlib import contextmanager
 import asyncio
+from cachetools import TTLCache # <--- 添加这一行
 if TYPE_CHECKING:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
 
@@ -38,8 +39,8 @@ class KGRetriever:
     def __init__(self, db_file_path: Optional[str] = None, embedder: Optional['LocalModelHandler'] = None):
         self.db_file_path = db_file_path if db_file_path else self.DUCKDB_KG_FILE_PATH_ENV
         self._embedder = embedder
-        self._retrieval_cache: Dict[str, List[Dict[str, Any]]] = {} # <--- 添加此行
-        self._retrieval_cache_lock = asyncio.Lock() # <--- 添加此行
+        self._retrieval_cache: TTLCache = TTLCache(maxsize=100, ttl=300) # <--- 修改这一行
+        self._retrieval_cache_lock = asyncio.Lock()
         kg_logger.info(f"KGRetriever (DuckDB) initialized. DB file path set to: {self.db_file_path}")
 
         if not os.path.exists(self.db_file_path):
@@ -183,15 +184,17 @@ class KGRetriever:
     async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         kg_logger.info(f"Starting DuckDB KG retrieval for query: '{user_query}', top_k: {top_k}")
 
-        # --- 添加：缓存检查 ---
+        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
         cache_key = f"{user_query}_{top_k}"
         async with self._retrieval_cache_lock:
-            if cache_key in self._retrieval_cache:
-                kg_logger.info(f"KG CACHE HIT for key: '{cache_key[:100]}...'")
-                return self._retrieval_cache[cache_key]
+            cached_result = self._retrieval_cache.get(cache_key)
+
+        if cached_result is not None:
+            kg_logger.info(f"KG CACHE HIT for key: '{cache_key[:100]}...'")
+            return cached_result
+        
         kg_logger.info(f"KG CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
         # --- 缓存检查结束 ---
-
 
         if not self._embedder:
             kg_logger.error("Embedder not configured for KGRetriever. Vector search will be skipped.")
@@ -219,8 +222,7 @@ class KGRetriever:
                 query_vector_list = await self._embedder.embed_query(user_query)
                 if query_vector_list:
                     vector_search_sql = "SELECT id_prop, text, label, list_distance(embedding, ?) AS distance FROM ExtractedEntity ORDER BY distance ASC LIMIT ?;"
-                    kg_logger.info(f"Executing DuckDB vector search. Top K: {top_k}")
-                    vector_results = self._execute_duckdb_sql_query_sync(vector_search_sql, [query_vector_list, top_k], user_query_context=user_query)
+                    vector_results = self._execute_duckdb_sql_query_sync(vector_search_sql, [query_vector_list, top_k])
                     if vector_results:
                         for rec in vector_results: rec["_source_strategy"] = "vector_search"
                         all_retrieved_records.extend(vector_results)
@@ -237,7 +239,6 @@ class KGRetriever:
                 entity_text_norm = normalize_text_for_id(entity_info.text)
                 entity_label_norm = entity_info.label.upper()
                 exact_entity_sql = "SELECT id_prop, text, label FROM ExtractedEntity WHERE text = ? AND label = ? LIMIT 1;"
-                kg_logger.info(f"Executing exact entity lookup for: text='{entity_text_norm}', label='{entity_label_norm}'")
                 entity_lookup_results = self._execute_duckdb_sql_query_sync(exact_entity_sql, [entity_text_norm, entity_label_norm])
                 for rec in entity_lookup_results:
                     if rec.get("id_prop") not in processed_entity_ids:
@@ -245,7 +246,7 @@ class KGRetriever:
                         all_retrieved_records.append(rec)
                         processed_entity_ids.add(rec.get("id_prop"))
 
-        # 4. 【核心修改】基于LLM提取的结构化关系进行验证和邻居查找
+        # 4. 基于LLM提取的结构化关系进行验证和邻居查找
         if extracted_info and extracted_info.relations:
             kg_logger.info(f"Found {len(extracted_info.relations)} structured relations to process.")
             for rel_item in extracted_info.relations:
@@ -268,42 +269,35 @@ class KGRetriever:
                     """
                     relation_verification_params = [head_text_norm, head_label_norm, tail_text_norm, tail_label_norm, relation_type_norm]
                     
-                    # --- 在这里添加精准日志记录 ---
                     log_entry = {
                         "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                         "task_type": "kg_executed_query_for_eval", "user_query_for_task": user_query,
                         "generated_query_language": "SQL_DuckDB", "generated_query": relation_verification_sql.strip(),
-                        "query_parameters": [str(p) for p in relation_verification_params], # 记录参数
+                        "query_parameters": [str(p) for p in relation_verification_params],
                         "application_version": "kg_retriever_0.2_rel_verify"
                     }
                     try:
                         asyncio.create_task(log_interaction_data(log_entry))
                     except Exception as e_log:
                         kg_logger.error(f"Error queuing precise log for relation verification query: {e_log}", exc_info=True)
-                    # --- 日志记录结束 ---
 
                     relation_verification_results = self._execute_duckdb_sql_query_sync(relation_verification_sql, relation_verification_params)
                     
                     if relation_verification_results:
                         kg_logger.info(f"    Successfully verified relation in KG: {relation_type_norm} between '{head_text_norm}' and '{tail_text_norm}'")
                         
-                        # 将参与已验证关系的核心实体（如果尚未添加）加入召回结果
                         for verified_rel_record in relation_verification_results:
-                            # 添加头实体
                             head_entity_from_rel = {"id_prop": verified_rel_record.get("source_id_prop"), "text": verified_rel_record.get("source_text"), "label": verified_rel_record.get("source_label"), "_source_strategy": f"verified_relation_head_{relation_type_norm}"}
                             if head_entity_from_rel.get("id_prop") not in processed_entity_ids:
                                 all_retrieved_records.append(head_entity_from_rel)
                                 processed_entity_ids.add(head_entity_from_rel.get("id_prop"))
                                 kg_logger.info(f"      Added head entity '{head_entity_from_rel.get('text')}' from verified relation to results.")
-                            # 添加尾实体
                             tail_entity_from_rel = {"id_prop": verified_rel_record.get("target_id_prop"), "text": verified_rel_record.get("target_text"), "label": verified_rel_record.get("target_label"), "_source_strategy": f"verified_relation_tail_{relation_type_norm}"}
                             if tail_entity_from_rel.get("id_prop") not in processed_entity_ids:
                                 all_retrieved_records.append(tail_entity_from_rel)
                                 processed_entity_ids.add(tail_entity_from_rel.get("id_prop"))
                                 kg_logger.info(f"      Added tail entity '{tail_entity_from_rel.get('text')}' from verified relation to results.")
                         
-                        # --- 步骤 4b: 新增 - 查找与已验证关系相关的邻居实体 ---
-                        # 1. 查找与头实体通过该关系连接的其他尾实体
                         if head_text_norm and head_label_norm and relation_type_norm:
                             find_other_tails_sql = """
                             SELECT t.id_prop, t.text, t.label, r.relation_type
@@ -314,7 +308,6 @@ class KGRetriever:
                             LIMIT ?;
                             """
                             find_other_tails_params = [head_text_norm, head_label_norm, relation_type_norm, tail_text_norm, top_k]
-                            kg_logger.info(f"      Finding other tails for ({head_text_norm})-[{relation_type_norm}]->(not {tail_text_norm})")
                             other_tails_results = self._execute_duckdb_sql_query_sync(find_other_tails_sql, find_other_tails_params)
                             for rec in other_tails_results:
                                 if rec.get("id_prop") not in processed_entity_ids:
@@ -323,7 +316,6 @@ class KGRetriever:
                                     processed_entity_ids.add(rec.get("id_prop"))
                                     kg_logger.info(f"        Added neighbor tail entity '{rec.get('text')}' to results.")
 
-                        # 2. 查找与尾实体通过该关系（反向）连接的其他头实体
                         if tail_text_norm and tail_label_norm and relation_type_norm:
                             find_other_heads_sql = """
                             SELECT h.id_prop, h.text, h.label, r.relation_type
@@ -334,7 +326,6 @@ class KGRetriever:
                             LIMIT ?;
                             """
                             find_other_heads_params = [tail_text_norm, tail_label_norm, relation_type_norm, head_text_norm, top_k]
-                            kg_logger.info(f"      Finding other heads for (not {head_text_norm})-[{relation_type_norm}]->({tail_text_norm})")
                             other_heads_results = self._execute_duckdb_sql_query_sync(find_other_heads_sql, find_other_heads_params)
                             for rec in other_heads_results:
                                 if rec.get("id_prop") not in processed_entity_ids:
@@ -352,11 +343,9 @@ class KGRetriever:
             kg_logger.info(f"No records retrieved from DuckDB KG for query: '{user_query}' after all strategies.")
             return []
 
-        # 去重，因为多种策略可能找到相同的结果
         unique_records = []
         seen_ids = set()
         for record in all_retrieved_records:
-            # 使用 id_prop 或 source_id_prop 进行去重
             record_id = record.get("id_prop") or record.get("source_id_prop")
             if record_id and record_id in seen_ids:
                 continue
@@ -364,13 +353,12 @@ class KGRetriever:
             if record_id:
                 seen_ids.add(record_id)
         
-        # 格式化最终输出
         formatted_docs = self._format_duckdb_records_for_retrieval(unique_records, user_query, "duckdb_kg")
         
-        # --- 添加：存储到缓存 ---
+        # --- 更新: 存储到 TTLCache ---
         async with self._retrieval_cache_lock:
             self._retrieval_cache[cache_key] = formatted_docs
-            kg_logger.info(f"KG CACHED {len(formatted_docs)} results for key: '{cache_key[:100]}...'")
+        kg_logger.info(f"KG CACHED {len(formatted_docs)} results for key: '{cache_key[:100]}...'")
         # --- 缓存存储结束 ---
 
         kg_logger.info(f"KGRetriever (DuckDB) retrieve method finished. Returning {len(formatted_docs)} formatted documents for fusion.")

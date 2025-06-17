@@ -9,7 +9,7 @@ import logging
 import numpy as np
 import traceback
 import asyncio
-
+from cachetools import TTLCache # <--- 添加这一行
 
 # 配置日志记录器
 logger = logging.getLogger(__name__)
@@ -29,9 +29,8 @@ class FileBM25Retriever:
 
         self._bm25_model: Optional[bm25s.BM25] = None
         self._doc_ids: Optional[List[str]] = None
-        # 用于缓存检索结果的字典
-        self._retrieval_cache: Dict[str, List[Dict[str, Any]]] = {}
-
+        # --- 使用 TTLCache 初始化缓存 ---
+        self._retrieval_cache: TTLCache = TTLCache(maxsize=100, ttl=300)
         self._initialize_retriever()
 
     def _initialize_retriever(self):
@@ -89,11 +88,13 @@ class FileBM25Retriever:
             logger.error("BM25 Retriever is not properly initialized.")
             return []
 
-        # --- 添加：缓存检查 ---
+        # --- 更新: 使用 TTLCache 进行缓存检查 ---
         cache_key = f"{query_text}_{n_results}"
-        if cache_key in self._retrieval_cache:
+        # BM25是同步的，所以我们不需要异步锁，可以直接访问缓存
+        cached_result = self._retrieval_cache.get(cache_key)
+        if cached_result is not None:
             logger.info(f"BM25 CACHE HIT for key: '{cache_key[:100]}...'")
-            return self._retrieval_cache[cache_key]
+            return cached_result
         logger.info(f"BM25 CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
         # --- 缓存检查结束 ---
 
@@ -130,7 +131,7 @@ class FileBM25Retriever:
                 else:
                     logger.warning(f"BM25 retrieval: Index {index} out of bounds for doc_ids list (len: {len(self._doc_ids)}). Skipping.")
 
-            # --- 添加：存储到缓存 ---
+            # --- 更新: 存储到 TTLCache ---
             self._retrieval_cache[cache_key] = retrieved_docs
             logger.info(f"BM25 CACHED {len(retrieved_docs)} results for key: '{cache_key[:100]}...'")
             # --- 缓存存储结束 ---
@@ -141,56 +142,4 @@ class FileBM25Retriever:
         except Exception as e:
             logger.error(f"Error during BM25 retrieval: {e}", exc_info=True)
             return []
-
-def main_sync_test_runner():
-    """
-    用于独立测试 FileBM25Retriever 的主函数。
-    """
-    logger.info("--- FileBM25Retriever Sync Test Runner ---")
-    try:
-        # 尝试从环境变量或默认路径获取索引目录
-        bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY", "/home/zhz/zhz_agent/zhz_rag/stored_data/bm25_index")
         
-        if not os.path.isdir(bm25_index_dir):
-            # 如果默认路径不存在，尝试备用路径
-            bm25_index_dir_dagster = "/home/zhz/dagster_home/bm25_index_data/"
-            if os.path.isdir(bm25_index_dir_dagster):
-                bm25_index_dir = bm25_index_dir_dagster
-            else:
-                logger.error(f"BM25 index directory for test not found at {bm25_index_dir} or {bm25_index_dir_dagster}")
-                return
-        
-        logger.info(f"Using BM25 index directory for test: {bm25_index_dir}")
-        retriever = FileBM25Retriever(index_directory=bm25_index_dir)
-        
-        test_query = "人工智能的应用有哪些？"
-        
-        # 第一次查询，应该未命中缓存
-        print("\n--- First retrieval (should be CACHE MISS) ---")
-        retrieved_results = retriever.retrieve(test_query, n_results=3)
-        if retrieved_results:
-            print(f"--- BM25 Retrieved Results for query: '{test_query}' ---")
-            for i, doc in enumerate(retrieved_results):
-                print(f"Result {i+1}: ID: {doc['id']}, Score: {doc['score']:.4f}, Source: {doc.get('source_type')}")
-        else:
-            print(f"\nNo results for query: '{test_query}'")
-        
-        # 第二次查询，应该命中缓存
-        print("\n--- Second retrieval (should be CACHE HIT) ---")
-        retrieved_results_cached = retriever.retrieve(test_query, n_results=3)
-        if retrieved_results_cached:
-            print(f"--- Cached BM25 Retrieved Results for query: '{test_query}' ---")
-            for i, doc in enumerate(retrieved_results_cached):
-                print(f"Result {i+1}: ID: {doc['id']}, Score: {doc['score']:.4f}, Source: {doc.get('source_type')}")
-        else:
-            print(f"\nNo results for cached query: '{test_query}'")
-
-
-    except Exception as e:
-        print(f"An error occurred during the BM25 test: {e}")
-        traceback.print_exc()
-
-if __name__ == '__main__':
-    # 配置顶层日志记录器，以便在独立运行时能看到日志输出
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    main_sync_test_runner()
