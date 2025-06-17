@@ -1,5 +1,4 @@
 # 文件: zhz_rag/utils/common_utils.py
-# 版本: 最终版 - 所有路径统一到 zhz_rag/stored_data/
 
 import httpx
 import json
@@ -14,6 +13,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 import re
 import unicodedata
+import glob
 
 load_dotenv()
 
@@ -132,3 +132,44 @@ def normalize_text_for_id(text: str) -> str:
         return re.sub(r'\s+', ' ', normalized_text)
     except Exception:
         return text
+
+def find_latest_rag_interaction_log(log_dir: str) -> Optional[str]:
+    """
+    Finds the latest RAG interaction log file in a given directory.
+    This is useful for evaluation scripts.
+    """
+    # 确保我们使用的是此模块自己的 logger
+    from .interaction_logger import interaction_logger_module_logger as logger
+    logger.debug(f"Searching for RAG interaction logs in: {log_dir}")
+    rag_log_pattern = os.path.join(log_dir, "rag_interactions_*.jsonl")
+    candidate_rag_logs = glob.glob(rag_log_pattern)
+    if candidate_rag_logs:
+        candidate_rag_logs.sort(key=os.path.getmtime, reverse=True)
+        logger.info(f"Automatically selected RAG interaction log: {candidate_rag_logs[0]}")
+        return candidate_rag_logs[0]
+    else:
+        logger.warning(f"No RAG interaction log files found matching pattern: {rag_log_pattern} in directory {log_dir}")
+        return None
+
+def load_jsonl_file(filepath: str, encoding: str = 'utf-8') -> List[Dict[str, Any]]:
+    """
+    Loads a .jsonl file line by line into a list of dictionaries.
+    """
+    from .interaction_logger import interaction_logger_module_logger as logger
+    data_list: List[Dict[str, Any]] = []
+    if not os.path.exists(filepath):
+        logger.error(f"File not found: {filepath}")
+        return data_list
+    try:
+        with open(filepath, 'r', encoding=encoding) as f:
+            for line_number, line in enumerate(f, 1):
+                try:
+                    if line.strip():
+                        data_list.append(json.loads(line.strip()))
+                except json.JSONDecodeError as e_json:
+                    logger.warning(f"Skipping malformed JSON line {line_number} in {filepath}: {e_json}")
+    except Exception as e_file:
+        logger.error(f"Error reading or processing file {filepath}: {e_file}", exc_info=True)
+        return []
+    logger.info(f"Successfully loaded {len(data_list)} entries from {filepath}")
+    return data_list

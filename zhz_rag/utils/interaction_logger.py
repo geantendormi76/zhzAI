@@ -5,6 +5,7 @@ import asyncio
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 import logging
+import aiofiles  # 使用 aiofiles 进行异步文件操作
 import uuid
 import traceback
 
@@ -37,6 +38,25 @@ _STORED_DATA_ROOT_DIR_IL = os.path.join(_ZHZ_RAG_PACKAGE_DIR_IL, 'stored_data')
 RAG_INTERACTION_LOGS_DIR_DEFAULT = os.path.join(_STORED_DATA_ROOT_DIR_IL, 'rag_interaction_logs')
 EVALUATION_RESULTS_LOGS_DIR_DEFAULT = os.path.join(_STORED_DATA_ROOT_DIR_IL, 'evaluation_results_logs')
 
+
+async def _async_write_to_jsonl_robust(filepath: str, interaction_json_string: str):
+    """
+    一个健壮的异步函数，用于将字符串追加到文件。
+    使用了 aiofiles 库来避免阻塞事件循环。
+    """
+    logger_to_use = interaction_logger_module_logger
+    logger_to_use.debug(f"ASYNC_WRITE_ROBUST: Attempting to write to {filepath}")
+    try:
+        async with aiofiles.open(filepath, mode='a', encoding='utf-8') as f:
+            await f.write(interaction_json_string)
+            await f.flush() # aiofiles 的 flush 也是异步的
+        logger_to_use.debug(f"ASYNC_WRITE_ROBUST: Successfully wrote and flushed to {filepath}")
+    except Exception as e:
+        logger_to_use.error(f"CRITICAL_LOG_FAILURE in _async_write_to_jsonl_robust: Failed to write to {filepath}. Error: {e}", exc_info=True)
+        # 备用方案
+        # print(f"CRITICAL_LOG_FAILURE: Could not write to {filepath}. Error: {e}")
+        # traceback.print_exc()
+
 def _sync_write_to_jsonl_robust(filepath: str, interaction_json_string: str):
     """
     一个健壮的同步函数，用于将字符串追加到文件，并确保数据刷入磁盘。
@@ -46,7 +66,7 @@ def _sync_write_to_jsonl_robust(filepath: str, interaction_json_string: str):
     try:
         # 'a' for append. '+' is not strictly needed for 'a' as it creates the file if it doesn't exist.
         with open(filepath, 'a', encoding='utf-8') as f:
-            f.write(interaction_json_string + "\n")
+            f.write(interaction_json_string)
             # 步骤1: 确保Python应用层缓冲区的内容写入操作系统缓冲区
             f.flush()
             # 步骤2: 请求操作系统将缓冲区内容实际写入磁盘，提供最强保证
@@ -55,69 +75,50 @@ def _sync_write_to_jsonl_robust(filepath: str, interaction_json_string: str):
     except Exception as e:
         # 这种底层的关键日志如果失败，需要非常明确的错误提示
         logger_to_use.error(f"CRITICAL_LOG_FAILURE in _sync_write_to_jsonl_robust: Failed to write to {filepath}. Error: {e}", exc_info=True)
-        # 如果logger可能没有配置好，可以取消下面的注释作为备用方案
-        # print(f"CRITICAL_LOG_FAILURE in _sync_write_to_jsonl_robust: Failed to write to {filepath}. Error: {e}")
-        # traceback.print_exc()
+
 
 async def log_interaction_data(
-    interaction_data: Dict[str, Any],
+    log_data: Dict[str, Any],
     is_evaluation_result: bool = False,
-    evaluation_name_for_file: Optional[str] = None,
-    custom_log_dir: Optional[str] = None
+    evaluation_name_for_file: Optional[str] = None
 ):
     """
-    异步将单条交互数据或评估结果追加到按天分割的JSONL文件中，
-    此过程使用一个健壮的写入方法以确保数据持久化。
+    Asynchronously logs interaction data to a JSONL file in the appropriate directory.
 
     Args:
-        interaction_data (Dict[str, Any]): 要记录的交互数据字典。
-        is_evaluation_result (bool): 如果为True，则记录到评估结果目录。默认为False。
-        evaluation_name_for_file (Optional[str]): 如果是评估结果，用于文件名中区分评估类型。
-        custom_log_dir (Optional[str]): 自定义日志目录路径，如果提供则覆盖默认目录。
+        log_data (Dict[str, Any]): The dictionary containing the data to log.
+        is_evaluation_result (bool): If True, logs to the evaluation results directory. 
+                                     Otherwise, logs to the standard RAG interaction directory.
+        evaluation_name_for_file (Optional[str]): A specific name for the evaluation file, e.g., 'answer_gemini'.
     """
-    logger_to_use = interaction_logger_module_logger
-    filepath = "" # 初始化filepath以备在异常处理中使用
     try:
-        # --- 数据准备逻辑 ---
-        today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        
+        # --- 修正：根据 is_evaluation_result 选择正确的目录 ---
         if is_evaluation_result:
-            base_dir = custom_log_dir if custom_log_dir else EVALUATION_RESULTS_LOGS_DIR_DEFAULT
-            file_prefix = "eval_results"
-            if evaluation_name_for_file:
-                file_prefix += f"_{evaluation_name_for_file}"
+            target_dir = os.getenv("EVALUATION_RESULTS_LOGS_DIR", EVALUATION_RESULTS_LOGS_DIR_DEFAULT)
+            if not evaluation_name_for_file:
+                evaluation_name_for_file = "default_eval"
+            # 文件名格式: eval_results_指定的名称_日期.jsonl
+            log_filename = f"eval_results_{evaluation_name_for_file}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.jsonl"
         else:
-            base_dir = custom_log_dir if custom_log_dir else RAG_INTERACTION_LOGS_DIR_DEFAULT
-            file_prefix = "rag_interactions"
-            
-        log_filename = f"{file_prefix}_{today_str}.jsonl"
-        filepath = os.path.join(base_dir, log_filename)
+            target_dir = os.getenv("RAG_INTERACTION_LOGS_DIR", RAG_INTERACTION_LOGS_DIR_DEFAULT)
+            # 文件名格式: rag_interactions_日期.jsonl
+            log_filename = f"rag_interactions_{datetime.now(timezone.utc).strftime('%Y%m%d')}.jsonl"
 
-        if not os.path.exists(base_dir):
-            try:
-                os.makedirs(base_dir, exist_ok=True)
-                logger_to_use.info(f"Created log directory: {base_dir}")
-            except Exception as e_mkdir:
-                logger_to_use.error(f"Failed to create log directory {base_dir}: {e_mkdir}", exc_info=True)
-                # 如果目录创建失败，直接返回，避免后续操作引发更多错误
-                return
+        # 确保目标目录存在
+        os.makedirs(target_dir, exist_ok=True)
+        log_filepath = os.path.join(target_dir, log_filename)
 
-        # 确保时间戳和ID存在
-        if "timestamp_utc" not in interaction_data:
-            interaction_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
-        if "interaction_id" not in interaction_data:
-            interaction_data["interaction_id"] = str(uuid.uuid4())
+        # 准备要写入的JSON字符串
+        # 确保时间戳是字符串格式，避免JSON序列化问题
+        if 'timestamp_utc' in log_data and isinstance(log_data['timestamp_utc'], datetime):
+             log_data['timestamp_utc'] = log_data['timestamp_utc'].isoformat()
         
-        # 将字典转换为JSON字符串
-        json_string = json.dumps(interaction_data, ensure_ascii=False)
-        
-        # 通过 asyncio.to_thread 调用我们加强版的同步写入函数
-        await asyncio.to_thread(_sync_write_to_jsonl_robust, filepath, json_string)
-        
-        logger_to_use.debug(f"Successfully queued robust log write to {filepath}. Interaction ID: {interaction_data.get('interaction_id', 'N/A')}")
+        log_entry_str = json.dumps(log_data, ensure_ascii=False)
 
+        # 异步写入文件
+        await _async_write_to_jsonl_robust(log_filepath, log_entry_str + '\n')
+        
     except Exception as e:
-        logger_to_use.error(f"ERROR in log_interaction_data: Failed to queue log writing for {filepath}. Error: {e}", exc_info=True)
-        # 记录失败时，打印部分数据以供调试
-        data_str_for_log = str(interaction_data)
-        logger_to_use.error(f"Data that failed to log (first 500 chars): {data_str_for_log[:500]}")
+        # 在独立的日志系统中记录日志本身的错误
+        interaction_logger_module_logger.error(f"Failed to log interaction data. Error: {e}", exc_info=True)
+        interaction_logger_module_logger.error(f"Original log data that failed: {str(log_data)[:500]}")
