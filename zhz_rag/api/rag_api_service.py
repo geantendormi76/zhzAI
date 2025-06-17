@@ -99,16 +99,14 @@ async def lifespan(app: FastAPI):
         file_bm25_retriever_instance = FileBM25Retriever(index_directory=bm25_index_dir)
         kg_retriever_instance = KGRetriever(db_file_path=duckdb_file_path_for_api, embedder=model_handler)
        
-        # use_rrf_env = os.getenv("FUSION_USE_RRF", "true").lower() == "true"
         rrf_k_env_str = os.getenv("RRF_K_VALUE", "60")
         try:
             rrf_k_setting = int(rrf_k_env_str)
         except ValueError:
             api_logger.warning(f"Invalid RRF_K_VALUE '{rrf_k_env_str}' in environment. Defaulting to 60.")
             rrf_k_setting = 60
-        api_logger.info(f"FusionEngine will use RRF with k={rrf_k_setting}") # <--- 添加日志确认k值
         
-        fusion_engine_instance = FusionEngine(logger=api_logger, rrf_k=rrf_k_setting) # <--- 修改这里，只传递rrf_k
+        fusion_engine_instance = FusionEngine(logger=api_logger, rrf_k=rrf_k_setting)
         
         final_answer_cache = TTLCache(maxsize=100, ttl=900) # 缓存100个最终答案，存活15分钟
         

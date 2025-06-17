@@ -2,12 +2,124 @@ import hashlib
 import jieba
 from typing import List, Dict, Any, Optional
 import logging
-import os
-import asyncio # 为了 asyncio.to_thread
+import asyncio # 确保存在，未来可能用到
 
 from zhz_rag.config.pydantic_models import RetrievedDocument
 
 class FusionEngine:
+    def __init__(self, logger: Optional[logging.Logger] = None, rrf_k: int = 60):
+        if logger:
+            self.logger = logger
+        else:
+            self.logger = logging.getLogger("FusionEngineLogger")
+            # (如果需要，可以在这里添加基本的日志配置)
+        
+        self.rrf_k = rrf_k
+        self.logger.info(f"FusionEngine initialized. Strategy: RRF with k={self.rrf_k}.")
+
+    def _tokenize_text(self, text: str) -> set[str]:
+        if not isinstance(text, str):
+            self.logger.warning(f"FusionEngine: _tokenize_text received non-string input: {type(text)}. Returning empty set.")
+            return set()
+        return set(jieba.cut(text))
+
+    def _calculate_jaccard_similarity(self, query_tokens: set[str], doc_tokens: set[str]) -> float:
+        if not query_tokens or not doc_tokens:
+            return 0.0
+        intersection = len(query_tokens.intersection(doc_tokens))
+        union = len(query_tokens.union(doc_tokens))
+        return intersection / union if union > 0 else 0.0
+
+    def _apply_rrf(self, all_docs: List[RetrievedDocument]) -> List[RetrievedDocument]:
+        if not all_docs:
+            return []
+
+        # 1. 按召回源对文档进行分组，并记录其原始排名
+        docs_by_source: Dict[str, List[RetrievedDocument]] = {}
+        for doc in all_docs:
+            source_type = doc.source_type or "unknown_source"
+            if source_type not in docs_by_source:
+                docs_by_source[source_type] = []
+            docs_by_source[source_type].append(doc)
+
+        # 2. 计算每个文档的RRF分数
+        doc_scores: Dict[str, float] = {}
+        doc_objects: Dict[str, RetrievedDocument] = {}
+
+        for source_type, docs_list in docs_by_source.items():
+            # 按原始分数降序排序，分数越高排名越靠前
+            sorted_docs = sorted(docs_list, key=lambda d: d.score if d.score is not None else -float('inf'), reverse=True)
+            
+            for rank, doc in enumerate(sorted_docs, 1): # rank 从1开始
+                # 使用内容的哈希值作为文档的唯一标识符
+                content_hash = hashlib.md5(doc.content.encode('utf-8')).hexdigest()
+                
+                if content_hash not in doc_scores:
+                    doc_scores[content_hash] = 0.0
+                    doc_objects[content_hash] = doc
+                
+                # 累加RRF分数
+                doc_scores[content_hash] += 1.0 / (self.rrf_k + rank)
+
+        # 3. 将RRF分数更新到文档对象中
+        fused_results = []
+        for content_hash, rrf_score in doc_scores.items():
+            doc_obj = doc_objects[content_hash]
+            doc_obj.score = rrf_score  # 使用RRF分数覆盖原始分数
+            fused_results.append(doc_obj)
+        
+        # 4. 根据RRF分数对最终结果进行排序
+        fused_results.sort(key=lambda d: d.score or 0.0, reverse=True)
+        
+        self.logger.info(f"RRF processing complete. Returning {len(fused_results)} unique documents sorted by RRF score.")
+        return fused_results
+
+    async def fuse_results(
+        self,
+        all_raw_retrievals: List[RetrievedDocument],
+        user_query: str,
+        top_n_final: int = 3
+    ) -> List[RetrievedDocument]:
+        self.logger.info(f"FusionEngine: Fusing {len(all_raw_retrievals)} raw documents for query: '{user_query}' using RRF.")
+
+        if not all_raw_retrievals:
+            return []
+
+        # 1. 初步筛选 (Light Screening) - 对非KG来源的文档进行Jaccard相似度过滤
+        JACCARD_THRESHOLD = 0.02
+        query_tokens = self._tokenize_text(user_query)
+        screened_docs: List[RetrievedDocument] = []
+        
+        for doc in all_raw_retrievals:
+            # KG召回的结果通常是实体或关系，Jaccard相似度不适用，应直接通过
+            if doc.source_type in ["knowledge_graph", "duckdb_kg"]:
+                screened_docs.append(doc)
+                continue
+
+            # 对于其他来源，进行Jaccard相似度检查
+            if query_tokens:
+                doc_tokens = self._tokenize_text(doc.content)
+                similarity = self._calculate_jaccard_similarity(query_tokens, doc_tokens)
+                if similarity >= JACCARD_THRESHOLD:
+                    screened_docs.append(doc)
+                else:
+                    self.logger.debug(f"Screening REJECT (Jaccard): Doc from {doc.source_type}, Sim: {similarity:.4f} < {JACCARD_THRESHOLD}. Content: '{doc.content[:80]}...'")
+            else:
+                # 如果查询为空，则不进行Jaccard过滤
+                screened_docs.append(doc)
+        
+        self.logger.info(f"After light screening, {len(screened_docs)} documents remain for RRF.")
+
+        if not screened_docs:
+            return []
+
+        # 2. 去重并应用RRF融合
+        # RRF算法天然地处理了来自不同源的相同内容，因为它会累加分数到同一个content_hash上
+        # 我们只需将所有筛选后的文档传入即可
+        fused_and_ranked_results = self._apply_rrf(screened_docs)
+
+        self.logger.info(f"Fusion engine returning final top {top_n_final} documents after RRF.")
+        return fused_and_ranked_results[:top_n_final]
     def __init__(self, logger: Optional[logging.Logger] = None, rrf_k: int = 60): # 移除了 use_rrf
         if logger:
             self.logger = logger
