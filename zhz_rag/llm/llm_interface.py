@@ -1,5 +1,4 @@
 # zhz_agent/llm.py (renamed to llm_interface.py as per typical module naming)
-# or more accurately, this is the content for llm_interface.py based on the inputs
 
 from cachetools import TTLCache
 import os
@@ -13,7 +12,7 @@ import traceback  # Ensure traceback is imported
 from zhz_rag.utils.interaction_logger import log_interaction_data # 导入修复后的健壮日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 
-from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, QueryExpansionAndKGExtractionOutput
 # 提示词导入
 from llama_cpp import Llama, LlamaGrammar 
 from zhz_rag.llm.rag_prompts import (
@@ -23,7 +22,6 @@ from zhz_rag.llm.rag_prompts import (
     get_cypher_generation_messages_with_templates,
     KG_EXTRACTION_GBNF_STRING  
 )
-
 import logging
 import re
 import uuid  # 用于生成 interaction_id
@@ -846,3 +844,46 @@ async def call_local_llm_with_gbnf(
     }
     await log_interaction_data(log_success_data)
     return raw_llm_output_text
+
+async def generate_expansion_and_entities(user_query: str) -> Optional[QueryExpansionAndKGExtractionOutput]:
+    """
+    Performs a single LLM call to get both expanded queries and KG entities using GBNF.
+    """
+    from .rag_prompts import COMBINED_EXPANSION_KG_PROMPT_TEMPLATE, COMBINED_EXPANSION_KG_GBNF_STRING
+    from ..config.pydantic_models import QueryExpansionAndKGExtractionOutput
+
+    llm_py_logger.info(f"Generating expanded queries and KG entities for: '{user_query[:100]}...'")
+
+    # 1. 准备 Prompt
+    full_prompt = COMBINED_EXPANSION_KG_PROMPT_TEMPLATE.format(user_query=user_query)
+
+    # 2. 调用带有 GBNF 约束的 LLM
+    llm_response_str = await call_local_llm_with_gbnf(
+        full_prompt=full_prompt,
+        grammar_str=COMBINED_EXPANSION_KG_GBNF_STRING,
+        temperature=0.1,
+        max_tokens=1024,
+        task_type="combined_expansion_kg_extraction",
+        user_query_for_log=user_query,
+        model_name_for_log="qwen3_gguf_combined_task"
+    )
+
+    if not llm_response_str:
+        llm_py_logger.warning("Combined LLM call returned no response.")
+        return None
+
+    # 3. 解析结果并返回 Pydantic 对象
+    try:
+        parsed_data = json.loads(llm_response_str.strip())
+        structured_output = QueryExpansionAndKGExtractionOutput(**parsed_data)
+        
+        # 确保原始查询在扩展查询列表中
+        if user_query not in structured_output.expanded_queries:
+            structured_output.expanded_queries.append(user_query)
+            
+        llm_py_logger.info(f"Successfully parsed combined output. Expanded queries: {len(structured_output.expanded_queries)}, Entities: {len(structured_output.extracted_entities_for_kg.entities)}")
+        return structured_output
+        
+    except (json.JSONDecodeError, TypeError) as e:
+        llm_py_logger.error(f"Failed to parse or validate combined LLM output. Error: {e}. Raw output: '{llm_response_str}'", exc_info=True)
+        return None

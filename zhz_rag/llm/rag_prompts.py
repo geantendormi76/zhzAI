@@ -287,3 +287,88 @@ entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":
 relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
 relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
 """
+
+# --- 新增：用于合并查询扩展和KG实体提取的Prompt和GBNF ---
+
+# GBNF for the combined task
+COMBINED_EXPANSION_KG_GBNF_STRING = r"""
+root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object "}"
+
+space ::= ([ \t\n\r])*
+string ::= "\"" (char)* "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+
+string-array ::= "[" space (string ("," space string)*)? space "]"
+
+kg-extraction-object ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
+
+entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
+entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
+
+relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
+relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
+"""
+
+# Prompt Template for the combined task
+COMBINED_EXPANSION_KG_PROMPT_TEMPLATE = """<|im_start|>system
+You are a highly efficient and structured data processing AI. Your task is to perform two actions based on the user's query and produce a single, valid JSON object as output.
+
+**Actions to Perform:**
+1.  **Query Expansion:** Generate 3 diverse, related sub-questions to explore different facets of the original query.
+2.  **KG Entity/Relation Extraction:** Extract key entities (PERSON, ORGANIZATION, TASK, etc.) and their relationships (e.g., WORKS_AT, ASSIGNED_TO) from the original query for knowledge graph searching.
+
+**Output Format (Strict JSON):**
+You MUST output a single, valid JSON object that strictly adheres to the following structure. Do NOT include any explanations, markdown, or any text outside of the JSON object.
+
+```json
+{{
+  "expanded_queries": [
+    "string // Expanded question 1",
+    "string // Expanded question 2",
+    "string // Expanded question 3"
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [
+      {{"text": "string // Extracted entity text", "label": "string // Entity type"}}
+    ],
+    "relations": [
+      {{
+        "head_entity_text": "string",
+        "head_entity_label": "string",
+        "relation_type": "string",
+        "tail_entity_text": "string",
+        "tail_entity_label": "string"
+      }}
+    ]
+  }}
+}}
+Example:
+User Query: "Who is responsible for the Project Alpha documentation, and where do they work?"
+Expected JSON Output:
+{{
+  "expanded_queries": [
+    "Who is the primary contact for Project Alpha documentation?",
+    "Which organization employs the person responsible for Project Alpha documentation?",
+    "What are the recent updates or status of the Project Alpha documentation?"
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [
+      {{
+        "text": "Project Alpha",
+        "label": "PROJECT"
+      }},
+      {{
+        "text": "documentation",
+        "label": "TASK"
+      }}
+    ],
+    "relations": []
+  }}
+}}
+<|im_end|>
+<|im_start|>user
+User Query: "{user_query}"
+Output JSON:
+<|im_end|>
+<|im_start|>assistant
+"""

@@ -10,7 +10,6 @@ from cachetools import TTLCache # <--- 添加这一行
 if TYPE_CHECKING:
     from zhz_rag.llm.local_model_handler import LocalModelHandler
 
-from zhz_rag.llm.llm_interface import extract_entities_for_kg_query
 from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent
 from zhz_rag.utils.common_utils import normalize_text_for_id
 from zhz_rag.utils.interaction_logger import log_interaction_data # <--- 确保这行存在
@@ -181,20 +180,23 @@ class KGRetriever:
             formatted_docs.append(doc_data)
         return formatted_docs
 
-    async def retrieve(self, user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    async def retrieve(
+        self, 
+        user_query: str, 
+        extracted_info: Optional[ExtractedEntitiesAndRelationIntent], # <--- 直接接收提取好的信息
+        top_k: int = 3
+    ) -> List[Dict[str, Any]]:
         kg_logger.info(f"Starting DuckDB KG retrieval for query: '{user_query}', top_k: {top_k}")
 
-        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
         cache_key = f"{user_query}_{top_k}"
         async with self._retrieval_cache_lock:
             cached_result = self._retrieval_cache.get(cache_key)
-
+        
         if cached_result is not None:
             kg_logger.info(f"KG CACHE HIT for key: '{cache_key[:100]}...'")
             return cached_result
         
         kg_logger.info(f"KG CACHE MISS for key: '{cache_key[:100]}...'. Performing retrieval.")
-        # --- 缓存检查结束 ---
 
         if not self._embedder:
             kg_logger.error("Embedder not configured for KGRetriever. Vector search will be skipped.")
@@ -202,20 +204,15 @@ class KGRetriever:
         all_retrieved_records: List[Dict[str, Any]] = []
         processed_entity_ids = set()
 
-        # 1. LLM提取实体和关系意图
-        extracted_info: Optional[ExtractedEntitiesAndRelationIntent] = None
-        try:
-            extracted_info = await extract_entities_for_kg_query(user_query)
-            if extracted_info:
-                entities_log = [e.model_dump() for e in extracted_info.entities]
-                relations_log = [r.model_dump() for r in extracted_info.relations]
-                kg_logger.info(f"LLM extracted for KG: Entities: {entities_log}, Relations: {relations_log}")
-            else:
-                kg_logger.info("LLM did not extract specific entities/relations for KG query.")
-        except Exception as e_extract:
-            kg_logger.error(f"Error during entity/relation extraction for KG: {e_extract}", exc_info=True)
+        # 1. LLM提取步骤已被移除，直接使用传入的 extracted_info
+        if extracted_info:
+            entities_log = [e.model_dump() for e in extracted_info.entities]
+            relations_log = [r.model_dump() for r in extracted_info.relations]
+            kg_logger.info(f"Using pre-extracted KG info: Entities: {entities_log}, Relations: {relations_log}")
+        else:
+            kg_logger.info("No pre-extracted KG info provided.")
 
-        # 2. 向量搜索 (可选, 作为补充)
+        # 2. 向量搜索
         if self._embedder:
             try:
                 kg_logger.info(f"Generating embedding for vector search text: '{user_query}'")
@@ -259,7 +256,6 @@ class KGRetriever:
 
                     kg_logger.info(f"Processing relation: ({head_text_norm}:{head_label_norm})-[{relation_type_norm}]->({tail_text_norm}:{tail_label_norm})")
 
-                    # 步骤 4a: 验证关系本身是否存在
                     relation_verification_sql = """
                     SELECT r.relation_type, s.id_prop AS source_id_prop, s.text AS source_text, s.label AS source_label, t.id_prop AS target_id_prop, t.text AS target_text, t.label AS target_label
                     FROM KGExtractionRelation r
@@ -355,14 +351,14 @@ class KGRetriever:
         
         formatted_docs = self._format_duckdb_records_for_retrieval(unique_records, user_query, "duckdb_kg")
         
-        # --- 更新: 存储到 TTLCache ---
         async with self._retrieval_cache_lock:
             self._retrieval_cache[cache_key] = formatted_docs
         kg_logger.info(f"KG CACHED {len(formatted_docs)} results for key: '{cache_key[:100]}...'")
-        # --- 缓存存储结束 ---
 
         kg_logger.info(f"KGRetriever (DuckDB) retrieve method finished. Returning {len(formatted_docs)} formatted documents for fusion.")
         return formatted_docs
+
+
 
     def close(self):
         kg_logger.info(f"KGRetriever (DuckDB).close() called. (No persistent DB object to close in this version as connections are per-method).")

@@ -1,0 +1,5 @@
+根据sample.md文档，项目Alpha的文档编写任务分配给了谁，并且他在哪里工作？
+在simple_table.xlsx文件中，产品B的价格是多少？
+根据sample_article.html，RAG框架的核心优势是什么？
+complex_layout.docx文档的主要贡献者是谁？
+doc1.txt文件的创建日期是哪一天？
