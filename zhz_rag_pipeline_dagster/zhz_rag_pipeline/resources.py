@@ -1,295 +1,269 @@
 # /home/zhz/zhz_agent/zhz_rag_pipeline_dagster/zhz_rag_pipeline/resources.py
+
+import logging
 import dagster as dg
-from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.config import Settings
 from typing import List, Dict, Any, Optional, Iterator
 import httpx
 import json
-import litellm
 import os
-import shutil
-from contextlib import contextmanager
-from pydantic import Field as PydanticField
-from pydantic import PrivateAttr
+from contextlib import asynccontextmanager, contextmanager # <--- 修正: 导入 contextmanager
+from pydantic import Field as PydanticField, PrivateAttr
 import asyncio
-import time	
-import gc
+import time 
 import duckdb
+import sys
+from queue import Empty
+from pathlib import Path
 
-# --- START: 添加 HardwareManager 导入 ---
+
+# --- 日志和硬件管理器导入 ---
 try:
-    # 假设 hardware_manager.py 位于项目的 utils 目录下，
-    # 并且 zhz_agent 是项目的根目录且在 PYTHONPATH 中
-    from utils.hardware_manager import HardwareManager, HardwareInfo
+    from zhz_rag.utils.interaction_logger import get_logger
+except ImportError:
+    import logging
+    def get_logger(name: str) -> logging.Logger:
+        logger = logging.getLogger(name)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        return logger
+
+try:
+    from zhz_rag.utils.hardware_manager import HardwareManager, HardwareInfo
 except ImportError as e_hal_import:
-    # 如果 utils 目录不在 zhz_agent 下，或者 PYTHONPATH 问题，可能需要调整
-    # 例如，如果 hardware_manager.py 与 resources.py 在同一目录的父目录的utils下：
-    # from ..utils.hardware_manager import HardwareManager, HardwareInfo
-    print(f"ERROR: Failed to import HardwareManager/HardwareInfo from utils.hardware_manager: {e_hal_import}. "
-          "Ensure it's in the correct path relative to this file or PYTHONPATH is set. "
-          "Proceeding without HAL capabilities.")
+    print(f"ERROR: Failed to import HardwareManager/HardwareInfo: {e_hal_import}. HAL features will be disabled.")
     HardwareManager = None
     HardwareInfo = None # type: ignore
-# --- END: 添加 HardwareManager 导入 ---
 
-try:
-    from zhz_rag.llm.local_model_handler import LocalModelHandler
-except ImportError as e:
-    print(f"FATAL: Could not import LocalModelHandler from zhz_rag.llm.local_model_handler. Error: {e}")
-    raise
+
+# --- GGUFEmbeddingResource: API客户端版本 ---
 
 class GGUFEmbeddingResourceConfig(dg.Config):
-    # --- 采纳外部AI建议的修改 ---
-    embedding_model_path: str  # 必需字段，直接类型注解
-    n_ctx: int = 2048          # 可选字段，直接赋予Python默认值
-    n_gpu_layers: int = 0      # 可选字段，直接赋予Python默认值
-    # --- 修改结束 ---
+    api_url: str = PydanticField( # <--- 修正: 使用 PydanticField 别名
+        default="http://127.0.0.1:8089",
+        description="URL of the standalone embedding API service."
+    )
 
 class GGUFEmbeddingResource(dg.ConfigurableResource):
-    embedding_model_path: str
-    n_ctx: int
-    n_gpu_layers: int
+    api_url: str
 
-    _model_handler: Optional[LocalModelHandler] = PrivateAttr(default=None)
+    _client: httpx.AsyncClient = PrivateAttr()
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
     _dimension: Optional[int] = PrivateAttr(default=None)
-    # _dimension_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock) # 在纯同步场景下暂时不需要
-
-    def _run_async_in_new_loop(self, coro):
-        # 这个辅助函数在同步方法中运行异步协程是正确的
-        # 对于 Dagster 这种多进程/多线程环境，确保每次都用新循环可能更安全
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(coro)
-        finally:
-            loop.close()
-        return result
-
+    
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"Initializing GGUFEmbeddingResource with model: {self.embedding_model_path}")
-        
-        if not os.path.exists(self.embedding_model_path):
-            error_msg = f"GGUF embedding model file not found at: {self.embedding_model_path}"
-            self._logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
+        self._client = httpx.AsyncClient(base_url=self.api_url, timeout=300.0)
+        self._logger.info(f"GGUFEmbeddingResource configured to use API at: {self.api_url}")
         try:
-            self._model_handler = LocalModelHandler(
-                embedding_model_path=self.embedding_model_path,
-                n_ctx_embed=self.n_ctx,
-                n_gpu_layers_embed=self.n_gpu_layers,
-                # embedding_pool_size 可以考虑从Config传入或使用默认
-            )
-            self._logger.info(f"GGUFEmbeddingResource initialized. LocalModelHandler created. Dimension will be fetched on first use.")
+            response = httpx.get(f"{self.api_url}/health")
+            response.raise_for_status()
+            health_data = response.json()
+            if health_data.get("model_loaded"):
+                self._dimension = health_data.get("dimension")
+                self._logger.info(f"Embedding service is healthy. Dimension confirmed: {self._dimension}")
+            else:
+                raise RuntimeError(f"Embedding service at {self.api_url} is not healthy: {health_data.get('message')}")
         except Exception as e:
-            self._logger.error(f"Failed to initialize GGUFEmbeddingResource (LocalModelHandler creation failed): {e}", exc_info=True)
-            raise
+            self._logger.error(f"Failed to connect to or get health from embedding service at {self.api_url}. Error: {e}")
+            raise RuntimeError(f"Could not initialize GGUFEmbeddingResource due to connection error.") from e
 
-    def _ensure_dimension_is_known(self) -> int:
-        if self._dimension is None:
-            if self._model_handler is None: # 确保 _model_handler 已初始化
-                self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in _ensure_dimension_is_known.")
-                raise RuntimeError("LocalModelHandler not initialized, cannot get dimension.")
-            
-            self._logger.info("GGUFEmbeddingResource: Dimension not yet known, attempting to fetch from LocalModelHandler...")
+    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        if hasattr(self, '_client') and not self._client.is_closed:
+            async def _close():
+                await self._client.aclose()
             try:
-                # _get_embedding_dimension_from_worker_once() 是 LocalModelHandler 的异步方法
-                dim = self._run_async_in_new_loop(self._model_handler._get_embedding_dimension_from_worker_once())
-                if dim is None or dim <= 0:
-                    raise ValueError(f"LocalModelHandler returned invalid dimension: {dim}")
-                self._dimension = dim
-                self._logger.info(f"GGUFEmbeddingResource: Dimension fetched and cached: {self._dimension}")
-            except Exception as e:
-                self._logger.error(f"GGUFEmbeddingResource: Failed to fetch embedding dimension: {e}", exc_info=True)
-                raise RuntimeError(f"Could not determine embedding dimension: {e}") from e
+                loop = asyncio.get_running_loop()
+                loop.create_task(_close())
+            except RuntimeError:
+                asyncio.run(_close())
+            self._logger.info("GGUFEmbeddingResource client closed.")
+
+    def get_embedding_dimension(self) -> int:
+        if self._dimension is None:
+            raise ValueError("Embedding dimension not available.")
         return self._dimension
 
     def encode(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
-        if self._model_handler is None:
-            self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in encode.")
-            raise RuntimeError("GGUFEmbeddingResource is not initialized (model_handler is None).")
-        
-        self._ensure_dimension_is_known() 
-
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        logger_instance.debug(f"GGUFEmbeddingResource: Encoding {len(texts)} texts using LocalModelHandler (async call).")
-        
+        if not texts:
+            return []
+        async def _async_encode():
+            try:
+                response = await self._client.post("/embed", json={"texts": texts})
+                response.raise_for_status()
+                data = response.json()
+                return data.get("embeddings", [])
+            except httpx.RequestError as e:
+                self._logger.error(f"Request to embedding service failed: {e}")
+                return [[] for _ in texts]
+            except Exception as e:
+                self._logger.error(f"An unexpected error occurred during embedding API call: {e}")
+                return [[] for _ in texts]
         try:
-            embeddings = self._run_async_in_new_loop(
-                self._model_handler.embed_documents(texts)
-            )
-            return embeddings
-        except Exception as e:
-             logger_instance.error(f"GGUFEmbeddingResource: Error during encode: {e}", exc_info=True)
-             raise
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(_async_encode(), loop)
+                return future.result(timeout=300)
+            return asyncio.run(_async_encode())
+        except RuntimeError:
+            return asyncio.run(_async_encode())
 
-
-    def get_embedding_dimension(self) -> int:
-        """返回嵌入模型的维度大小。如果尚未获取，则会尝试获取。"""
-        if not hasattr(self, '_model_handler') or self._model_handler is None: # 增加对 _model_handler 是否为 None 的检查
-            self._logger.error("GGUFEmbeddingResource: LocalModelHandler not initialized in get_embedding_dimension.")
-            raise RuntimeError("GGUFEmbeddingResource is not initialized (model_handler is None).")
-        
-        # 直接调用内部方法来确保维度是已知的
-        # _ensure_dimension_is_known 会处理维度为 None 的情况，并主动去获取
-        return self._ensure_dimension_is_known()
-
-
-# --- ChromaDBResource ---
 class ChromaDBResourceConfig(dg.Config):
-    collection_name: str = "rag_documents"
-    persist_directory: str = "/home/zhz/zhz_agent/zhz_rag/stored_data/chromadb_index/"
+    collection_name: str = PydanticField(
+        default="zhz_rag_collection",
+        description="Name of the ChromaDB collection."
+    )
+    persist_directory: str = PydanticField(
+        # 确保路径与你的项目结构和期望的存储位置一致
+        default=os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "chromadb_index"),
+        description="Directory to persist ChromaDB data."
+    )
+    # 可以添加更多ChromaDB客户端的配置，例如auth, headers等
+    # client_settings: Optional[Dict[str, Any]] = None # 例如 chromadb.Settings
 
 class ChromaDBResource(dg.ConfigurableResource):
     collection_name: str
     persist_directory: str
+    # client_settings: Optional[Dict[str, Any]] # 如果上面Config中添加了
 
-    _client: chromadb.Client = PrivateAttr(default=None)
-    _collection: chromadb.Collection = PrivateAttr(default=None)
+    _client: Optional[chromadb.PersistentClient] = PrivateAttr(default=None)
+    _collection: Optional[Any] = PrivateAttr(default=None) # chromadb.api.models.Collection.Collection
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"Initializing ChromaDB client and collection '{self.collection_name}'...")
-        self._logger.info(f"ChromaDB data will be persisted to: {self.persist_directory}")
+        os.makedirs(self.persist_directory, exist_ok=True)
+        self._logger.info(f"ChromaDB persist directory: {self.persist_directory}")
+        
         try:
-            os.makedirs(self.persist_directory, exist_ok=True)
-            self._client = chromadb.PersistentClient(path=self.persist_directory)
+            # from chromadb.config import Settings # 如果需要传递settings
+            # settings_obj = Settings(**self.client_settings) if self.client_settings else Settings()
+            self._client = chromadb.PersistentClient(path=self.persist_directory) #, settings=settings_obj)
+            self._logger.info(f"ChromaDB client initialized. Attempting to get or create collection: '{self.collection_name}'")
+            
+            # 获取或创建集合
+            # 注意: get_or_create_collection 可能需要 embedding_function 如果集合不存在且没有指定
+            # 但我们的嵌入是在外部生成的，所以这里不需要传递 embedding_function
+            # 如果集合已存在且有不同的 embedding_function 或 metadata，可能会有问题
+            # 为简单起见，我们假设如果集合存在，其配置是兼容的
             self._collection = self._client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "cosine"}
+                # metadata={"hnsw:space": "l2"} # 默认是 l2，可以按需指定
             )
-            self._logger.info(f"ChromaDB collection '{self.collection_name}' initialized/loaded. Count: {self._collection.count()}")
+            self._logger.info(f"Successfully got or created ChromaDB collection: '{self.collection_name}'. Collection ID: {self._collection.id}")
+            self._logger.info(f"Current item count in collection '{self.collection_name}': {self._collection.count()}")
+
         except Exception as e:
-            self._logger.error(f"Failed to initialize ChromaDB: {e}", exc_info=True)
-            raise
+            self._logger.error(f"Failed to initialize ChromaDB client or collection: {e}", exc_info=True)
+            raise RuntimeError(f"Could not initialize ChromaDBResource due to: {e}") from e
+
+    def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        # PersistentClient 通常不需要显式关闭或清理，数据已持久化
+        # 如果有其他需要清理的资源，可以在这里处理
+        if self._client:
+            # self._client.clear_system_cache() # 可选，根据ChromaDB版本和需求
+            self._logger.info("ChromaDBResource teardown: Client was persistent, no explicit close needed.")
+        self._client = None
+        self._collection = None
 
     def add_embeddings(
         self, 
         ids: List[str], 
         embeddings: List[List[float]], 
-        documents: Optional[List[str]] = None, # <--- 添加 documents 参数，并设为可选
-        metadatas: Optional[List[Dict[str, Any]]] = None # <--- 将 metadatas 也设为可选，与ChromaDB客户端一致
-    ):
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
+        documents: Optional[List[str]] = None, 
+        metadatas: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
         if self._collection is None:
-            logger_instance.error("ChromaDB collection is not initialized. Cannot add embeddings.")
-            raise RuntimeError("ChromaDB collection is not initialized.")
+            msg = "ChromaDB collection is not initialized. Cannot add embeddings."
+            self._logger.error(msg)
+            raise RuntimeError(msg)
         
-        # 参数长度校验
-        num_ids = len(ids)
-        if not (num_ids == len(embeddings) and \
-                (documents is None or num_ids == len(documents)) and \
-                (metadatas is None or num_ids == len(metadatas))):
-            logger_instance.error(
-                f"Length mismatch: ids({num_ids}), embeddings({len(embeddings)}), "
-                f"documents({len(documents) if documents else 'None'}), metadatas({len(metadatas) if metadatas else 'None'})."
-            )
-            raise ValueError("Length of ids, embeddings, and documents/metadatas (if provided) must be the same.")
-
         if not ids:
-            logger_instance.info("No ids provided to add_embeddings, skipping.")
+            self._logger.warning("add_embeddings called with empty IDs list. Nothing to add.")
             return
 
-        logger_instance.info(f"Adding/updating {len(ids)} items to ChromaDB collection '{self.collection_name}'...")
         try:
+            # ChromaDB的add方法可以处理upsert逻辑，如果ID已存在则更新
+            self._logger.info(f"Attempting to add/update {len(ids)} items to collection '{self.collection_name}'.")
             self._collection.add(
-                ids=ids, 
-                embeddings=embeddings, 
-                documents=documents, # <--- 将 documents 参数传递给 collection.add
+                ids=ids,
+                embeddings=embeddings,
+                documents=documents,
                 metadatas=metadatas
             )
-            logger_instance.info(f"Items added/updated. Collection count now: {self._collection.count()}")
-        except Exception as e_add:
-            logger_instance.error(f"Error during self._collection.add: {e_add}", exc_info=True)
+            self._logger.info(f"Successfully added/updated {len(ids)} items. Collection count now: {self._collection.count()}")
+        except Exception as e:
+            self._logger.error(f"Failed to add embeddings to ChromaDB collection '{self.collection_name}': {e}", exc_info=True)
+            # 根据错误类型，可能需要更具体的处理或重试逻辑
             raise
-        
-    def query_embeddings(self, query_embeddings: List[List[float]], n_results: int = 5) -> chromadb.QueryResult:
-        logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        if self._collection is None:
-            logger_instance.error("ChromaDB collection is not initialized. Cannot query embeddings.")
-            raise RuntimeError("ChromaDB collection is not initialized.")
-        logger_instance.debug(f"Querying ChromaDB collection '{self.collection_name}' with {len(query_embeddings)} vectors, n_results={n_results}.")
-        return self._collection.query(query_embeddings=query_embeddings, n_results=n_results)
 
-# --- LocalLLMAPIResource ---
+    def query_embeddings(
+        self,
+        query_embeddings: List[List[float]],
+        n_results: int = 5,
+        where_filter: Optional[Dict[str, Any]] = None,
+        # include: Optional[List[str]] = ["metadatas", "documents", "distances"] # ChromaDB 0.4.x
+        include: Optional[List[str]] = None # ChromaDB 0.5.x an later, include is a list of DocumentSetInclude = List[Literal["documents", "embeddings", "metadatas", "distances", "uris", "data"]]
+    ) -> Optional[Dict[str, Any]]: # 返回类型根据ChromaDB版本和include参数调整
+        if self._collection is None:
+            msg = "ChromaDB collection is not initialized. Cannot query embeddings."
+            self._logger.error(msg)
+            raise RuntimeError(msg)
+
+        if include is None: # 设置一个合理的默认值
+            include = ["metadatas", "documents", "distances"]
+
+        try:
+            self._logger.info(f"Querying collection '{self.collection_name}' with {len(query_embeddings)} vector(s), n_results={n_results}, filter={where_filter is not None}.")
+            results = self._collection.query(
+                query_embeddings=query_embeddings,
+                n_results=n_results,
+                where=where_filter, # metadata filter
+                # where_document=None, # document content filter (if supported)
+                include=include
+            )
+            self._logger.debug(f"Query results: {results}") # 可能非常冗长
+            return results
+        except Exception as e:
+            self._logger.error(f"Failed to query embeddings from ChromaDB collection '{self.collection_name}': {e}", exc_info=True)
+            raise
+
 class LocalLLMAPIResourceConfig(dg.Config):
-    api_url: str = "http://127.0.0.1:8088/v1/chat/completions" # <--- 修改
+    api_url: str = "http://127.0.0.1:8088/v1/chat/completions"
     default_temperature: float = 0.1
     default_max_new_tokens: int = 2048
 
 class LocalLLMAPIResource(dg.ConfigurableResource):
-    # 我们将 SGLangAPIResource 重命名为 LocalLLMAPIResource
     api_url: str
     default_temperature: float
     default_max_new_tokens: int
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
-
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info(f"LocalLLMAPIResource configured with API URL: {self.api_url}") # <--- 修改日志信息
-
-    # generate_structured_output 方法的逻辑需要调整以适配 OpenAI 兼容的 API
-    async def generate_structured_output(
-        self, prompt: str, json_schema: Dict[str, Any],
-        temperature: Optional[float] = None, max_new_tokens: Optional[int] = None
-    ) -> Dict[str, Any]:
+        self._logger.info(f"LocalLLMAPIResource configured with API URL: {self.api_url}")
+    async def generate_structured_output(self, prompt: str, json_schema: Dict[str, Any], temperature: Optional[float] = None, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
         temp_to_use = temperature if temperature is not None else self.default_temperature
         tokens_to_use = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
-
-        messages = [{"role": "user", "content": prompt}] # 简化处理
-
-        payload = {
-            "model": "local_kg_extraction_model", # 模型名对于本地服务不重要，但需要有
-            "messages": messages,
-            "temperature": temp_to_use,
-            "max_tokens": tokens_to_use,
-            "response_format": { # 我们的 local_llm_service.py 支持这个
-                "type": "json_object",
-                "schema": json_schema
-            }
-        }
+        messages = [{"role": "user", "content": prompt}]
+        payload = {"model": "local_kg_extraction_model", "messages": messages, "temperature": temp_to_use, "max_tokens": tokens_to_use, "response_format": {"type": "json_object", "schema": json_schema}}
         logger_instance.debug(f"Sending request to Local LLM Service. Prompt (start): {prompt[:100]}...")
-
         try:
-            timeout_config = httpx.Timeout(
-                connect=30.0,    # 连接超时30秒
-                read=300.0,      # 读取超时300秒 (5分钟)
-                write=300.0,     # 写入超时300秒 (5分钟)
-                pool=30.0        # 从连接池获取连接的超时30秒
-            )
-            async with httpx.AsyncClient(timeout=timeout_config) as client:
-                response = await client.post(self.api_url, json=payload) # 使用 self.api_url
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                response = await client.post(self.api_url, json=payload)
                 response.raise_for_status()
                 response_json = response.json()
-                
-                # OpenAI 兼容 API 的响应格式是 {"choices": [{"message": {"content": "..."}}]}
                 if response_json.get("choices") and response_json["choices"][0].get("message"):
                     generated_text = response_json["choices"][0]["message"].get("content", "")
-                    logger_instance.debug(f"Local LLM raw response text: {generated_text}")
-                    try:
-                        parsed_output = json.loads(generated_text)
-                        return parsed_output
-                    except json.JSONDecodeError as e:
-                        logger_instance.error(f"Failed to decode JSON from Local LLM output: {generated_text}. Error: {e}", exc_info=True)
-                        raise ValueError(f"Local LLM output was not valid JSON: {generated_text}") from e
-                else:
-                    raise ValueError(f"Local LLM response format is incorrect: {response_json}")
-        except httpx.HTTPStatusError as e:
-            logger_instance.error(f"Local LLM API HTTP error: {e.response.status_code} - {e.response.text}", exc_info=True)
-            raise
-        except httpx.RequestError as e:
-            logger_instance.error(f"Local LLM API request error: {e}", exc_info=True)
-            raise
+                    return json.loads(generated_text)
+                raise ValueError(f"Local LLM response format is incorrect: {response_json}")
         except Exception as e:
-            logger_instance.error(f"Unexpected error during Local LLM call: {e}", exc_info=True)
+            logger_instance.error(f"Error during Local LLM call: {e}", exc_info=True)
             raise
 
-# --- GeminiAPIResource ---
 class GeminiAPIResourceConfig(dg.Config):
     model_name: str = PydanticField(default="gemini/gemini-1.5-flash-latest", description="Name of the Gemini model.")
     proxy_url: Optional[str] = PydanticField(default_factory=lambda: os.getenv("LITELLM_PROXY_URL"), description="Optional proxy URL for LiteLLM.")
@@ -303,217 +277,118 @@ class GeminiAPIResource(dg.ConfigurableResource):
     default_max_tokens: int
     _api_key: Optional[str] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
-
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
         self._api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if self.model_name and not self.model_name.startswith("gemini/"):
-            if "gemini" in self.model_name.lower():
-                self._logger.info(f"Model name '{self.model_name}' auto-prefixed to 'gemini/'.")
-                self.model_name = f"gemini/{self.model_name.split('/')[-1]}"
-            else:
-                self._logger.warning(f"Model name '{self.model_name}' does not start with 'gemini/'.")
-        if not self._api_key:
-            self._logger.warning("Gemini API key not found. API calls will likely fail.")
-        else:
-            self._logger.info(f"GeminiAPIResource initialized. Model: {self.model_name}, Proxy: {self.proxy_url or 'Not set'}")
-
-    async def call_completion(
-        self, messages: List[Dict[str, str]],
-        temperature: Optional[float] = None, max_tokens: Optional[int] = None,
-    ) -> Optional[str]:
+        if not self._api_key: self._logger.warning("Gemini API key not found.")
+        else: self._logger.info(f"GeminiAPIResource initialized. Model: {self.model_name}, Proxy: {self.proxy_url or 'Not set'}")
+    async def call_completion(self, messages: List[Dict[str, str]], temperature: Optional[float] = None, max_tokens: Optional[int] = None) -> Optional[str]:
+        import litellm
         logger_instance = self._logger if self._logger else dg.get_dagster_logger()
-        if not self._api_key:
-            logger_instance.error("Gemini API key is not configured.")
-            return None
-        temp_to_use = temperature if temperature is not None else self.default_temperature
-        tokens_to_use = max_tokens if max_tokens is not None else self.default_max_tokens
-        litellm_params = {
-            "model": self.model_name, "messages": messages, "api_key": self._api_key,
-            "temperature": temp_to_use, "max_tokens": tokens_to_use,
-        }
-        if self.proxy_url:
-            litellm_params["proxy"] = {"http": self.proxy_url, "https": self.proxy_url} # type: ignore
-        logger_instance.debug(f"Calling LiteLLM (Gemini) with params (excluding messages): { {k:v for k,v in litellm_params.items() if k != 'messages'} }")
-        raw_output_text: Optional[str] = None
+        if not self._api_key: return None
+        litellm_params = {"model": self.model_name, "messages": messages, "api_key": self._api_key, "temperature": temperature or self.default_temperature, "max_tokens": max_tokens or self.default_max_tokens}
+        if self.proxy_url: litellm_params["proxy"] = {"http": self.proxy_url, "https": self.proxy_url}
         try:
-            response = await litellm.acompletion(**litellm_params) # type: ignore
-            if response and response.choices and response.choices[0].message and response.choices[0].message.content:
-                raw_output_text = response.choices[0].message.content
-                logger_instance.debug(f"LiteLLM (Gemini) raw response (first 300 chars): {raw_output_text[:300]}...")
-            else:
-                logger_instance.warning(f"LiteLLM (Gemini) returned empty/malformed response: {response}")
-        except Exception as e_generic:
-            logger_instance.error(f"Error calling Gemini via LiteLLM: {e_generic}", exc_info=True)
-        return raw_output_text
-
+            response = await litellm.acompletion(**litellm_params)
+            return response.choices[0].message.content if response and response.choices else None
+        except Exception as e:
+            logger_instance.error(f"Error calling Gemini via LiteLLM: {e}", exc_info=True)
+            return None
+        
 class DuckDBResource(dg.ConfigurableResource):
-    db_file_path: str = PydanticField(
-        default=os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "duckdb_knowledge_graph.db"),
-        description="Path to the DuckDB database file for the knowledge graph."
-    )
-    # 可以在这里添加其他配置，例如 read_only, vss_persistence 等
-
+    db_file_path: str = PydanticField(default=os.path.join(os.getenv("ZHZ_AGENT_PROJECT_ROOT", "/home/zhz/zhz_agent"), "zhz_rag", "stored_data", "duckdb_knowledge_graph.db"))
     _conn: Optional[duckdb.DuckDBPyConnection] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
 
-    # --- 【用这个版本覆盖原来的 setup_for_execution 方法】 ---
+    # --- START: 添加 __init__ 方法和日志 ---
+    def __init__(self, db_file_path: Optional[str] = None):
+        super().__init__() # 调用父类的 __init__
+        if db_file_path: # 如果通过构造函数传递了路径
+            self.db_file_path = db_file_path
+        # 获取一个临时的 logger 实例，因为此时 context 可能还不可用
+        temp_logger = logging.getLogger("DuckDBResource_INIT")
+        if not temp_logger.hasHandlers():
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            temp_logger.addHandler(handler)
+            temp_logger.setLevel(logging.INFO)
+        temp_logger.info(f"===== DuckDBResource __init__ called. DB path configured to: {self.db_file_path} =====")
+    # --- END: 添加 __init__ 方法和日志 ---
+
+    # --- START: 覆盖这个 setup_for_execution 方法 ---
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        db_path_to_use = self.db_file_path
-        
-        db_dir = os.path.dirname(db_path_to_use)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            self._logger.info(f"Created directory for DuckDB database: {db_dir}")
+        self._logger.info("<<<<< DuckDBResource SETUP_FOR_EXECUTION - START >>>>>")
 
-        self._logger.info(f"Attempting to connect to DuckDB at: {db_path_to_use}")
+        os.makedirs(os.path.dirname(self.db_file_path), exist_ok=True)
         
         try:
-            # 连接数据库
-            self._conn = duckdb.connect(database=db_path_to_use, read_only=False)
-            self._logger.info(f"Successfully connected to DuckDB: {db_path_to_use}")
-            
-            # 强制加载VSS扩展
-            # 即使之前已加载，重复LOAD通常是安全的，或者会快速返回
-            # 关键在于确保当前连接的上下文中VSS是可用的
-            try:
-                self._logger.info("DuckDBResource: Forcefully attempting to INSTALL and LOAD vss extension for current connection.")
-                self._conn.execute("INSTALL vss;")      # 尝试安装（如果未安装）
-                self._conn.execute("LOAD vss;")         # 尝试加载
-                self._logger.info("DuckDBResource: VSS extension INSTALL and LOAD sequence completed for current connection.")
-                
-                # 启用HNSW持久化（如果需要）
-                try:
-                    self._conn.execute("SET hnsw_enable_experimental_persistence=true;")
-                    self._logger.info("DuckDBResource: HNSW experimental persistence enabled for current connection.")
-                except Exception as e_persistence:
-                    self._logger.warning(f"DuckDBResource: Failed to enable HNSW experimental persistence: {e_persistence}. This might affect index persistence if new HNSW indexes are created by this resource/asset.")
-            
-            except duckdb.CatalogException as e_vss_cat:
-                if "already loaded" in str(e_vss_cat).lower() or "already installed" in str(e_vss_cat).lower():
-                    self._logger.info(f"DuckDBResource: VSS extension reported as already installed/loaded: {e_vss_cat}")
-                    # 即使已加载，也尝试再次LOAD以确保当前会话可用
-                    try:
-                        self._conn.execute("LOAD vss;")
-                        self._logger.info("DuckDBResource: VSS extension re-LOADED successfully.")
-                    except Exception as e_reload:
-                        self._logger.error(f"DuckDBResource: Failed to re-LOAD VSS extension even if reported as installed/loaded: {e_reload}", exc_info=True)
-                        raise RuntimeError(f"Critical: Failed to ensure VSS is loaded for DuckDB connection: {e_reload}") from e_reload
-                else:
-                    self._logger.error(f"DuckDBResource: CatalogException during VSS setup (not 'already loaded/installed'): {e_vss_cat}", exc_info=True)
-                    raise RuntimeError(f"Failed to setup VSS extension for DuckDB: {e_vss_cat}") from e_vss_cat
-            except Exception as e_vss_other:
-                self._logger.error(f"DuckDBResource: Other exception during VSS setup: {e_vss_other}", exc_info=True)
-                raise RuntimeError(f"Failed to setup VSS extension for DuckDB: {e_vss_other}") from e_vss_other
+            self._logger.info(f"Connecting to DuckDB at: {self.db_file_path}")
+            # 在连接时就启用允许加载未签名扩展的配置，这对于加载vss等社区扩展有时是必要的
+            self._conn = duckdb.connect(database=self.db_file_path, read_only=False)
+            self._logger.info(f"Successfully connected to DuckDB at: {self.db_file_path}")
 
-        except duckdb.duckdb.Error as e_connect_wal: # 捕获包括WAL重放错误在内的DuckDB连接错误
-            self._logger.error(f"Failed to connect to DuckDB at {db_path_to_use} or error during WAL replay: {e_connect_wal}", exc_info=True)
-            # 检查错误信息是否与VSS有关
-            if "unknown index type 'HNSW'" in str(e_connect_wal):
-                self._logger.error("DuckDBResource: WAL replay failed due to HNSW index. This strongly indicates VSS was not loaded prior to the operation that created/modified the index or during this connection attempt before WAL replay.")
-            raise # 将原始的DuckDB连接错误重新抛出
-        except Exception as e_connect_generic: # 捕获其他可能的连接错误
-            self._logger.error(f"Generic error connecting to DuckDB at {db_path_to_use}: {e_connect_generic}", exc_info=True)
-            raise
+            # --- 核心修改：在连接后立即加载扩展 ---
+            self._logger.info("Attempting to INSTALL and LOAD vss extension.")
+            self._conn.execute("INSTALL vss;")
+            self._conn.execute("LOAD vss;")
+            self._conn.execute("SET hnsw_enable_experimental_persistence=true;")
+            self._logger.info("DuckDB VSS extension loaded and persistence enabled successfully.")
+
+        except Exception as e:
+            self._logger.error(f"Error during DuckDB connection or VSS setup: {e}", exc_info=True)
+            # 如果是 "already installed" 或 "already loaded" 的错误，我们可以忽略它并继续
+            error_str = str(e).lower()
+            if "already installed" in error_str or "already loaded" in error_str:
+                self._logger.warning(f"VSS extension seems to be already installed/loaded, continuing...")
+            else:
+                raise RuntimeError(f"DuckDB connection/VSS setup failed: {e}") from e
+        
+        self._logger.info("<<<<< DuckDBResource SETUP_FOR_EXECUTION - END >>>>>")
+    # --- END: 覆盖结束 ---
 
     def teardown_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._logger.info(">>>>> DuckDBResource TEARDOWN_FOR_EXECUTION - START <<<<<") # <--- 新增日志
         if self._conn:
-            self._logger.info(f"Closing DuckDB connection to: {self.db_file_path}")
-            self._conn.close()
-            self._conn = None
-        self._logger.info("DuckDBResource teardown complete.")
+            try:
+                self._logger.info(f"Executing CHECKPOINT on DuckDB connection for: {self.db_file_path}")
+                self._conn.execute("CHECKPOINT;")
+                self._logger.info(f"CHECKPOINT executed successfully for: {self.db_file_path}")
+            except Exception as e_checkpoint:
+                self._logger.error(f"Error executing CHECKPOINT for DuckDB: {e_checkpoint}", exc_info=True)
+            finally:
+                self._logger.info(f"Closing DuckDB connection for: {self.db_file_path}")
+                self._conn.close()
+                self._conn = None 
+        else:
+            self._logger.info("No active DuckDB connection to teardown.")
+        self._logger.info(">>>>> DuckDBResource TEARDOWN_FOR_EXECUTION - END <<<<<") # <--- 新增日志
 
     @contextmanager
     def get_connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
-        if not self._conn:
-            # 这种情况下，我们应该在 setup_for_execution 中确保连接已建立
-            # 或者在这里尝试重新连接，但这会使逻辑复杂化。
-            # Dagster 资源通常期望 setup_for_execution 已经准备好了资源。
-            self._logger.error("DuckDB connection not established during setup. Cannot yield connection.")
-            raise ConnectionError("DuckDB connection was not established by setup_for_execution.")
-        
-        # 简单的版本：直接 yield 已经建立的连接
-        # 注意：这种共享连接的方式对于并发的 Dagster ops (如果使用非 in_process_executor) 需要小心
-        # 但对于 in_process_executor 和我们的流水线是安全的。
+        if not self._conn: 
+            # 尝试重新连接（如果 teardown 后或初始化失败后再次调用）
+            # 这部分逻辑可以根据需求调整，或者严格要求 setup_for_execution 成功
+            self._logger.warning("DuckDB connection not established. Attempting to re-initialize (this might indicate an issue).")
+            # 应该避免在 get_connection 中重新执行完整的 setup 逻辑，
+            # 但至少要确保 self._conn 不是 None。
+            # 为了简单起见，如果连接不存在，我们直接抛出错误，强制要求 setup 成功。
+            raise ConnectionError("DuckDB connection not established. Ensure setup_for_execution was successful.")
         yield self._conn
 
-
-# --- START: 定义 SystemResource ---
 class SystemResource(dg.ConfigurableResource):
-    """
-    Dagster resource to provide system hardware information and recommendations
-    based on Hardware Abstraction Layer (HAL).
-    """
     _hw_manager: Optional[Any] = PrivateAttr(default=None)
     _hw_info: Optional[Any] = PrivateAttr(default=None)
     _logger: Optional[dg.DagsterLogManager] = PrivateAttr(default=None)
-    
-    # 可以添加一些配置项来微调HAL的行为，如果需要的话
-    # 例如：safety_vram_buffer_gb_override: Optional[float] = None
-
     def setup_for_execution(self, context: dg.InitResourceContext) -> None:
         self._logger = context.log
-        self._logger.info("Initializing SystemResource...")
         if HardwareManager:
-            try:
-                self._hw_manager = HardwareManager()
-                self._hw_info = self._hw_manager.get_hardware_info()
-                if self._hw_info:
-                    self._logger.info(f"SystemResource: Hardware detection successful: {self._hw_info}")
-                else:
-                    self._logger.warning("SystemResource: HardwareManager did not return hardware info.")
-            except Exception as e:
-                self._logger.error(f"SystemResource: Error initializing HardwareManager: {e}", exc_info=True)
+            self._hw_manager = HardwareManager()
+            self._hw_info = self._hw_manager.get_hardware_info()
+            self._logger.info(f"SystemResource hardware detection: {self._hw_info}")
         else:
-            self._logger.warning("SystemResource: HardwareManager class not available. HAL features will be disabled.")
-        self._logger.info("SystemResource initialized.")
-
-    def get_hardware_info(self) -> Optional[Any]:
-        """Returns the detected HardwareInfo object, or None if detection failed."""
-        if not self._hw_info:
-            self._logger.warning("Accessing hardware info, but it was not successfully detected during initialization.")
-        return self._hw_info
-
-    def get_recommended_llm_gpu_layers(
-        self, 
-        model_total_layers: int, 
-        model_size_on_disk_gb: float, 
-        context_length_tokens: int,
-        # 可以暴露HAL方法中的其他参数作为此方法的参数，或使用默认/固定值
-        kv_cache_gb_per_1k_ctx: float = 0.25, 
-        safety_buffer_vram_gb: float = 1.5
-    ) -> int:
-        """
-        Delegates to HardwareManager to recommend n_gpu_layers.
-        Returns 0 if HAL is not available or GPU is not suitable.
-        """
-        if self._hw_manager:
-            try:
-                return self._hw_manager.recommend_llm_gpu_layers(
-                    model_total_layers=model_total_layers,
-                    model_size_on_disk_gb=model_size_on_disk_gb,
-                    kv_cache_gb_per_1k_ctx=kv_cache_gb_per_1k_ctx,
-                    context_length_tokens=context_length_tokens,
-                    safety_buffer_vram_gb=safety_buffer_vram_gb
-                )
-            except Exception as e:
-                self._logger.error(f"Error getting GPU layer recommendation from HAL: {e}", exc_info=True)
-                return 0 # Fallback to CPU on error
-        self._logger.warning("HardwareManager not available, defaulting to 0 GPU layers.")
-        return 0 # Fallback to CPU
-
+            self._logger.warning("HardwareManager not available.")
     def get_recommended_concurrent_tasks(self, task_type: str = "cpu_bound_llm") -> int:
-        """
-        Delegates to HardwareManager to recommend concurrent task number.
-        Returns 1 if HAL is not available.
-        """
-        if self._hw_manager:
-            try:
-                return self._hw_manager.recommend_concurrent_tasks(task_type=task_type)
-            except Exception as e:
-                self._logger.error(f"Error getting concurrent task recommendation from HAL: {e}", exc_info=True)
-                return 1 # Fallback to 1 on error
-        self._logger.warning("HardwareManager not available, defaulting to 1 concurrent task.")
-        return 1 # Fallback
-# --- END: 定义 SystemResource ---
+        if self._hw_manager: return self._hw_manager.recommend_concurrent_tasks(task_type=task_type)
+        return 1

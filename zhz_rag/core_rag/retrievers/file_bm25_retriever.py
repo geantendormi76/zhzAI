@@ -143,3 +143,4 @@ class FileBM25Retriever:
             logger.error(f"Error during BM25 retrieval: {e}", exc_info=True)
             return []
         
+

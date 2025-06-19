@@ -144,26 +144,23 @@ def split_text_into_sentences(text: str) -> List[str]:
     return result if result else [text] # 如果无法分割，返回原文本作为一个句子
 
 
-
+# --- START: 覆盖这个函数 ---
 def split_markdown_table_by_rows(
     markdown_table_text: str,
     target_chunk_size: int,
     max_chunk_size: int,
     context: Optional[dg.AssetExecutionContext] = None
-) -> List[Dict[str, Any]]: # <--- 修改返回类型
+) -> List[Dict[str, Any]]:
     """
     Splits a Markdown table string by its data rows.
-    Returns a list of dictionaries, each containing 'text', 'start_row_index', and 'end_row_index'.
-    Indices are 0-based relative to the start of data_rows.
+    It now tries to create smaller chunks, even for short tables, by grouping a few rows together.
     """
-    sub_chunks_data: List[Dict[str, Any]] = [] # <--- 修改变量名和类型
+    sub_chunks_data: List[Dict[str, Any]] = []
     lines = markdown_table_text.strip().split('\n')
     
-    if len(lines) < 2: # 至少需要表头和分隔行
-        if context: context.log.warning(f"Markdown table has less than 2 lines ({len(lines)}). Cannot process for row splitting. Returning as single chunk.")
-        # 对于无法按预期处理的表格，返回原始文本及无效的行索引
+    if len(lines) < 2:
+        if context: context.log.warning(f"Markdown table has less than 2 lines. Cannot process for row splitting.")
         return [{"text": markdown_table_text, "start_row_index": -1, "end_row_index": -1}]
-
 
     header_row = lines[0]
     separator_row = lines[1]
@@ -173,80 +170,32 @@ def split_markdown_table_by_rows(
         if context: context.log.warning("Markdown table has no data rows. Returning header and separator as single chunk.")
         return [{"text": f"{header_row}\n{separator_row}", "start_row_index": -1, "end_row_index": -1}]
 
-    if not (separator_row.strip().startswith('|') and separator_row.strip().endswith('|') and '-' in separator_row):
-        if context: context.log.warning(f"Markdown table separator row looks non-standard: '{separator_row}'. Row splitting might be unreliable.")
-        # 即使分隔符不标准，也尝试继续，但标记行索引为不可靠
-        # 或者直接返回整个表作为一个块，标记行索引无效
-        # 为简单起见，我们先尝试，但如果这个情况频繁且导致问题，应返回整个表
-        # return [{"text": markdown_table_text, "start_row_index": -2, "end_row_index": -2}] # -2 表示分隔符问题
+    # --- 新的、更激进的分割逻辑 ---
+    current_sub_chunk_lines = []
+    current_sub_chunk_start_row_idx = 0
+    
+    # 定义每个块的目标行数，例如 2-3 行，可以根据需要调整
+    ROWS_PER_CHUNK = 2
 
-    current_sub_chunk_lines = [header_row, separator_row]
-    current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1
-    current_sub_chunk_start_row_idx = 0 # 记录当前子块数据行的起始索引
-
-    for i, data_row in enumerate(data_rows):
-        row_len = len(data_row)
-        if not data_row.strip():
-            if i == current_sub_chunk_start_row_idx and len(current_sub_chunk_lines) == 2 : # 如果是新块的第一个数据行就是空的，则递增起始行索引
-                current_sub_chunk_start_row_idx +=1
-            continue # 跳过空数据行
-
-        # 条件：1. 当前块只有表头；2. 加入新行不超过目标大小；3. 当前块只有表头且加入第一行数据即使超目标大小但不超最大大小
-        should_add_to_current = (
-            len(current_sub_chunk_lines) == 2 or
-            (current_sub_chunk_char_count + row_len + 1 <= target_chunk_size) or
-            (len(current_sub_chunk_lines) == 2 and (current_sub_chunk_char_count + row_len + 1 > target_chunk_size) and (current_sub_chunk_char_count + row_len + 1 <= max_chunk_size))
-        )
-
-        if should_add_to_current and (current_sub_chunk_char_count + row_len + 1 <= max_chunk_size):
-            current_sub_chunk_lines.append(data_row)
-            current_sub_chunk_char_count += row_len + 1
-        else:
-            # 完成当前子块
-            if len(current_sub_chunk_lines) > 2: # 确保至少有一行数据
-                sub_chunks_data.append({
-                    "text": "\n".join(current_sub_chunk_lines),
-                    "start_row_index": current_sub_chunk_start_row_idx,
-                    "end_row_index": i - 1 # 上一行是这个块的结束行
-                })
-                if context: context.log.debug(f"  Table sub-chunk created: rows {current_sub_chunk_start_row_idx}-{i-1}")
-
-            # 开始新的子块
-            current_sub_chunk_lines = [header_row, separator_row, data_row] # 当前行是新块的第一行数据
-            current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1 + len(data_row) + 1
-            current_sub_chunk_start_row_idx = i
-            
-            # 如果当前行（作为新块的第一行）自己就超长了（非常罕见，除非max_chunk_size很小）
-            if current_sub_chunk_char_count > max_chunk_size:
-                if context: context.log.warning(f"  Single data row (original index {i}) with header exceeds max_chunk_size. Creating chunk for this row anyway.")
-                # 即使超长，也为这一行创建一个块
-                sub_chunks_data.append({
-                    "text": "\n".join(current_sub_chunk_lines), # 包含表头、分隔符和这一超长行
-                    "start_row_index": i,
-                    "end_row_index": i 
-                })
-                if context: context.log.debug(f"  Table sub-chunk created for single very long row: {i}-{i}")
-                # 重置，准备下一个数据行（如果有的话）
-                current_sub_chunk_lines = [header_row, separator_row]
-                current_sub_chunk_char_count = len(header_row) + 1 + len(separator_row) + 1
-                current_sub_chunk_start_row_idx = i + 1
-
-
-    # 添加最后一个正在构建的子块
-    if len(current_sub_chunk_lines) > 2:
-        sub_chunks_data.append({
-            "text": "\n".join(current_sub_chunk_lines),
-            "start_row_index": current_sub_chunk_start_row_idx,
-            "end_row_index": len(data_rows) - 1 # 最后的数据行
-        })
-        if context: context.log.debug(f"  Table sub-chunk created (last): rows {current_sub_chunk_start_row_idx}-{len(data_rows)-1}")
-
-    if not sub_chunks_data and markdown_table_text:
-        if context: context.log.warning("Markdown table splitting by row resulted in no sub-chunks. Returning original table as one.")
-        return [{"text": markdown_table_text, "start_row_index": 0, "end_row_index": len(data_rows) -1 if data_rows else -1}]
+    for i in range(0, len(data_rows), ROWS_PER_CHUNK):
+        chunk_of_rows = data_rows[i:i + ROWS_PER_CHUNK]
         
-    return sub_chunks_data
+        # 每个块都包含表头和分隔符，以保证上下文完整
+        sub_chunk_text = "\n".join([header_row, separator_row] + chunk_of_rows)
+        
+        start_row_index = i
+        end_row_index = i + len(chunk_of_rows) - 1
 
+        sub_chunks_data.append({
+            "text": sub_chunk_text,
+            "start_row_index": start_row_index,
+            "end_row_index": end_row_index
+        })
+        if context:
+            context.log.debug(f"  Table sub-chunk created: data rows index {start_row_index}-{end_row_index}")
+    
+    return sub_chunks_data
+# --- END: 覆盖结束 ---
 
 
 def split_code_block_by_blank_lines(
@@ -339,7 +288,6 @@ def split_code_block_by_blank_lines(
     return final_sub_chunks if final_sub_chunks else [code_text]
 
 
-
 @dg.asset(
     name="text_chunks",
     description="Cleans/chunks documents. Splits long elements, merges short ones, enriches with contextual metadata.",
@@ -366,9 +314,8 @@ def clean_chunk_text_asset(
         if not parsed_doc.elements:
             context.log.warning(f"Document {doc_id_from_meta} has no structured elements.")
             if parsed_doc.parsed_text and parsed_doc.parsed_text.strip():
-                context.log.info(f"  Fallback: Document {doc_id_from_meta} has no elements, but has parsed_text. "
+                context.log.info(f"    Fallback: Document {doc_id_from_meta} has no elements, but has parsed_text. "
                                  f"Applying RecursiveCharacterTextSplitter to parsed_text.")
-                from langchain_text_splitters import RecursiveCharacterTextSplitter
                 text_splitter_fallback = RecursiveCharacterTextSplitter(
                     chunk_size=config.chunk_size,
                     chunk_overlap=config.chunk_overlap,
@@ -393,7 +340,7 @@ def clean_chunk_text_asset(
                             chunk_metadata=chunk_meta
                         ))
                 except Exception as e_fallback_split:
-                    context.log.error(f"  Error during fallback splitting for {doc_id_from_meta}: {e_fallback_split}")
+                    context.log.error(f"    Error during fallback splitting for {doc_id_from_meta}: {e_fallback_split}")
             continue
 
         doc_internal_chunk_counter = 0
@@ -403,6 +350,7 @@ def clean_chunk_text_asset(
             element_type_str = "unknown"
             source_element_metadata_from_element_obj = {}
 
+            # --- 这部分逻辑保持不变，用于提取各种元素的文本和类型 ---
             if isinstance(element, TitleElement) or (isinstance(element, dict) and element.get("element_type") == "title"):
                 element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
                 element_type_str = "title"
@@ -413,7 +361,7 @@ def clean_chunk_text_asset(
                 for key in keys_to_remove:
                     del current_title_hierarchy[key]
                 current_title_hierarchy[title_level] = element_text_content.strip()
-                logger.debug(f"  Updated title hierarchy for {doc_id_from_meta}: {current_title_hierarchy}")
+                logger.debug(f"    Updated title hierarchy for {doc_id_from_meta}: {current_title_hierarchy}")
 
             elif isinstance(element, NarrativeTextElement) or (isinstance(element, dict) and element.get("element_type") == "narrative_text"):
                 element_text_content = element.text if hasattr(element, 'text') else element.get("text", "")
@@ -424,23 +372,22 @@ def clean_chunk_text_asset(
                 source_element_metadata_from_element_obj["item_level"] = element.level if hasattr(element, 'level') else element.get("level")
                 source_element_metadata_from_element_obj["ordered"] = element.ordered if hasattr(element, 'ordered') else element.get("ordered")
                 source_element_metadata_from_element_obj["item_number"] = element.item_number if hasattr(element, 'item_number') else element.get("item_number")
-            
-            
+                
             elif isinstance(element, TableElement) or (isinstance(element, dict) and element.get("element_type") == "table"):
-                # --- 新逻辑开始 ---
-                element_text_content = "" # 先初始化
-                if hasattr(element, 'markdown_representation') and element.markdown_representation:
-                    element_text_content = element.markdown_representation
-                elif isinstance(element, dict): # 兼容字典形式
-                    element_text_content = element.get("markdown_representation", "")
+                element_text_content = ""
+                markdown_repr = getattr(element, 'markdown_representation', None) or (element.get("markdown_representation") if isinstance(element, dict) else None)
+                if markdown_repr:
+                    element_text_content = markdown_repr
                 
                 element_type_str = "table"
                 source_element_metadata_from_element_obj["caption"] = getattr(element, 'caption', element.get("caption") if isinstance(element, dict) else None)
                 
-                # 如果表格的Markdown表示本身不长，就直接把它作为一个完整的块
-                if element_text_content and len(element_text_content) <= config.max_element_text_length_before_split:
-                    context.log.info(f"  Table Element {element_idx} is short enough (len: {len(element_text_content)}). Treating as a single chunk.")
-                
+                # --- START: 核心修改 - 强制对所有表格进行分割逻辑检查 ---
+                # 无论表格长短，都尝试用 split_markdown_table_by_rows 处理
+                # 这个修改简化了逻辑，确保所有表格都经过统一的分割函数。
+                context.log.info(f"    Table Element {element_idx} (len: {len(element_text_content)}) in {doc_id_from_meta}. Forcing row-based splitting logic.")
+                # 这个修改将使得所有表格都进入下面的if分支
+                # --- END: 核心修改 ---
 
             elif isinstance(element, CodeBlockElement) or (isinstance(element, dict) and element.get("element_type") == "code_block"):
                 element_text_content = element.code if hasattr(element, 'code') else element.get("code", "")
@@ -448,11 +395,13 @@ def clean_chunk_text_asset(
                 source_element_metadata_from_element_obj["language"] = element.language if hasattr(element, 'language') else element.get("language")
             elif isinstance(element, PageBreakElement) or (isinstance(element, dict) and element.get("element_type") == "page_break"):
                 element_type_str = "page_break"
+            
+            # --- 后续逻辑保持不变 ---
 
             element_text_content = element_text_content.strip() if element_text_content else ""
 
             if not element_text_content and element_type_str != "page_break":
-                context.log.debug(f"  Element {element_idx} (type: {element_type_str}) in {doc_id_from_meta} has no text content, skipping chunk creation.")
+                context.log.debug(f"    Element {element_idx} (type: {element_type_str}) in {doc_id_from_meta} has no text content, skipping chunk creation.")
                 continue
             
             base_chunk_meta = parsed_doc.original_metadata.copy()
@@ -476,33 +425,30 @@ def clean_chunk_text_asset(
             if element_specific_meta:
                 base_chunk_meta.update({f"el_{k}": v for k, v in element_specific_meta.items()})
 
-            if len(element_text_content) > config.max_element_text_length_before_split:
+            if len(element_text_content) > config.max_element_text_length_before_split or element_type_str == "table": # <--- 核心修改，确保表格进入此分支
                 sub_chunks_created_count = 0
                 
-                if element_type_str == "table" and hasattr(element, 'markdown_representation') and element.markdown_representation:
-                    context.log.info(f"  Table Element {element_idx} (markdown_len: {len(element.markdown_representation)}) in {doc_id_from_meta} is too long. Attempting row-based splitting.")
+                # --- START: 核心修改 - 调整表格分割逻辑 ---
+                if element_type_str == "table" and element_text_content:
+                    context.log.info(f"    Table Element {element_idx} (markdown_len: {len(element_text_content)}) in {doc_id_from_meta} is being processed by row-based splitting logic.")
                     table_sub_chunks_data = split_markdown_table_by_rows(
-                        element.markdown_representation,
+                        element_text_content,
                         config.target_sentence_split_chunk_size,
                         config.max_merged_chunk_size,
                         context
                     )
                     
-                    if table_sub_chunks_data and \
-                       (len(table_sub_chunks_data) > 1 or
-                       (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["text"] != element.markdown_representation) or
-                       (len(table_sub_chunks_data) == 1 and table_sub_chunks_data[0]["start_row_index"] != -1)):
-                        
-                        context.log.info(f"    Successfully split/processed table into {len(table_sub_chunks_data)} sub-chunk(s) by row.")
+                    if table_sub_chunks_data:
+                        context.log.info(f"      Successfully processed/split table into {len(table_sub_chunks_data)} sub-chunk(s) by row.")
                         for sub_idx, chunk_data_dict in enumerate(table_sub_chunks_data):
                             doc_internal_chunk_counter += 1
                             chunk_meta = base_chunk_meta.copy()
                             chunk_meta.update({
                                 "chunk_number_in_doc": doc_internal_chunk_counter,
                                 "source_element_type": "table_row_chunk",
-                                "chunking_strategy": "table_split_by_row_v1",
+                                "chunking_strategy": "table_split_by_row_v2",
                                 "is_split_from_long_element": True,
-                                "original_element_text_length": len(element.markdown_representation),
+                                "original_element_text_length": len(element_text_content),
                                 "sub_chunk_sequence_in_element": sub_idx + 1,
                                 "total_sub_chunks_from_element": len(table_sub_chunks_data),
                                 "table_original_start_row": chunk_data_dict["start_row_index"],
@@ -510,12 +456,14 @@ def clean_chunk_text_asset(
                             })
                             initial_chunks.append(ChunkOutput(chunk_text=chunk_data_dict["text"], source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
                             sub_chunks_created_count += 1
-                        if sub_chunks_created_count > 0: continue
+                        if sub_chunks_created_count > 0:
+                            continue # 表格处理完毕，跳到下一个元素
                     else:
-                        context.log.warning(f"    Row-based splitting of table (idx {element_idx}) did not result in valid sub-chunks or was not applicable. Falling back to sentence splitting for the entire table markdown.")
+                        context.log.warning(f"      Row-based splitting of table (idx {element_idx}) did not result in valid sub-chunks. It will be treated as a single large text block and processed by sentence splitting.")
+                # --- END: 核心修改 ---
 
                 elif element_type_str == "code_block":
-                    context.log.info(f"  Code Block Element {element_idx} (len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting blank line splitting.")
+                    context.log.info(f"    Code Block Element {element_idx} (len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting blank line splitting.")
                     code_sub_chunks = split_code_block_by_blank_lines(
                         element_text_content,
                         config.target_sentence_split_chunk_size,
@@ -523,7 +471,7 @@ def clean_chunk_text_asset(
                         context
                     )
                     if code_sub_chunks and (len(code_sub_chunks) > 1 or code_sub_chunks[0] != element_text_content):
-                        context.log.info(f"    Successfully split code block into {len(code_sub_chunks)} sub-chunks by blank lines.")
+                        context.log.info(f"      Successfully split code block into {len(code_sub_chunks)} sub-chunks by blank lines.")
                         for sub_idx, sub_chunk_text in enumerate(code_sub_chunks):
                             if not sub_chunk_text.strip(): continue
                             doc_internal_chunk_counter += 1
@@ -541,13 +489,12 @@ def clean_chunk_text_asset(
                             sub_chunks_created_count += 1
                         if sub_chunks_created_count > 0: continue
                     else:
-                        context.log.warning(f"    Blank line splitting of code block (idx {element_idx}) did not result in multiple chunks or failed. Falling back to sentence/char splitting for the code content.")
+                        context.log.warning(f"      Blank line splitting of code block (idx {element_idx}) did not result in multiple chunks or failed. Falling back to sentence/char splitting for the code content.")
 
-                context.log.info(f"  Element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting sentence splitting (or fallback).")
+                context.log.info(f"    Element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} is too long. Attempting sentence splitting (or fallback).")
                 sentences = split_text_into_sentences(element_text_content)
                 if not sentences:
-                    context.log.warning(f"    Could not split element {element_idx} into sentences. Using RecursiveCharacterTextSplitter as fallback.")
-                    from langchain_text_splitters import RecursiveCharacterTextSplitter
+                    context.log.warning(f"      Could not split element {element_idx} into sentences. Using RecursiveCharacterTextSplitter as fallback.")
                     char_splitter = RecursiveCharacterTextSplitter(
                         chunk_size=config.chunk_size,
                         chunk_overlap=config.chunk_overlap,
@@ -566,7 +513,7 @@ def clean_chunk_text_asset(
                             "total_sub_chunks_from_element": len(sub_chunks_texts),
                         })
                         initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
-                        context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_texts)} (char_split) from element {element_idx} for {doc_id_from_meta}")
+                        context.log.info(f"      Created sub-chunk {sub_idx+1}/{len(sub_chunks_texts)} (char_split) from element {element_idx} for {doc_id_from_meta}")
                 else:
                     current_sub_chunk_sentences = []
                     current_sub_chunk_length = 0
@@ -574,7 +521,7 @@ def clean_chunk_text_asset(
                     for i, sentence in enumerate(sentences):
                         sentence_len = len(sentence)
                         if not current_sub_chunk_sentences or \
-                           (current_sub_chunk_length + sentence_len + (1 if current_sub_chunk_sentences else 0) <= config.target_sentence_split_chunk_size):
+                        (current_sub_chunk_length + sentence_len + (1 if current_sub_chunk_sentences else 0) <= config.target_sentence_split_chunk_size):
                             current_sub_chunk_sentences.append(sentence)
                             current_sub_chunk_length += sentence_len + (1 if len(current_sub_chunk_sentences) > 1 else 0)
                         else:
@@ -599,8 +546,8 @@ def clean_chunk_text_asset(
                             "total_sub_chunks_from_element": len(sub_chunks_generated_for_element),
                         })
                         initial_chunks.append(ChunkOutput(chunk_text=sub_chunk_text, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
-                        context.log.info(f"    Created sub-chunk {sub_idx+1}/{len(sub_chunks_generated_for_element)} (sentence_split) from element {element_idx} for {doc_id_from_meta}")
-            
+                        context.log.info(f"      Created sub-chunk {sub_idx+1}/{len(sub_chunks_generated_for_element)} (sentence_split) from element {element_idx} for {doc_id_from_meta}")
+                
             else:
                 doc_internal_chunk_counter += 1
                 chunk_meta = base_chunk_meta.copy()
@@ -611,7 +558,7 @@ def clean_chunk_text_asset(
                     "original_element_text_length": len(element_text_content),
                 })
                 initial_chunks.append(ChunkOutput(chunk_text=element_text_content, source_document_id=doc_id_from_meta, chunk_metadata=chunk_meta))
-                context.log.info(f"  Created chunk from element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} (not split).")
+                context.log.info(f"    Created chunk from element {element_idx} (type: {element_type_str}, len: {len(element_text_content)}) in {doc_id_from_meta} (not split).")
 
     if not initial_chunks:
         context.log.info("No initial chunks to process for merging.")
@@ -619,7 +566,7 @@ def clean_chunk_text_asset(
 
     context.log.info(f"Starting short chunk merging process. Initial chunks: {len(initial_chunks)}")
     context.log.info(f"Merging config: MinLenToAvoidMerge={config.min_chunk_length_to_avoid_merge}, MaxMergedSize={config.max_merged_chunk_size}")
-    
+
     merged_chunks: List[ChunkOutput] = []
     i = 0
     while i < len(initial_chunks):
@@ -628,7 +575,7 @@ def clean_chunk_text_asset(
         merged_this_iteration = False
 
         if len(current_chunk.chunk_text) < config.min_chunk_length_to_avoid_merge or \
-           current_chunk.chunk_metadata.get("source_element_type") == "title":
+        current_chunk.chunk_metadata.get("source_element_type") == "title":
 
             chunks_to_merge = [current_chunk]
             current_merged_text = current_chunk.chunk_text
@@ -652,8 +599,8 @@ def clean_chunk_text_asset(
                 )
 
                 if is_current_short_title and is_next_short_narrative and \
-                   current_chunk.source_document_id == next_chunk.source_document_id and \
-                   current_chunk.chunk_metadata.get("source_element_index", -2) + 1 == next_chunk.chunk_metadata.get("source_element_index", -1):
+                current_chunk.source_document_id == next_chunk.source_document_id and \
+                current_chunk.chunk_metadata.get("source_element_index", -2) + 1 == next_chunk.chunk_metadata.get("source_element_index", -1):
                     
                     temp_merged_text = current_chunk.chunk_text + "\n\n" + next_chunk.chunk_text
                     if len(temp_merged_text) <= config.max_merged_chunk_size:
@@ -664,9 +611,9 @@ def clean_chunk_text_asset(
 
                 if not can_merge:
                     if current_chunk.chunk_metadata.get("is_split_from_long_element") and \
-                       next_chunk.chunk_metadata.get("is_split_from_long_element") and \
-                       current_chunk.chunk_metadata.get("source_document_id") == next_chunk.chunk_metadata.get("source_document_id") and \
-                       current_chunk.chunk_metadata.get("source_element_index") == next_chunk.chunk_metadata.get("source_element_index"):
+                    next_chunk.chunk_metadata.get("is_split_from_long_element") and \
+                    current_chunk.chunk_metadata.get("source_document_id") == next_chunk.chunk_metadata.get("source_document_id") and \
+                    current_chunk.chunk_metadata.get("source_element_index") == next_chunk.chunk_metadata.get("source_element_index"):
                         
                         separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
                         temp_merged_text = current_merged_text + separator + next_chunk.chunk_text
@@ -681,7 +628,7 @@ def clean_chunk_text_asset(
                          current_chunk.chunk_metadata.get("source_document_id") == next_chunk.chunk_metadata.get("source_document_id") and \
                          current_chunk.chunk_metadata.get("source_element_type") == next_chunk.chunk_metadata.get("source_element_type") and \
                          current_chunk.chunk_metadata.get("source_element_index", -2) + 1 == next_chunk.chunk_metadata.get("source_element_index", -1):
-                         
+                        
                         separator = "\n" if current_chunk.chunk_metadata.get("source_element_type") == "list_item" else " "
                         temp_merged_text = current_merged_text + separator + next_chunk.chunk_text
                         if len(temp_merged_text) <= config.max_merged_chunk_size:
@@ -725,7 +672,7 @@ def clean_chunk_text_asset(
                         chunk_metadata=merged_meta
                     )
                     merged_chunks.append(merged_chunk_output)
-                    context.log.info(f"  Merged 2 chunks (indices {i} and {i+1}) into one. New len: {len(potential_merged_text)}. Strategy: {merged_meta['chunking_strategy']}.")
+                    context.log.info(f"    Merged 2 chunks (indices {i} and {i+1}) into one. New len: {len(potential_merged_text)}. Strategy: {merged_meta['chunking_strategy']}.")
                     i += 2
                     merged_this_iteration = True
             
@@ -741,18 +688,15 @@ def clean_chunk_text_asset(
     context.add_output_metadata(metadata={"total_chunks_generated_after_merge": len(merged_chunks)})
     return merged_chunks
 
-
-# 在 processing_assets.py 中
-
 @dg.asset(
     name="text_embeddings",
     description="Generates vector embeddings for text chunks.",
     group_name="processing",
     deps=["text_chunks"]
 )
-def generate_embeddings_asset(
+def generate_embeddings_asset( # <--- 保持同步，因为 GGUFEmbeddingResource.encode 是同步包装
     context: dg.AssetExecutionContext,
-    text_chunks: List[ChunkOutput], # <--- 这是 text_chunks 资产的输出
+    text_chunks: List[ChunkOutput],
     embedder: GGUFEmbeddingResource
 ) -> List[EmbeddingOutput]:
     # +++ 新增打印语句 +++
@@ -793,7 +737,7 @@ def generate_embeddings_asset(
     embedding_map = {text: vec for text, vec in zip(chunk_texts_to_encode, vectors)}
 
     for i, chunk_input in enumerate(text_chunks):
-        model_name_for_log = embedder.embedding_model_path
+        model_name_for_log = os.getenv("EMBEDDING_MODEL_PATH", "API_Based_Embedder")
         embedding_vector_for_chunk = [0.0] * embedder.get_embedding_dimension() # 默认为零向量
 
         if chunk_input.chunk_text and chunk_input.chunk_text.strip() and chunk_input.chunk_text in embedding_map:
@@ -825,27 +769,38 @@ def generate_embeddings_asset(
 )
 def vector_storage_asset(
     context: dg.AssetExecutionContext,
-    text_embeddings: List[EmbeddingOutput], # 这应该是来自 generate_embeddings_asset 的输出
-    chroma_db: ChromaDBResource # 这是注入的 ChromaDBResource 实例
+    text_embeddings: List[EmbeddingOutput],
+    chroma_db: ChromaDBResource
 ) -> None:
     if not text_embeddings:
         context.log.warning("vector_storage_asset: No embeddings received, nothing to store in ChromaDB.")
         context.add_output_metadata(metadata={"num_embeddings_stored": 0})
         return
 
-    ids_to_store = [emb.chunk_id for emb in text_embeddings]
-    embeddings_to_store = [emb.embedding_vector for emb in text_embeddings]
-    documents_to_store = [emb.chunk_text for emb in text_embeddings] # 获取真实的文本内容
+    # --- START: 核心修复 ---
+    # 筛选出那些拥有有效（非空）嵌入向量的条目
+    valid_embeddings_to_store: List[EmbeddingOutput] = []
+    for emb in text_embeddings:
+        if emb.embedding_vector and len(emb.embedding_vector) > 0:
+            valid_embeddings_to_store.append(emb)
+        else:
+            context.log.warning(f"Skipping storage for chunk_id {emb.chunk_id} due to empty embedding vector.")
     
-    cleaned_metadatas: List[Dict[str, Any]] = []
-    for i, emb_output in enumerate(text_embeddings):
-        # 确保原始元数据存在且是字典
-        original_meta = emb_output.original_chunk_metadata if isinstance(emb_output.original_chunk_metadata, dict) else {}
-        meta = original_meta.copy() # 使用副本
+    if not valid_embeddings_to_store:
+        context.log.warning("vector_storage_asset: No valid embeddings found after filtering. Nothing to store.")
+        context.add_output_metadata(metadata={"num_embeddings_stored": 0, "num_invalid_embeddings_skipped": len(text_embeddings)})
+        return
         
-        # 确保 chunk_text 也加入到元数据中（如果需要的话，或者仅依赖 documents 参数）
-        # ChromaDB 的 documents 参数用于存储主要文本，元数据用于附加信息
-        # 但为了调试和可能的回退，在元数据中也保留一份 chunk_text 是有益的
+    ids_to_store = [emb.chunk_id for emb in valid_embeddings_to_store]
+    embeddings_to_store = [emb.embedding_vector for emb in valid_embeddings_to_store]
+    documents_to_store = [emb.chunk_text for emb in valid_embeddings_to_store]
+    cleaned_metadatas: List[Dict[str, Any]] = []
+
+    for i, emb_output in enumerate(valid_embeddings_to_store):
+    # --- END: 核心修复 ---
+        original_meta = emb_output.original_chunk_metadata if isinstance(emb_output.original_chunk_metadata, dict) else {}
+        meta = original_meta.copy()
+        
         meta["chunk_text_in_meta"] = str(emb_output.chunk_text) if emb_output.chunk_text is not None else "[TEXT IS NULL]"
 
         cleaned_meta_item: Dict[str, Any] = {}
@@ -871,6 +826,14 @@ def vector_storage_asset(
             else: 
                 cleaned_meta_item[key] = value
         cleaned_metadatas.append(cleaned_meta_item)
+
+    # +++ 新增日志 +++
+    if embeddings_to_store:
+        context.log.info(f"vector_storage_asset: Sample embedding vector to be stored (first item, first 10 elements): {str(embeddings_to_store[0][:10]) if embeddings_to_store[0] else 'None'}")
+        context.log.info(f"vector_storage_asset: Length of first embedding vector to be stored: {len(embeddings_to_store[0]) if embeddings_to_store[0] else 'N/A'}")
+        is_first_all_zeros = all(v == 0.0 for v in embeddings_to_store[0]) if embeddings_to_store[0] else "N/A"
+        context.log.info(f"vector_storage_asset: Is first sample embedding all zeros: {is_first_all_zeros}")
+    # +++ 结束新增日志 +++
 
     context.log.info(f"vector_storage_asset: Preparing to add/update {len(ids_to_store)} items to ChromaDB collection '{chroma_db.collection_name}'.")
     if ids_to_store:
@@ -1222,11 +1185,35 @@ def duckdb_nodes_asset(
     duckdb_kg: DuckDBResource,               # <--- 修改资源参数
     embedder: GGUFEmbeddingResource          # 保持对 embedder 的依赖，用于生成嵌入
 ):
+        # --- START: 移动并强化初始日志 ---
+    print("<<<<< duckdb_nodes_asset FUNCTION ENTERED - PRINTING TO STDOUT >>>>>", flush=True) 
+    # 尝试使用 context.log，如果它此时可用
+    try:
+        context.log.info("<<<<< duckdb_nodes_asset FUNCTION CALLED - VIA CONTEXT.LOG - VERY BEGINNING >>>>>")
+    except Exception as e_log_init:
+        print(f"Context.log not available at the very beginning of duckdb_nodes_asset: {e_log_init}", flush=True)
+    # --- END: 移动并强化初始日志 ---
+
     context.log.info("--- Starting DuckDB Node Loading Asset (Using INSERT ON CONFLICT) ---")
     if not kg_extractions:
         context.log.warning("No KG extractions received. Skipping node loading.")
         return
 
+    # +++ 新增调试日志：检查表是否存在 +++
+    try:
+        with duckdb_kg.get_connection() as conn_debug:
+            context.log.info("Attempting to list tables in DuckDB from duckdb_nodes_asset:")
+            tables = conn_debug.execute("SHOW TABLES;").fetchall()
+            context.log.info(f"Tables found: {tables}")
+            if any('"ExtractedEntity"' in str(table_row).upper() for table_row in tables) or \
+               any('ExtractedEntity' in str(table_row) for table_row in tables) : # 检查大小写不敏感的匹配
+                context.log.info("Table 'ExtractedEntity' (or similar) IS visible at the start of duckdb_nodes_asset.")
+            else:
+                context.log.warning("Table 'ExtractedEntity' IS NOT visible at the start of duckdb_nodes_asset. Schema asset might not have run correctly or changes are not reflected.")
+    except Exception as e_debug_show:
+        context.log.error(f"Error trying to list tables in duckdb_nodes_asset: {e_debug_show}")
+    # +++ 结束新增调试日志 +++
+    
     unique_nodes_data_for_insert: List[Dict[str, Any]] = []
     unique_nodes_keys = set() # 用于在Python层面去重，避免多次尝试插入相同实体
 
@@ -1273,7 +1260,7 @@ def duckdb_nodes_asset(
     nodes_updated_count = 0
 
     upsert_sql = f"""
-    INSERT INTO ExtractedEntity (id_prop, text, label, embedding)
+    INSERT INTO "ExtractedEntity" (id_prop, text, label, embedding)
     VALUES (?, ?, ?, ?)
     ON CONFLICT (id_prop) DO UPDATE SET
         text = excluded.text,
@@ -1308,11 +1295,9 @@ def duckdb_nodes_asset(
                     context.log.error(f"Error UPSERTING node with id_prop {node_data_dict.get('id_prop')} into DuckDB: {e_upsert_item}", exc_info=True)
             
             # 我们可以查一下表中的总行数来间接了解情况
-            total_rows_after = conn.execute("SELECT COUNT(*) FROM ExtractedEntity").fetchone()[0]
+            total_rows_after = conn.execute('SELECT COUNT(*) FROM "ExtractedEntity"').fetchone()[0]
             context.log.info(f"Successfully processed {nodes_processed_count} node upsert operations into DuckDB.")
             context.log.info(f"Total rows in ExtractedEntity table after upsert: {total_rows_after}")
-            # 注意：这里的 nodes_processed_count 不直接等于插入或更新数，而是尝试操作的次数
-            # 如果需要精确计数插入/更新，需要更复杂的逻辑或DuckDB特定功能
 
     except Exception as e_db_nodes:
         context.log.error(f"Error during DuckDB node loading: {e_db_nodes}", exc_info=True)
@@ -1323,7 +1308,6 @@ def duckdb_nodes_asset(
         "nodes_processed_by_upsert_statement": nodes_processed_count,
     })
     context.log.info("--- DuckDB Node Loading Asset Finished ---")
-
 
 
 @dg.asset(

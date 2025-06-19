@@ -106,6 +106,13 @@ class ChromaDBRetriever:
                 logger.error(f"Failed to generate embedding for query: {query_text[:100]}")
                 return []
             
+            # +++ 新增日志 +++
+            logger.info(f"ChromaDBRetriever: Query embedding for '{query_text[:50]}' (first 10 elements): {str(query_embedding[:10])}")
+            logger.info(f"ChromaDBRetriever: Length of query embedding: {len(query_embedding)}")
+            is_query_emb_all_zeros = all(v == 0.0 for v in query_embedding)
+            logger.info(f"ChromaDBRetriever: Is query embedding all zeros: {is_query_emb_all_zeros}")
+            # +++ 结束新增日志 +++
+
             def _blocking_query():
                 include_fields_query = include_fields if include_fields is not None else ["metadatas", "documents", "distances"]
                 # --- 核心修改：在查询时应用 where_filter ---

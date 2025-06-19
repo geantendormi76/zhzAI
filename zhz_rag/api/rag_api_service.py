@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 import uuid
 from datetime import datetime, timezone
 from cachetools import TTLCache
-import hashlib # <--- 添加这一行
+import hashlib
 
 # --- .env 文件加载 (保持不变) ---
 _current_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,17 +35,18 @@ from zhz_rag.llm.llm_interface import (
     generate_expansion_and_entities, 
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
-from zhz_rag.llm.rag_prompts import ( # <--- 新增的导入块
+from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
     get_table_qa_messages
 )
-from zhz_rag.llm.local_model_handler import LocalModelHandler
+from zhz_rag.llm.local_model_handler import LlamaCppEmbeddingFunction as LocalModelHandlerWrapper
 from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
 from zhz_rag.core_rag.retrievers.file_bm25_retriever import FileBM25Retriever
 from zhz_rag.core_rag.kg_retriever import KGRetriever
-from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
+from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction # Re-importing from here for clarity after changes
 from zhz_rag.core_rag.fusion_engine import FusionEngine
 from zhz_rag.utils.interaction_logger import log_interaction_data
+from zhz_rag_pipeline_dagster.zhz_rag_pipeline.resources import GGUFEmbeddingResource # <--- 新增导入
 
 # --- 日志配置 (保持不变) ---
 api_logger = logging.getLogger("RAGApiServiceLogger")
@@ -71,41 +72,87 @@ async def log_writer_task():
         except Exception as e:
             api_logger.error(f"Critical error in log_writer_task: {e}", exc_info=True)
 
-# --- 应用上下文和生命周期管理 (保持不变) ---
+# --- 应用上下文和生命周期管理 ---
 @dataclass
 class RAGAppContext:
-    model_handler: LocalModelHandler
+    model_handler: LlamaCppEmbeddingFunction # This will now encapsulate GGUFEmbeddingResource
     chroma_retriever: ChromaDBRetriever
     kg_retriever: KGRetriever
     file_bm25_retriever: FileBM25Retriever
     fusion_engine: FusionEngine
     answer_cache: TTLCache
+    gguf_embedding_resource: GGUFEmbeddingResource # Keep a direct reference for teardown
     
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # (这部分所有组件的初始化代码都保持不变)
     api_logger.info("--- RAG API Service: Initializing RAG components... ---")
     llm_gguf_model_path_for_handler = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
-    embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH")
+    embedding_gguf_model_path = os.getenv("EMBEDDING_MODEL_PATH") # This will now be used by GGUFEmbeddingResource
     chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
     bm25_index_dir = os.getenv("BM25_INDEX_DIRECTORY")
     duckdb_file_path_for_api = os.getenv("DUCKDB_KG_FILE_PATH")
-    embedding_pool_size = int(os.getenv("EMBEDDING_SUBPROCESS_POOL_SIZE", "2"))
+    embedding_pool_size = int(os.getenv("EMBEDDING_SUBPROCESS_POOL_SIZE", "2")) # Not directly used by GGUFEmbeddingResource
+
+    # Environment variable checks (kept for completeness, assuming they are in .env)
+    if not llm_gguf_model_path_for_handler:
+        api_logger.warning("LOCAL_LLM_GGUF_MODEL_PATH not set. LLM functionality may be limited.")
+    if not embedding_gguf_model_path:
+        api_logger.warning("EMBEDDING_MODEL_PATH not set. Embedding functionality may be limited.")
+    if not chroma_persist_dir:
+        api_logger.warning("CHROMA_PERSIST_DIRECTORY not set. ChromaDB will use in-memory mode or fail.")
+    if not bm25_index_dir:
+        api_logger.warning("BM25_INDEX_DIRECTORY not set. BM25 retrieval will not function.")
+    if not duckdb_file_path_for_api:
+        api_logger.warning("DUCKDB_KG_FILE_PATH not set. KG retrieval will not function.")
     
-    # (所有环境变量检查和组件初始化逻辑都保持不变)
     try:
-        model_handler = LocalModelHandler(
-            llm_model_path=llm_gguf_model_path_for_handler, embedding_model_path=embedding_gguf_model_path,
-            n_gpu_layers_embed=int(os.getenv("EMBEDDING_N_GPU_LAYERS", 0)), n_gpu_layers_llm=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
-            embedding_pool_size=embedding_pool_size
+        # 1. Initialize GGUFEmbeddingResource (这部分保持不变)
+        embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://127.0.0.1:8089")
+        api_logger.info(f"Attempting to initialize GGUFEmbeddingResource with API URL: {embedding_api_url}")
+        class FakeDagsterContext:
+            def __init__(self, logger_instance): self.log = logger_instance
+        fake_dagster_context = FakeDagsterContext(api_logger)
+        gguf_embed_resource = GGUFEmbeddingResource(api_url=embedding_api_url)
+        await asyncio.to_thread(gguf_embed_resource.setup_for_execution, fake_dagster_context) 
+        api_logger.info(f"GGUFEmbeddingResource setup called. Dimension: {gguf_embed_resource.get_embedding_dimension()}")
+
+        # 2. Create the "model_handler" instance using the class from local_model_handler.py
+        #    This instance will be passed to the LlamaCppEmbeddingFunction from core_rag.
+        #    Pass the embedding_model_path it might need for validation or logging.
+        actual_embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH")
+        the_model_handler_for_core_rag = LocalModelHandlerWrapper(
+            resource=gguf_embed_resource,
+            embedding_model_path_for_handler=actual_embedding_model_path
         )
-        custom_embed_fn = LlamaCppEmbeddingFunction(model_handler=model_handler)
+        api_logger.info("LocalModelHandlerWrapper (acting as model_handler) initialized.")
+
+        # 3. Now initialize LlamaCppEmbeddingFunction (from core_rag) using the_model_handler_for_core_rag
+        #    This is the embedding function that ChromaDB will use.
+        #    The parameter name is 'model_handler'.
+        chroma_embedding_function = LlamaCppEmbeddingFunction(model_handler=the_model_handler_for_core_rag)
+        api_logger.info("LlamaCppEmbeddingFunction (for ChromaDB) initialized with LocalModelHandlerWrapper.")
+        
+        # 4. Update RAGAppContext and other components
+        #    'model_handler' in RAGAppContext should probably be the_model_handler_for_core_rag
+        #    or chroma_embedding_function depending on its intended use elsewhere.
+        #    Let's assume 'model_handler' in RAGAppContext is the higher-level one.
+        
+        #    'custom_embed_fn' for ChromaDBRetriever is chroma_embedding_function
+        #    'embedder' for KGRetriever should also be chroma_embedding_function (or compatible)
+
+        app_ctx_model_handler = chroma_embedding_function # This is the one used by Chroma and KG
+
         chroma_retriever_instance = ChromaDBRetriever(
-            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "rag_documents"), persist_directory=chroma_persist_dir,
-            embedding_function=custom_embed_fn
+            collection_name=os.getenv("CHROMA_COLLECTION_NAME", "zhz_rag_collection"), # <--- 修改这里
+            persist_directory=chroma_persist_dir,
+            embedding_function=app_ctx_model_handler # 或者之前用的 custom_embed_fn，确保它正确初始化
         )
         file_bm25_retriever_instance = FileBM25Retriever(index_directory=bm25_index_dir)
-        kg_retriever_instance = KGRetriever(db_file_path=duckdb_file_path_for_api, embedder=model_handler)
+        
+        kg_retriever_instance = KGRetriever(
+            db_file_path=duckdb_file_path_for_api, 
+            embedder=app_ctx_model_handler 
+        )
        
         rrf_k_env_str = os.getenv("RRF_K_VALUE", "60")
         try:
@@ -116,13 +163,16 @@ async def lifespan(app: FastAPI):
         
         fusion_engine_instance = FusionEngine(logger=api_logger, rrf_k=rrf_k_setting)
         
-        final_answer_cache = TTLCache(maxsize=100, ttl=900) # 缓存100个最终答案，存活15分钟
+        final_answer_cache = TTLCache(maxsize=100, ttl=900) # Cache 100 final answers for 15 minutes
         
         app.state.rag_context = RAGAppContext(
-            model_handler=model_handler, chroma_retriever=chroma_retriever_instance,
-            kg_retriever=kg_retriever_instance, file_bm25_retriever=file_bm25_retriever_instance,
+            model_handler=app_ctx_model_handler, # <--- 更新这里
+            chroma_retriever=chroma_retriever_instance,
+            kg_retriever=kg_retriever_instance, 
+            file_bm25_retriever=file_bm25_retriever_instance,
             fusion_engine=fusion_engine_instance,
-            answer_cache=final_answer_cache # <--- 添加这一行
+            answer_cache=final_answer_cache,
+            gguf_embedding_resource=gguf_embed_resource # Store the resource for proper teardown
         )
         
         api_logger.info("--- RAG components initialized successfully. ---")
@@ -131,22 +181,36 @@ async def lifespan(app: FastAPI):
         api_logger.critical(f"FATAL: Failed to initialize RAG components: {e}", exc_info=True)
         app.state.rag_context = None
     
-    yield
+    yield # This is the FastAPI lifespan's yield point
     
     api_logger.info("--- RAG API Service: Cleaning up resources ---")
-    if app.state.rag_context and hasattr(app.state.rag_context.model_handler, 'close_embedding_pool'):
-        app.state.rag_context.model_handler.close_embedding_pool()
+    
+    # Clean up GGUFEmbeddingResource using its teardown_for_execution method
+    if app.state.rag_context and app.state.rag_context.gguf_embedding_resource:
+        if hasattr(app.state.rag_context.gguf_embedding_resource, 'teardown_for_execution'):
+            api_logger.info("Calling teardown_for_execution on GGUFEmbeddingResource...")
+            class FakeDagsterContext: # Temporary helper class for teardown
+                def __init__(self, logger_instance):
+                    self.log = logger_instance
+            fake_dagster_context_teardown = FakeDagsterContext(api_logger)
+            await asyncio.to_thread(app.state.rag_context.gguf_embedding_resource.teardown_for_execution, fake_dagster_context_teardown)
+            api_logger.info("GGUFEmbeddingResource teardown_for_execution called.")
+        else:
+            api_logger.warning("GGUFEmbeddingResource does not have a teardown_for_execution method.")
+    else:
+        api_logger.warning("No RAGAppContext or GGUFEmbeddingResource found for teardown.")
+
     api_logger.info("--- Cleanup complete. ---")
 
 # --- FastAPI 应用实例 (保持不变) ---
 app = FastAPI(
     title="Upgraded Standalone RAG API Service",
     description="Provides API access to the RAG framework, now powered by Qwen3 models.",
-    version="2.0.2_fstring_fix", # 版本号更新
+    version="2.0.2_fstring_fix", # Version updated
     lifespan=lifespan
 )
 
-# ... (run_with_semaphore 等辅助函数保持不变) ...
+# --- Helper functions (kept unchanged) ---
 async def run_with_semaphore(semaphore: asyncio.Semaphore, coro_or_func_name: str, coro_obj):
     async with semaphore:
         api_logger.debug(f"Semaphore acquired for async task: {coro_or_func_name}")
@@ -199,27 +263,13 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
 
         expanded_queries = llm_planning_output.expanded_queries
         kg_extraction_info = llm_planning_output.extracted_entities_for_kg
-        # --- 核心修改：获取元数据过滤器 ---
         metadata_filter = llm_planning_output.metadata_filter
         
         api_logger.info(f"--- Step 2: Starting parallel retrieval for {len(expanded_queries)} queries. Metadata Filter: {metadata_filter} ---")
         
+        # --- START: 核心修改 ---
+        # 1. 对 KG 和 BM25 的检索任务保持不变，因为它们不受此元数据过滤器的影响
         kg_task = app_ctx.kg_retriever.retrieve(query_request.query, kg_extraction_info, query_request.top_k_kg)
-        
-        # --- 核心修改：将过滤器应用到 ChromaDB 召回任务中 ---
-        # 注意：我们只对ChromaDB使用元数据过滤，因为它支持最灵活的过滤。BM25和KG有自己的逻辑。
-        chroma_tasks = [
-            run_with_semaphore(
-                cpu_bound_semaphore, 
-                f"chroma.retrieve({q[:20]}..)", 
-                app_ctx.chroma_retriever.retrieve(
-                    q, 
-                    query_request.top_k_vector, 
-                    where_filter=metadata_filter  # <--- 将过滤器传递进去
-                )
-            ) for q in expanded_queries
-        ]
-
         bm25_tasks = [
             run_sync_with_semaphore(
                 cpu_bound_semaphore, 
@@ -230,10 +280,34 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             ) for q in expanded_queries
         ]
 
+        # 2. 对 ChromaDB 的检索任务进行智能过滤
+        chroma_tasks = []
+        for q in expanded_queries:
+            # 只有当查询是原始查询且规划器生成了过滤器时，才应用过滤器
+            # 这确保了针对特定文件的查询是精确的
+            # 而扩展出的其他相关问题则在整个知识库中搜索，以保证召回率
+            current_filter = metadata_filter if q == query_request.query else None
+            
+            api_logger.info(f"Chroma task for query '{q[:30]}...' will use filter: {current_filter}")
+            
+            chroma_tasks.append(
+                run_with_semaphore(
+                    cpu_bound_semaphore, 
+                    f"chroma.retrieve({q[:20]}..)", 
+                    app_ctx.chroma_retriever.retrieve(
+                        q, 
+                        query_request.top_k_vector, 
+                        where_filter=current_filter
+                    )
+                )
+            )
+        # --- END: 核心修改 ---
+
         retrieval_tasks = chroma_tasks + bm25_tasks + [run_with_semaphore(cpu_bound_semaphore, "kg.retrieve", kg_task)]
 
         results_from_gather = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
         
+        # ... (后续的融合、生成答案和日志记录逻辑保持不变) ...
         all_retrieved_docs: List[RetrievedDocument] = []
         bm25_results_to_enrich: List[Dict[str, Any]] = []
         for task_result_group in results_from_gather:
@@ -269,11 +343,9 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 ]
                 fused_context = "\n\n---\n\n".join(context_strings)
 
-                # --- 核心修改：智能路由选择Prompt ---
-                # 检查最终上下文中是否包含表格元素
                 contains_table = any(
-                    doc.metadata.get("source_element_type") == "table" or  # <--- 修改键名
-                    doc.metadata.get("source_element_type") == "table_row_chunk" # <--- 修改键名
+                    doc.metadata.get("source_element_type") == "table" or 
+                    doc.metadata.get("source_element_type") == "table_row_chunk"
                     for doc in final_context_docs_obj if doc.metadata
                 )
 
@@ -284,13 +356,12 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     api_logger.info("No table detected in context. Using general answer prompt builder.")
                     prompt_builder_to_use = get_answer_generation_messages
                 
-                # 使用新的 V2 答案生成函数
                 generated_final_answer = await generate_answer_from_context(
                     user_query=query_request.query, 
                     context_str=fused_context,
                     prompt_builder=prompt_builder_to_use
                 )
-                final_answer = generated_final_answer # v2函数已处理了None的情况
+                final_answer = generated_final_answer
         
         response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=final_context_docs_obj)
         
@@ -305,7 +376,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
              api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
 
     except Exception as e:
-        # ... (异常处理逻辑保持不变)
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
         exception_occurred = e
         response_to_return = HybridRAGResponse(
@@ -315,7 +385,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         log_data_for_finally = { "final_answer": response_to_return.answer, "final_docs": [], "expanded_queries": [], }
 
     finally:
-        # ... (日志记录逻辑保持不变)
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         interaction_log_entry = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -343,6 +412,8 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
              raise HTTPException(status_code=500, detail="Internal Server Error: Response generation failed unexpectedly.")
         
         return response_to_return
+    
+
 
 if __name__ == "__main__":
     api_logger.info("Starting Standalone RAG API Service with Producer-Consumer Logger...")

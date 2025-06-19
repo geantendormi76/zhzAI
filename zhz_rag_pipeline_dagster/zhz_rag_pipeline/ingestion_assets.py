@@ -2,6 +2,7 @@
 import dagster as dg
 import os
 from typing import List, Dict, Any, Union, Optional
+from datetime import datetime, timezone
 
 # --- 修改：导入分发器并设置Pydantic可用性标志 ---
 # 尝试导入Pydantic模型，并设置一个标志，以便在模型不可用时代码可以优雅地降级。
@@ -55,7 +56,8 @@ def load_documents_asset(
                     with open(file_path, 'rb') as f: # 以二进制模式读取以更好地处理不同编码
                         raw_bytes = f.read()
                     
-                    # 在parse_document_asset中进行更智能的解码
+                    # --- START: 覆盖这部分代码块 ---
+                    file_stat = os.stat(file_path)
                     doc_output_data = {
                         "document_path": file_path,
                         "file_type": file_extension,
@@ -63,9 +65,12 @@ def load_documents_asset(
                         "metadata": {
                             "filename": filename,
                             "source_directory": target_directory,
-                            "size_bytes": os.path.getsize(file_path)
+                            "size_bytes": file_stat.st_size,
+                            "creation_time_utc": datetime.fromtimestamp(file_stat.st_ctime, tz=timezone.utc).isoformat(),
+                            "modified_time_utc": datetime.fromtimestamp(file_stat.st_mtime, tz=timezone.utc).isoformat()
                         }
                     }
+                    # --- END: 覆盖结束 ---
 
                     if _PYDANTIC_AVAILABLE:
                         loaded_docs.append(LoadedDocumentOutput(**doc_output_data))

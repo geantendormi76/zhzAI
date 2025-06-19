@@ -1,0 +1,6 @@
+load_from:
+  - python_module:
+      # 指向我们包含 Dagster Definitions 的 Python 模块
+      module_name: zhz_rag_pipeline.definitions
+      # 为这个代码位置命名
+      location_name: "zhz_rag_pipeline_code"

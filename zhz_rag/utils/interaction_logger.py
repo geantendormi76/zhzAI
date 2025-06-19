@@ -8,6 +8,7 @@ import logging
 import aiofiles  # 使用 aiofiles 进行异步文件操作
 import uuid
 import traceback
+import sys # <--- 添加此行
 
 # --- 配置此模块的logger ---
 # 使用一个特定的名字，以便在项目中其他地方可以按名获取，避免与根logger混淆
@@ -122,3 +123,20 @@ async def log_interaction_data(
         # 在独立的日志系统中记录日志本身的错误
         interaction_logger_module_logger.error(f"Failed to log interaction data. Error: {e}", exc_info=True)
         interaction_logger_module_logger.error(f"Original log data that failed: {str(log_data)[:500]}")
+
+def get_logger(name: str) -> logging.Logger:
+    """
+    一个通用的函数，用于获取或创建具有标准配置的logger。
+    这避免了在每个模块中重复配置logger。
+    """
+    logger = logging.getLogger(name)
+    if not logger.hasHandlers():
+        logger.setLevel(os.getenv(f"{name.upper()}_LOG_LEVEL", "INFO").upper())
+        logger.propagate = False
+        handler = logging.StreamHandler(sys.stdout) # 确保日志输出到标准输出
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - PID:%(process)d - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
