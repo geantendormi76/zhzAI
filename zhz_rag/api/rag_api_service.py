@@ -40,7 +40,7 @@ from zhz_rag.llm.llm_interface import (
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
 # 修复: 移除 get_table_qa_messages 的导入，因为它导致了 AttributeError
-from zhz_rag.llm.rag_prompts import get_answer_generation_messages 
+from zhz_rag.llm.rag_prompts import get_answer_generation_messages, get_table_qa_messages
 from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
 from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
 from zhz_rag.llm.local_model_handler import LlamaCppEmbeddingFunction as LocalModelHandlerWrapper
@@ -184,7 +184,7 @@ app = FastAPI(
 # --- API 端点 ---
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
-    api_logger.info(f"\n--- Received RAG query (v3.1): '{query_request.query}' ---")
+    api_logger.info(f"\n--- Received RAG query (v3.2 - Expert Dispatch): '{query_request.query}' ---")
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
     if not app_ctx:
@@ -196,126 +196,102 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     log_data_for_finally: Dict[str, Any] = {}
 
     try:
-        # Cache check before any heavy processing
+        # --- 缓存逻辑保持不变 ---
         cache_key = hashlib.md5(query_request.model_dump_json().encode('utf-8')).hexdigest()
         cached_response = app_ctx.answer_cache.get(cache_key)
         if cached_response is not None:
             api_logger.info(f"FINAL ANSWER CACHE HIT for query: '{query_request.query}'")
-            response_to_return = cached_response
-            log_data_for_finally = {
-                "final_answer": response_to_return.answer,
-                "final_docs": [doc.model_dump() for doc in response_to_return.retrieved_sources],
-                "expanded_queries": ["FROM_CACHE"], # Indicate cache hit in logs
-            }
-            return response_to_return
+            return cached_response
 
-        api_logger.info(f"FINAL ANSWER CACHE MISS for query: '{query_request.query}'")
-
-        # --- START: V3.2 - 规划与元数据过滤 ---
-        # 1. 调用LLM规划器生成查询计划
-        api_logger.info(f"--- Step 1.1: Generating query plan for: '{query_request.query}' ---")
-        query_plan = await generate_query_plan(user_query=query_request.query)
+        # --- START: V3.2 - 最终版专家分派逻辑 ---
         
-        # 如果规划失败，则使用原始查询和空过滤器
-        if not query_plan:
-            api_logger.warning("Query plan generation failed. Falling back to basic query.")
-            search_query = query_request.query
-            metadata_filter = {}
-        else:
-            search_query = query_plan.query
-            metadata_filter = query_plan.metadata_filter
-            api_logger.info(f"Generated Plan -> Search Query: '{search_query}', Metadata Filter: {metadata_filter}")
+        # 1. 生成查询计划
+        api_logger.info(f"--- Step 1: Generating query plan for: '{query_request.query}' ---")
+        query_plan = await generate_query_plan(user_query=query_request.query)
+        search_query = query_plan.query if query_plan else query_request.query
+        metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
 
-            # --- 新增：简化元数据过滤器 ---
-            # ChromaDB 要求 $and/$or 列表至少有两个元素。如果只有一个，我们需要将其简化。
-            if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
-                metadata_filter = metadata_filter["$and"][0]
-                api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
-            elif metadata_filter and ("$or" in metadata_filter) and len(metadata_filter["$or"]) == 1:
-                metadata_filter = metadata_filter["$or"][0]
-                api_logger.info(f"Simplified single-element $or filter to: {metadata_filter}")
-            # --- 新增结束 ---
-            
-        # 2. 使用规划后的查询和过滤器，检索小块
-        api_logger.info(f"--- Step 1.2: Retrieving child chunks with generated plan ---")
+        # 2. 简化元数据过滤器
+        if "$and" in metadata_filter and len(metadata_filter["$and"]) == 1:
+            metadata_filter = metadata_filter["$and"][0]
+        elif "$or" in metadata_filter and len(metadata_filter["$or"]) == 1:
+            metadata_filter = metadata_filter["$or"][0]
+        api_logger.info(f"Plan -> Query: '{search_query}', Filter: {metadata_filter}")
+
+        # 3. 检索小块
+        api_logger.info(f"--- Step 2: Retrieving child chunks with plan ---")
         retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
             query_text=search_query,
             n_results=query_request.top_k_vector,
-            where_filter=metadata_filter if metadata_filter else None # <--- 应用元数据过滤器
+            where_filter=metadata_filter if metadata_filter else None
         )
-        api_logger.info(f"Retrieved {len(retrieved_child_chunks)} child chunks with filter.")
+        api_logger.info(f"Retrieved {len(retrieved_child_chunks)} child chunks.")
 
-        # 3. 从小块中提取父ID (逻辑不变)
-        parent_ids = [
-            chunk['metadata']['parent_id'] 
-            for chunk in retrieved_child_chunks 
-            if chunk.get('metadata') and chunk['metadata'].get('parent_id')
-        ]
-        unique_parent_ids = list(set(parent_ids))
-        api_logger.info(f"Found {len(unique_parent_ids)} unique parent document IDs.")
+        final_context_str = ""
+        final_context_docs_obj: List[RetrievedDocument] = []
+        prompt_builder_to_use = get_answer_generation_messages # 默认为通用专家
 
-        # 4. 从 docstore 获取父文档 (逻辑不变)
-        parent_docs = app_ctx.docstore.mget(unique_parent_ids)
-        
-        # 5. 准备最终上下文 (逻辑不变)
-        final_context_docs_obj = [
-            RetrievedDocument(
-                source_type="parent_document_retrieval",
-                content=doc.page_content,
-                score=1.0,
-                metadata=doc.metadata
-            ) for doc in parent_docs if doc is not None
-        ]
-        
-        # 6. 生成答案
-        api_logger.info(f"--- Step 2: Generating final answer from {len(final_context_docs_obj)} parent documents ---")
-        if not final_context_docs_obj:
+        # 4. 专家分派逻辑
+        if retrieved_child_chunks:
+            # 检查排名第一的小块是否是表格
+            top_chunk = retrieved_child_chunks[0]
+            top_chunk_meta = top_chunk.get('metadata', {})
+            top_chunk_type = top_chunk_meta.get('paragraph_type')
+
+            if top_chunk_type and 'Table' in top_chunk_type:
+                # --- 表格专家路径 ---
+                api_logger.info(f"EXPERT DISPATCH: Top chunk is a '{top_chunk_type}'. Using Table QA Expert.")
+                final_context_str = top_chunk.get('document', '') # 直接使用小块内容（即表格本身）
+                final_context_docs_obj = [RetrievedDocument(
+                    source_type="specialized_table_retrieval",
+                    content=final_context_str,
+                    score=top_chunk.get('distance', 1.0), # 可以用距离作为分数
+                    metadata=top_chunk_meta
+                )]
+                prompt_builder_to_use = get_table_qa_messages
+            else:
+                # --- 通用专家路径 (小块 -> 大块) ---
+                api_logger.info(f"EXPERT DISPATCH: Top chunk is '{top_chunk_type}'. Using General Context (Small-to-Big) Expert.")
+                parent_ids = list(set(
+                    chunk['metadata']['parent_id'] 
+                    for chunk in retrieved_child_chunks if chunk.get('metadata') and chunk['metadata'].get('parent_id')
+                ))
+                parent_docs = app_ctx.docstore.mget(parent_ids)
+                
+                final_context_docs_obj = [
+                    RetrievedDocument(
+                        source_type="parent_document_retrieval",
+                        content=doc.page_content,
+                        score=1.0,
+                        metadata=doc.metadata
+                    ) for doc in parent_docs if doc is not None
+                ]
+                context_strings = [f"Source: {doc.metadata.get('filename', 'N/A')}\nContent:\n{doc.content}" for doc in final_context_docs_obj]
+                final_context_str = "\n\n---\n\n".join(context_strings)
+
+        # 5. 生成答案
+        api_logger.info(f"--- Step 3: Generating final answer with selected expert ---")
+        if not final_context_str:
             final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
         else:
-            context_strings = [
-                f"Source Document ID: {doc.metadata.get('doc_id', 'N/A')}\nContent: {doc.content}" 
-                for doc in final_context_docs_obj
-            ]
-            fused_context = "\n\n---\n\n".join(context_strings)
-            
-            # 修复: 直接使用 get_answer_generation_messages 避免 get_table_qa_messages 报错
-            # 如果需要表格QA功能，确保 zhz_rag.llm.rag_prompts 中正确定义并导出 get_table_qa_messages
-            # For now, simplifying to avoid the AttributeError.
-            prompt_builder_to_use = get_answer_generation_messages
-            
             generated_final_answer = await generate_answer_from_context(
                 user_query=query_request.query, 
-                context_str=fused_context,
+                context_str=final_context_str,
                 prompt_builder=prompt_builder_to_use
             )
             final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
         
+        # --- END: 最终版专家分派逻辑 ---
+
         response_to_return = HybridRAGResponse(
             answer=final_answer, 
             original_query=query_request.query, 
             retrieved_sources=final_context_docs_obj
         )
         
-        log_data_for_finally = {
-            "final_answer": final_answer,
-            "final_docs": [doc.model_dump() for doc in final_context_docs_obj],
-            "expanded_queries": [query_request.query], # Only original query used for manual retrieval directly
-        }
-        
-        # Cache the successful response
-        if response_to_return.answer != "Error: Processing failed due to " and not response_to_return.debug_info:
+        if final_answer != NO_ANSWER_PHRASE_ANSWER_CLEAN:
             app_ctx.answer_cache[cache_key] = response_to_return
             api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
-
-    except Exception as e:
-        api_logger.error(f"Critical error in query_rag_endpoint (v3.1): {e}", exc_info=True)
-        exception_occurred = e
-        response_to_return = HybridRAGResponse(
-            answer=f"An internal error occurred: {str(e)}", original_query=query_request.query,
-            retrieved_sources=[], debug_info={"error": str(e), "type": type(e).__name__}
-        )
-        log_data_for_finally = { "final_answer": response_to_return.answer, "final_docs": [], "expanded_queries": [], }
-
     finally:
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         interaction_log_entry = {

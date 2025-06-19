@@ -3,6 +3,7 @@ import os
 from markdown_it import MarkdownIt
 import logging
 from typing import List, Dict, Any, Optional, Union, Literal 
+from bs4 import BeautifulSoup
 
 # --- 添加 Unstructured 的导入 ---
 try:
@@ -396,13 +397,64 @@ def parse_xlsx_to_structured_output(file_path: str, original_metadata: Dict[str,
         return {"parsed_text":text_content, "elements":elements, "original_metadata":original_metadata} # type: ignore
         
 def parse_html_to_structured_output(html_content_str: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
-    logger.info(f"Parsing HTML content (length: {len(html_content_str)} chars) (Not yet fully implemented in document_parsers.py)")
-    # Here you would integrate the BeautifulSoup logic from your PoC
-    text_content = f"[Placeholder: HTML content snippet {html_content_str[:100]}]"
-    elements = []
-    if _PYDANTIC_MODELS_AVAILABLE_PARSERS:
-        elements.append(NarrativeTextElement(text=text_content))
-        return ParsedDocumentOutput(parsed_text=text_content, elements=elements, original_metadata=original_metadata)
-    else:
-        elements.append({"element_type":"narrative_text", "text":text_content})
-        return {"parsed_text":text_content, "elements":elements, "original_metadata":original_metadata} # type: ignore
+    """
+    Parses an HTML string using BeautifulSoup, extracts meaningful elements,
+    and converts them to our internal Pydantic models.
+    """
+    logger.info(f"Parsing HTML content with BeautifulSoup (length: {len(html_content_str)} chars)...")
+    if not html_content_str.strip():
+        return None
+
+    try:
+        soup = BeautifulSoup(html_content_str, 'lxml')
+        
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+
+        elements: List[DocumentElementType] = [] # type: ignore
+        
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'li', 'pre']):
+            text = tag.get_text(separator=' ', strip=True)
+            if text:
+                if tag.name.startswith('h'):
+                    level = int(tag.name[1:])
+                    elements.append(TitleElement(text=text, level=level))
+                elif tag.name == 'li':
+                    elements.append(ListItemElement(text=text))
+                elif tag.name == 'pre':
+                    elements.append(CodeBlockElement(code=text))
+                else:
+                    elements.append(NarrativeTextElement(text=text))
+        
+        for table in soup.find_all('table'):
+            header = [th.get_text(strip=True) for th in table.find_all('th')]
+            rows = []
+            for tr in table.find_all('tr'):
+                cells = [td.get_text(strip=True) for td in tr.find_all('td')]
+                if cells:
+                    rows.append(cells)
+            
+            if header or rows:
+                md_table_parts = []
+                if header:
+                    md_table_parts.append(f"| {' | '.join(header)} |")
+                    md_table_parts.append(f"|{'---|' * len(header)}")
+                for row in rows:
+                    md_table_parts.append(f"| {' | '.join(row)} |")
+                
+                elements.append(TableElement(markdown_representation='\n'.join(md_table_parts)))
+
+        if not elements:
+            logger.warning("No structured elements found in HTML content after parsing.")
+            return None
+
+        linear_text = _generate_parsed_text_from_elements_internal(elements)
+
+        return ParsedDocumentOutput(
+            parsed_text=linear_text,
+            elements=elements,
+            original_metadata=original_metadata
+        )
+    except Exception as e:
+        logger.error(f"Error parsing HTML content with BeautifulSoup: {e}", exc_info=True)
+        return None
