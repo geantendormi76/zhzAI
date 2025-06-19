@@ -7,9 +7,7 @@ from typing import List, Dict, Any, Optional, Union, Literal
 # --- 添加 Unstructured 的导入 ---
 try:
     from unstructured.partition.docx import partition_docx
-    from unstructured.documents.elements import Element as UnstructuredElement # 用于类型提示
-    # 如果需要更细致的Unstructured元素类型，也可以导入，例如：
-    # from unstructured.documents.elements import Title as UnstructuredTitle, NarrativeText as UnstructuredNarrativeText, etc.
+    from unstructured.documents.elements import Element as UnstructuredElement, Title, NarrativeText, ListItem, Table, Image, Header, Footer
     _UNSTRUCTURED_AVAILABLE = True
     print("INFO (document_parsers.py): Successfully imported Unstructured for DOCX.")
 except ImportError:
@@ -256,6 +254,31 @@ def _generate_parsed_text_from_elements_internal(elements: List[Any]) -> str:
         text_parts.append("\n") 
     return "".join(text_parts).strip().replace("\n\n\n", "\n\n").replace("\n\n\n", "\n\n")
 
+def _convert_unstructured_to_pydantic(elements: List[UnstructuredElement]) -> List[DocumentElementType]:  # type: ignore
+    """Converts a list of Unstructured elements to our internal Pydantic models."""
+    pydantic_elements = []
+    for el in elements:
+        meta = DocumentElementMetadata(page_number=getattr(el.metadata, 'page_number', None))
+        
+        if isinstance(el, Title):
+            pydantic_elements.append(TitleElement(text=el.text, level=getattr(el.metadata, 'category_depth', 1), metadata=meta))
+        elif isinstance(el, NarrativeText):
+            pydantic_elements.append(NarrativeTextElement(text=el.text, metadata=meta))
+        elif isinstance(el, ListItem):
+            pydantic_elements.append(ListItemElement(text=el.text, metadata=meta))
+        elif isinstance(el, Table):
+            # Unstructured v0.12+ has built-in markdown conversion
+            pydantic_elements.append(TableElement(markdown_representation=getattr(el, 'text_as_html', str(el)), metadata=meta))
+        elif isinstance(el, (Header, Footer, Image)):
+             # We can choose to ignore headers, footers, and images for now
+             continue
+        else:
+            # Fallback for any other element types
+            if el.text.strip():
+                 pydantic_elements.append(NarrativeTextElement(text=el.text, metadata=meta))
+                 
+    return pydantic_elements
+
 
 def parse_markdown_to_structured_output(md_content_str: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
     """
@@ -287,18 +310,67 @@ def parse_markdown_to_structured_output(md_content_str: str, original_metadata: 
 
 # --- Placeholder for other parsers ---
 def parse_docx_to_structured_output(file_path: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
-    logger.info(f"Parsing DOCX: {file_path} (Not yet fully implemented in document_parsers.py)")
-    # Here you would integrate the Unstructured logic from your PoC
-    # For now, returning a basic structure
-    text_content = f"[Placeholder: DOCX content for {os.path.basename(file_path)}]"
-    elements = []
-    if _PYDANTIC_MODELS_AVAILABLE_PARSERS:
-        elements.append(NarrativeTextElement(text=text_content))
-        return ParsedDocumentOutput(parsed_text=text_content, elements=elements, original_metadata=original_metadata)
-    else:
-        elements.append({"element_type":"narrative_text", "text":text_content})
-        return {"parsed_text":text_content, "elements":elements, "original_metadata":original_metadata} # type: ignore
+    """
+    Parses a DOCX file using Unstructured.io, extracts rich metadata,
+    and converts elements to our internal Pydantic models.
+    """
+    if not _UNSTRUCTURED_AVAILABLE:
+        logger.error("Unstructured library is not available. Cannot parse DOCX files.")
+        return None
+        
+    logger.info(f"Parsing DOCX with Unstructured: {file_path}")
+    
+    try:
+        # 使用 Unstructured 解析文档，设置策略以获取更干净的数据
+        unstructured_elements = partition_docx(
+            filename=file_path,
+            strategy="hi_res",  # 使用高分辨率策略以更好地处理布局
+            infer_table_structure=True, # 开启表格结构推断
+        )
+        
+        # --- 关键：合并 Unstructured 提取的元数据 ---
+        # partition_docx 返回的第一个元素通常包含文档级别的元数据
+        doc_level_meta = {}
+        if unstructured_elements:
+             # Unstructured v0.12+ 将元数据附加到每个元素上
+             # 我们从第一个元素获取通用元数据
+             doc_level_meta = unstructured_elements[0].metadata.to_dict()
 
+        # 将 Unstructured 的元数据与我们传入的原始元数据合并
+        # Unstructured 的元数据优先级更高，因为它更具体
+        combined_metadata = {**original_metadata, **doc_level_meta}
+        # 移除一些不需要的内部键
+        combined_metadata.pop('parent_id', None)
+        combined_metadata.pop('category_depth', None)
+
+        # 将 Unstructured 元素转换为我们自己的 Pydantic 模型
+        pydantic_elements = _convert_unstructured_to_pydantic(unstructured_elements)
+        
+        if not pydantic_elements:
+            logger.warning(f"No content elements were extracted from DOCX file: {file_path}")
+            return None
+
+        # 从转换后的元素生成线性文本表示
+        linear_text = _generate_parsed_text_from_elements_internal(pydantic_elements)
+
+        if _PYDANTIC_MODELS_AVAILABLE_PARSERS:
+            return ParsedDocumentOutput(
+                parsed_text=linear_text,
+                elements=pydantic_elements,
+                original_metadata=combined_metadata # <--- 使用合并后的元数据
+            )
+        else:
+            # Fallback for non-pydantic environment (should not happen in production)
+            return {
+                "parsed_text": linear_text,
+                "elements": pydantic_elements,
+                "original_metadata": combined_metadata
+            } # type: ignore
+            
+    except Exception as e:
+        logger.error(f"Error parsing DOCX file '{file_path}' with Unstructured: {e}", exc_info=True)
+        return None
+    
 def parse_pdf_to_structured_output(file_path: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
     logger.info(f"Parsing PDF: {file_path} (Not yet fully implemented in document_parsers.py)")
     # Here you would integrate the PyMuPDF logic from your PoC

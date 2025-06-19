@@ -35,8 +35,8 @@ else:
 # --- 导入我们自己的模块 ---
 from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
 from zhz_rag.llm.llm_interface import (
-    generate_answer_from_context, 
-    generate_expansion_and_entities, 
+    generate_answer_from_context,
+    generate_query_plan,  # <--- 修改点
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
 # 修复: 移除 get_table_qa_messages 的导入，因为它导致了 AttributeError
@@ -210,17 +210,42 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             return response_to_return
 
         api_logger.info(f"FINAL ANSWER CACHE MISS for query: '{query_request.query}'")
-        
-        # --- START: 手动实现小块检索，大块返回 ---
-        # 1. 检索小块
-        api_logger.info(f"--- Step 1: Retrieving child chunks for query: '{query_request.query}' ---")
-        retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
-            query_text=query_request.query,
-            n_results=query_request.top_k_vector # 使用top_k参数
-        )
-        api_logger.info(f"Retrieved {len(retrieved_child_chunks)} child chunks.")
 
-        # 2. 从小块中提取父ID
+        # --- START: V3.2 - 规划与元数据过滤 ---
+        # 1. 调用LLM规划器生成查询计划
+        api_logger.info(f"--- Step 1.1: Generating query plan for: '{query_request.query}' ---")
+        query_plan = await generate_query_plan(user_query=query_request.query)
+        
+        # 如果规划失败，则使用原始查询和空过滤器
+        if not query_plan:
+            api_logger.warning("Query plan generation failed. Falling back to basic query.")
+            search_query = query_request.query
+            metadata_filter = {}
+        else:
+            search_query = query_plan.query
+            metadata_filter = query_plan.metadata_filter
+            api_logger.info(f"Generated Plan -> Search Query: '{search_query}', Metadata Filter: {metadata_filter}")
+
+            # --- 新增：简化元数据过滤器 ---
+            # ChromaDB 要求 $and/$or 列表至少有两个元素。如果只有一个，我们需要将其简化。
+            if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
+                metadata_filter = metadata_filter["$and"][0]
+                api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
+            elif metadata_filter and ("$or" in metadata_filter) and len(metadata_filter["$or"]) == 1:
+                metadata_filter = metadata_filter["$or"][0]
+                api_logger.info(f"Simplified single-element $or filter to: {metadata_filter}")
+            # --- 新增结束 ---
+            
+        # 2. 使用规划后的查询和过滤器，检索小块
+        api_logger.info(f"--- Step 1.2: Retrieving child chunks with generated plan ---")
+        retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
+            query_text=search_query,
+            n_results=query_request.top_k_vector,
+            where_filter=metadata_filter if metadata_filter else None # <--- 应用元数据过滤器
+        )
+        api_logger.info(f"Retrieved {len(retrieved_child_chunks)} child chunks with filter.")
+
+        # 3. 从小块中提取父ID (逻辑不变)
         parent_ids = [
             chunk['metadata']['parent_id'] 
             for chunk in retrieved_child_chunks 
@@ -229,21 +254,20 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         unique_parent_ids = list(set(parent_ids))
         api_logger.info(f"Found {len(unique_parent_ids)} unique parent document IDs.")
 
-        # 3. 从 docstore 获取父文档
+        # 4. 从 docstore 获取父文档 (逻辑不变)
         parent_docs = app_ctx.docstore.mget(unique_parent_ids)
         
-        # 4. 准备最终上下文
+        # 5. 准备最终上下文 (逻辑不变)
         final_context_docs_obj = [
             RetrievedDocument(
                 source_type="parent_document_retrieval",
                 content=doc.page_content,
-                score=1.0, # Manually setting score to 1.0, as direct Chroma score is for chunks, not fused parents
+                score=1.0,
                 metadata=doc.metadata
             ) for doc in parent_docs if doc is not None
         ]
-        # --- END: 手动实现结束 ---
         
-        # 5. 生成答案
+        # 6. 生成答案
         api_logger.info(f"--- Step 2: Generating final answer from {len(final_context_docs_obj)} parent documents ---")
         if not final_context_docs_obj:
             final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN

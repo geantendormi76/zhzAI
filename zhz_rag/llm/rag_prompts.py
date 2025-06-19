@@ -1,4 +1,3 @@
-# /home/zhz/zhz_rag/llm/rag_prompts.py
 from typing import List, Dict, Any
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 
@@ -19,17 +18,17 @@ def get_answer_generation_messages(user_query: str, context_str: str) -> List[Di
 1.  **【绝对忠实于上下文】**: 你的回答【必须且只能】使用【上下文信息】中明确提供的文字和事实。严禁进行任何形式的推断、联想、猜测或引入外部知识。
 
 2.  **【处理无法回答的情况】**:
-    *   **如果上下文信息充足**: 请直接、简洁地回答用户问题。
-    *   **如果上下文信息不足以回答**:
-        *   **第一步**: 明确告知用户无法找到信息。请使用这个固定的句子开头：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”。
-        *   **第二步**: 在此基础上，尝试分析用户问题的意图，并给出一句简短、有帮助的建议，引导用户进行下一步操作。
-        *   **示例1**: 如果用户询问特定文件的信息但未找到，你可以建议：“您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
-        *   **示例2**: 如果用户询问一个需要特定知识但未找到答案的问题，你可以建议：“您可能需要查阅相关的专业文档或联系相关领域的专家。”
-        *   **最终输出**: 将第一步和第二步合并成一个流畅的回答。例如：“根据目前提供的资料，我无法找到关于您问题的明确信息。您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
+    * **如果上下文信息充足**: 请直接、简洁地回答用户问题。
+    * **如果上下文信息不足以回答**:
+        * **第一步**: 明确告知用户无法找到信息。请使用这个固定的句子开头：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”。
+        * **第二步**: 在此基础上，尝试分析用户问题的意图，并给出一句简短、有帮助的建议，引导用户进行下一步操作。
+        * **示例1**: 如果用户询问特定文件的信息但未找到，你可以建议：“您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
+        * **示例2**: 如果用户询问一个需要特定知识但未找到答案的问题，你可以建议：“您可能需要查阅相关的专业文档或联系相关领域的专家。”
+        * **最终输出**: 将第一步和第二步合并成一个流畅的回答。例如：“根据目前提供的资料，我无法找到关于您问题的明确信息。您或许可以检查文件名是否正确，或确认该文件是否已在知识库中。”
 
 3.  **【答案风格：专业、简洁】**:
-    *   直接针对用户问题，避免不必要的寒暄。
-    *   语言表达专业、客观。
+    * 直接针对用户问题，避免不必要的寒暄。
+    * 语言表达专业、客观。
 
 /no_think
 
@@ -50,9 +49,9 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
     
 
 **【严格的输出要求】**
-*   你的【最终且唯一】的输出【必须】是这个澄清问句本身。
-*   【绝对禁止】输出任何思考过程、解释、前缀、后缀或任何与澄清问句无关的文字。
-*   澄清问句本身不应包含用户的原始查询或不确定性原因的复述。
+* 你的【最终且唯一】的输出【必须】是这个澄清问句本身。
+* 【绝对禁止】输出任何思考过程、解释、前缀、后缀或任何与澄清问句无关的文字。
+* 澄清问句本身不应包含用户的原始查询或不确定性原因的复述。
 /no_think
 
 
@@ -132,9 +131,6 @@ Parameters Needed: {', '.join(selected_template['params_needed'])}
 {NEW_KG_SCHEMA_DESCRIPTION} 
 # ^^^ Schema描述已包含输出JSON格式 {{"status": "success/unable_to_generate", "query": "..."}} 的指导，请严格遵循该JSON输出格式。
 
-**【当前需要填充的Cypher查询模板】**
-{template_description_for_prompt}
-
 **【你的任务与输出要求】**
 1.  仔细分析【用户问题】，理解其核心查询意图。
 2.  判断该意图是否与提供的【当前需要填充的Cypher查询模板】描述相符。
@@ -194,7 +190,7 @@ def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str
         if extracted_labels:
             allowed_entity_labels_str = ", ".join(extracted_labels)
             if "OTHER" not in extracted_labels:
-                 allowed_entity_labels_str += ", OTHER"
+                allowed_entity_labels_str += ", OTHER"
 
     # --- V3 "最最严格" Prompt ---
     system_prompt_for_entity_extraction = f"""<|im_start|>system
@@ -226,280 +222,76 @@ YOUR_VALID_JSON_OUTPUT_ONLY:<|im_end|>""" # <--- 结尾引导更加直接
     return messages
 
 
-# 用于Dagster流水线中，从单个文本块抽取KG的提示词
-KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1 = """
-你是一个信息抽取助手。请从以下提供的文本中抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体。
-同时，请抽取出以下两种关系：
-1. WORKS_AT (当一个人在一个组织工作时，例如：PERSON WORKS_AT ORGANIZATION)
-2. ASSIGNED_TO (当一个任务分配给一个人时，例如：TASK ASSIGNED_TO PERSON)
+# =================================================================================================
+# V2 - RAG Query Planner with Metadata Filtering Prompts
+# =================================================================================================
 
-请严格按照以下JSON格式进行输出，不要包含任何额外的解释或Markdown标记：
-{{
-  "entities": [
-    {{"text": "实体1原文", "label": "实体1类型"}},
-    ...
-  ],
-  "relations": [
-    {{"head_entity_text": "头实体文本", "head_entity_label": "头实体类型", "relation_type": "关系类型", "tail_entity_text": "尾实体文本", "tail_entity_label": "尾实体类型"}},
-    ...
-  ]
-}}
-如果文本中没有可抽取的实体或关系，请返回一个空的对应列表 (例如 {{"entities": [], "relations": []}})。
+V2_PLANNING_PROMPT_TEMPLATE = """
+# 指令
+你是一个专业的RAG查询规划专家。你的任务是分析用户的提问，并将其分解为一个结构化的JSON对象，该对象包含两个字段：`query` 和 `metadata_filter`。
 
-文本：
-"{text_to_extract}"
-""" # <--- 末尾引导词已删除
+## JSON结构说明
+1.  `query` (字符串): 提炼出的核心搜索关键词，用于向量语义搜索。这个查询应该简洁且抓住用户意图的核心。
+2.  `metadata_filter` (JSON对象): 一个用于ChromaDB的`where`过滤器，用于在搜索前对文档块进行元数据层面的精确过滤。
+    - 如果用户没有指定任何过滤条件，请使用空对象 `{{}}`。
+    # --- 修改点 ---
+    - 可用的元数据字段包括: `filename` (字符串), `page_number` (整数), `paragraph_type` (字符串, 例如 'text', 'table', 'title'), `author` (字符串), 以及扁平化的章节标题 `title_hierarchy_1`, `title_hierarchy_2`, `title_hierarchy_3`, `title_hierarchy_4` (均为字符串)。
+    - 你可以使用逻辑操作符 `$and` 和 `$or` 来组合多个条件。对于字段的比较，可以使用 `$eq` (等于), `$ne` (不等于), `$gt` (大于), `$gte` (大于等于), `$lt` (小于), `$lte` (小于等于), `$like` (模糊匹配)。
 
-# 用于Dagster流水线中，从一批文本块抽取KG的提示词
-KG_EXTRACTION_BATCH_PROMPT_TEMPLATE_V1 = """
-你是一个信息抽取助手。你的任务是处理下面编号的【文本块列表】中的每一个文本块。
-对于列表中的【每一个文本块】，请独立地抽取出所有的人名(PERSON)、组织机构名(ORGANIZATION)和任务(TASK)实体，以及它们之间可能存在的WORKS_AT和ASSIGNED_TO关系。
-
-【输出格式要求】:
-你的最终输出【必须】是一个JSON数组。
-这个数组中的每个元素都对应输入【文本块列表】中相应顺序的文本块的抽取结果。
-每个元素的结构【必须】严格符合以下JSON Schema：
-{{
-  "entities": [ 
-    {{"text": "实体原文", "label": "实体类型"}}, 
-    ... 
-  ],
-  "relations": [
-    {{"head_entity_text": "头实体文本", "head_entity_label": "头实体类型", "relation_type": "关系类型", "tail_entity_text": "尾实体文本", "tail_entity_label": "尾实体类型"}},
-    ...
-  ]
-}}
-如果某个文本块中沒有可抽取的实体或关系，则其在JSON数组中对应的元素应为：{{"entities": [], "relations": []}}。
-【绝对禁止】在最终的JSON数组之外包含任何其他文本、解释或Markdown标记。
-
-【待处理的文本块列表】:
-{formatted_text_block_list}
-""" 
-
-# GBNF for Knowledge Graph Extraction (proven stable with Qwen3-1.7B and create_completion)
-KG_EXTRACTION_GBNF_STRING = r"""
-root ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
-
-space ::= ([ \t\n\r])*
-string ::= "\"" (char)* "\""
-char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-
-entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
-entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
-
-relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
-relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
-"""
-
-# --- 新增：用于合并查询扩展和KG实体提取的Prompt和GBNF ---
-
-# GBNF for the combined task
-COMBINED_EXPANSION_KG_GBNF_STRING = r"""
-root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object "}"
-
-space ::= ([ \t\n\r])*
-string ::= "\"" (char)* "\""
-char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-
-string-array ::= "[" space (string ("," space string)*)? space "]"
-
-kg-extraction-object ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
-
-entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
-entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
-
-relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
-relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
-"""
-
-# Prompt Template for the combined task
-COMBINED_EXPANSION_KG_PROMPT_TEMPLATE = """<|im_start|>system
-You are a highly efficient and structured data processing AI. Your task is to perform two actions based on the user's query and produce a single, valid JSON object as output.
-
-**Actions to Perform:**
-1.  **Query Expansion:** Generate 3 diverse, related sub-questions to explore different facets of the original query.
-2.  **KG Entity/Relation Extraction:** Extract key entities (PERSON, ORGANIZATION, TASK, etc.) and their relationships (e.g., WORKS_AT, ASSIGNED_TO) from the original query for knowledge graph searching.
-
-**Output Format (Strict JSON):**
-You MUST output a single, valid JSON object that strictly adheres to the following structure. Do NOT include any explanations, markdown, or any text outside of the JSON object.
-
+## 示例
+### 示例 1: 简单查询
+用户提问: "RAG是什么？"
+AI输出:
 ```json
 {{
-  "expanded_queries": [
-    "string // Expanded question 1",
-    "string // Expanded question 2",
-    "string // Expanded question 3"
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [
-      {{"text": "string // Extracted entity text", "label": "string // Entity type"}}
-    ],
-    "relations": [
-      {{
-        "head_entity_text": "string",
-        "head_entity_label": "string",
-        "relation_type": "string",
-        "tail_entity_text": "string",
-        "tail_entity_label": "string"
-      }}
-    ]
-  }}
+    "query": "RAG是什么",
+    "metadata_filter": {{}}
 }}
-Example:
-User Query: "Who is responsible for the Project Alpha documentation, and where do they work?"
-Expected JSON Output:
+```
+### 示例 2: 带章节和类型过滤的查询
+用户提问: "给我看看第二章关于销售分析的表格"
+AI输出:
+```json
 {{
-  "expanded_queries": [
-    "Who is the primary contact for Project Alpha documentation?",
-    "Which organization employs the person responsible for Project Alpha documentation?",
-    "What are the recent updates or status of the Project Alpha documentation?"
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [
-      {{
-        "text": "Project Alpha",
-        "label": "PROJECT"
-      }},
-      {{
-        "text": "documentation",
-        "label": "TASK"
-      }}
-    ],
-    "relations": []
-  }}
+    "query": "销售分析 表格",
+    "metadata_filter": {{
+        "$and": [
+            {{"title_hierarchy_2": {{"$like": "%销售分析%"}}}},
+            {{"paragraph_type": {{"$eq": "table"}}}}
+        ]
+    }}
 }}
-<|im_end|>
-<|im_start|>user
-User Query: "{user_query}"
-Output JSON:
-<|im_end|>
-<|im_start|>assistant
+```
+### 示例 3: 带文件名和页码的查询
+用户提问: "在'2024年年度报告.pdf'的第15页有什么内容？"
+AI输出:
+```json
+{{
+    "query": "第15页的内容",
+    "metadata_filter": {{
+        "$and": [
+            {{"filename": {{"$eq": "2024年年度报告.pdf"}}}},
+            {{"page_number": {{"$eq": 15}}}}
+        ]
+    }}
+}}
+```
+现在，请根据以下用户提问，生成对应的JSON对象。
+
+用户提问: "{user_query}"
+AI输出:
 """
-
-# --- START: 覆盖 GBNF 字符串 ---
-# GBNF for the combined task with advanced filtering
-COMBINED_PLANNING_GBNF_STRING = r"""
-root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object ("," space "\"metadata_filter\"" ":" space (json-object | "null"))? space "}"
-
-# --- Common Definitions ---
-space ::= ([ \t\n\r])*
-string ::= "\"" (char)* "\""
-char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+# 用于约束规划器输出的GBNF Schema
+V2_PLANNING_GBNF_SCHEMA = r'''
+root   ::= object
+value  ::= object | array | string | number | "true" | "false" | "null"
+ws ::= ([ \t\n\r])*
+object ::= "{" ws ( member ("," ws member)* )? ws "}"
+member ::= string ws ":" ws value
+array  ::= "[" ws ( value ("," ws value)* )? ws "]"
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\""
 number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
-boolean ::= "true" | "false"
-
-# --- JSON structure for filter ---
-json-value ::= string | number | boolean | json-object | json-array | "null"
-json-object ::= "{" space (pair ("," space pair)*)? space "}"
-pair ::= string ":" space json-value
-json-array ::= "[" space (json-value ("," space json-value)*)? space "]"
-
-# --- Specific parts for our main object ---
-string-array ::= "[" space (string ("," space string)*)? space "]"
-
-kg-extraction-object ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
-entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
-entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
-relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
-relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
-"""
-# --- END: 覆盖 GBNF 字符串 ---
-
-
-# V3: 更强大的规划器，支持层次化元数据过滤
-# Prompt Template for the combined task - V3 with Advanced Metadata Filter
-COMBINED_PLANNING_PROMPT_TEMPLATE = """<|im_start|>system
-You are a highly efficient and structured query planner. Your task is to analyze the user's query and produce a single, valid JSON object to guide the retrieval process.
-
-**Actions to Perform:**
-1.  **Query Expansion:** Generate 2-3 diverse, related sub-questions.
-2.  **KG Entity Extraction:** Extract key entities (PERSON, ORGANIZATION, TASK, etc.).
-3.  **Advanced Metadata Filter Generation:** Analyze the query for specific contextual constraints like filenames, chapters, sections, or page numbers. Construct a filter object accordingly.
-
-**Available Metadata Fields for Filtering:**
-- `filename`: string (e.g., "report.pdf")
-- `page`: integer (e.g., 5)
-- `paragraph_type`: string (e.g., "table", "title", "narrative_text")
-- `title_hierarchy_1`: string (e.g., "第一章 介绍")
-- `title_hierarchy_2`: string (e.g., "财务分析")
-- `title_hierarchy_...`: string (for deeper levels)
-
-**Output Format (Strict JSON):**
-You MUST output a single, valid JSON object. Do NOT include any explanations, markdown, or any text outside of the JSON object.
-
-```json
-{{
-  "expanded_queries": [
-    "string"
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [
-      {{"text": "string", "label": "string"}}
-    ],
-    "relations": []
-  }},
-  "metadata_filter": {{ ... }} or null
-}}
-Examples:
-Example 1: Simple Filename Filter
-User Query: "In the annual_report_2023.pdf file, what were the main conclusions?"
-Expected JSON Output:
-{{
-  "expanded_queries": [
-    "What are the key findings in the 2023 annual report?",
-    "Summarize the executive summary of annual_report_2023.pdf."
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [{{"text": "annual_report_2023.pdf", "label": "DOCUMENT"}}],
-    "relations": []
-  }},
-  "metadata_filter": {{"filename": "annual_report_2023.pdf"}}
-}}
-Example 2: Advanced Chapter and Content Type Filter
-User Query: "Show me the tables in the second chapter of the financial report."
-Expected JSON Output:
-{{
-  "expanded_queries": [
-    "What data is presented in the tables of chapter 2 of the financial report?",
-    "List all tables from the second chapter of the financial analysis document."
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [{{"text": "financial report", "label": "DOCUMENT"}}],
-    "relations": []
-  }},
-  "metadata_filter": {{
-    "$and": [
-      {{"title_hierarchy_2": "财务分析"}},
-      {{"paragraph_type": "table"}}
-    ]
-  }}
-}}
-Example 3: No Filter
-User Query: "Who is the project manager for Project Alpha?"
-Expected JSON Output:
-{{
-  "expanded_queries": [
-    "Who leads Project Alpha?",
-    "What are the responsibilities of the project manager for Project Alpha?"
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [
-      {{"text": "Project Alpha", "label": "PROJECT"}},
-      {{"text": "project manager", "label": "TASK"}}
-    ],
-    "relations": []
-  }},
-  "metadata_filter": null
-}}
-<|im_end|>
-<|im_start|>user
-User Query: "{user_query}"
-Output JSON:
-<|im_end|>
-<|im_start|>assistant
-"""
-
-
+'''
 
 def get_table_qa_messages(user_query: str, context_str: str) -> List[Dict[str, str]]:
     """
@@ -512,22 +304,22 @@ def get_table_qa_messages(user_query: str, context_str: str) -> List[Dict[str, s
 **核心指令与行为准则：**
 
 1.  **【定位关键信息】**:
-    *   首先，在【用户问题】中识别出要查询的**关键实体** (例如, "产品B", "张三")。
-    *   然后，在【上下文信息】的Markdown表格中，找到包含该**关键实体**的**那一行**。
+    * 首先，在【用户问题】中识别出要查询的**关键实体** (例如, "产品B", "张三")。
+    * 然后，在【上下文信息】的Markdown表格中，找到包含该**关键实体**的**那一行**。
 
 2.  **【提取目标值】**:
-    *   在定位到正确的行之后，根据【用户问题】的意图（例如，想查询“价格”、“年龄”、“城市”），找到对应的**列**。
-    *   从该行和该列交叉的位置，提取出**精确的单元格数值**作为答案。
+    * 在定位到正确的行之后，根据【用户问题】的意图（例如，想查询“价格”、“年龄”、“城市”），找到对应的**列**。
+    * 从该行和该列交叉的位置，提取出**精确的单元格数值**作为答案。
 
 3.  **【答案格式】**:
-    *   **如果找到答案**: 请直接、简洁地回答。模板："[关键实体]的[查询属性]是[提取的值]。"
-        *   *示例*: "产品B的价格是150。"
-    *   **如果找不到**: 如果在表格中找不到对应的行或列，导致无法回答，请使用这个固定的句子：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
+    * **如果找到答案**: 请直接、简洁地回答。模板："[关键实体]的[查询属性]是[提取的值]。"
+        * *示例*: "产品B的价格是150。"
+    * **如果找不到**: 如果在表格中找不到对应的行或列，导致无法回答，请使用这个固定的句子：“{NO_ANSWER_PHRASE_ANSWER_CLEAN}”
 
 4.  **【绝对禁止】**:
-    *   严禁对表格内容进行任何形式的计算、总结或推断（除非用户明确要求）。
-    *   严禁使用表格之外的任何上下文信息。
-    *   严禁输出任何与答案无关的解释或对话。
+    * 严禁对表格内容进行任何形式的计算、总结或推断（除非用户明确要求）。
+    * 严禁使用表格之外的任何上下文信息。
+    * 严禁输出任何与答案无关的解释或对话。
 
 /no_think
 

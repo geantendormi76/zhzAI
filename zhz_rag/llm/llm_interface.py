@@ -12,15 +12,14 @@ from pydantic import ValidationError
 from zhz_rag.utils.interaction_logger import log_interaction_data # 导入修复后的健壮日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 
-from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, QueryExpansionAndKGExtractionOutput
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, RagQueryPlan
 # 提示词导入
 from llama_cpp import Llama, LlamaGrammar 
 from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
     get_clarification_question_messages,
-    get_entity_relation_extraction_messages, # <--- 添加导入
-    get_cypher_generation_messages_with_templates,
-    KG_EXTRACTION_GBNF_STRING  
+    get_entity_relation_extraction_messages,
+    get_cypher_generation_messages_with_templates
 )
 import logging
 import re
@@ -699,60 +698,60 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
     return {"clarification_needed": False, "reason": f"Intent classification by Gemini failed: {error_info_intent or 'Unknown reason'}"}
 
 # --- 新增：用于提取实体和关系意图的函数 ---
-async def extract_entities_for_kg_query(user_question: str) -> Optional[ExtractedEntitiesAndRelationIntent]:
-    llm_py_logger.info(f"Attempting to extract entities and relation intent for KG query (with GBNF) from: '{user_question}'")
+# async def extract_entities_for_kg_query(user_question: str) -> Optional[ExtractedEntitiesAndRelationIntent]:
+#     llm_py_logger.info(f"Attempting to extract entities and relation intent for KG query (with GBNF) from: '{user_question}'")
 
-    # --- 使用您在 test_gbnf_extraction.py 中验证成功的 One-Shot Prompt 构建逻辑 ---
-    one_shot_example = """
---- 示例 ---
-输入文本: "Alice在ACME公司担任工程师。"
-输出JSON:
-{
-  "entities": [
-    {"text": "Alice", "label": "PERSON"},
-    {"text": "ACME公司", "label": "ORGANIZATION"},
-    {"text": "工程师", "label": "TASK"}
-  ],
-  "relations": [
-    {"head_entity_text": "Alice", "head_entity_label": "PERSON", "relation_type": "WORKS_AT", "tail_entity_text": "ACME公司", "tail_entity_label": "ORGANIZATION"}
-  ]
-}
---- 任务开始 ---"""
+#     # --- 使用您在 test_gbnf_extraction.py 中验证成功的 One-Shot Prompt 构建逻辑 ---
+#     one_shot_example = """
+# --- 示例 ---
+# 输入文本: "Alice在ACME公司担任工程师。"
+# 输出JSON:
+# {
+#   "entities": [
+#     {"text": "Alice", "label": "PERSON"},
+#     {"text": "ACME公司", "label": "ORGANIZATION"},
+#     {"text": "工程师", "label": "TASK"}
+#   ],
+#   "relations": [
+#     {"head_entity_text": "Alice", "head_entity_label": "PERSON", "relation_type": "WORKS_AT", "tail_entity_text": "ACME公司", "tail_entity_label": "ORGANIZATION"}
+#   ]
+# }
+# --- 任务开始 ---"""
     
-    # system_content 部分与您的测试脚本保持一致
-    system_content_for_prompt = (
-        f"你是一个严格的JSON知识图谱提取器。请根据用户提供的文本，严格按照示例格式，生成一个包含'entities'和'relations'的JSON对象。\n"
-        f"{one_shot_example}"
-    )
+#     # system_content 部分与您的测试脚本保持一致
+#     system_content_for_prompt = (
+#         f"你是一个严格的JSON知识图谱提取器。请根据用户提供的文本，严格按照示例格式，生成一个包含'entities'和'relations'的JSON对象。\n"
+#         f"{one_shot_example}"
+#     )
 
-    # user_content 部分也与您的测试脚本保持一致
-    user_content_for_prompt = (
-        f"输入文本: \"{user_question}\"\n" # 注意：这里用的是 user_question，而不是固定的 sample_text_to_extract
-        f"输出JSON:\n"
-    )
+#     # user_content 部分也与您的测试脚本保持一致
+#     user_content_for_prompt = (
+#         f"输入文本: \"{user_question}\"\n" # 注意：这里用的是 user_question，而不是固定的 sample_text_to_extract
+#         f"输出JSON:\n"
+#     )
 
-    full_prompt_for_extraction = (
-        f"<|im_start|>system\n{system_content_for_prompt}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content_for_prompt}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-    # --- Prompt 构建结束 ---
+#     full_prompt_for_extraction = (
+#         f"<|im_start|>system\n{system_content_for_prompt}<|im_end|>\n"
+#         f"<|im_start|>user\n{user_content_for_prompt}<|im_end|>\n"
+#         f"<|im_start|>assistant\n"
+#     )
+#     # --- Prompt 构建结束 ---
 
-    llm_response_str = await call_local_llm_with_gbnf(
-        full_prompt=full_prompt_for_extraction,
-        grammar_str=KG_EXTRACTION_GBNF_STRING, # 使用我们定义的GBNF字符串
-        temperature=0.1,
-        max_tokens=1024, # 与您的测试脚本一致
-        repeat_penalty=1.2, # 与您的测试脚本一致
-        stop_sequences=["<|im_end|>"], # Qwen的停止标记
-        task_type="kg_entity_relation_extraction_gbnf",
-        user_query_for_log=user_question,
-        model_name_for_log="qwen3_gguf_kg_ext_gbnf"
-    )
+#     llm_response_str = await call_local_llm_with_gbnf(
+#         full_prompt=full_prompt_for_extraction,
+#         grammar_str=KG_EXTRACTION_GBNF_STRING, # 使用我们定义的GBNF字符串
+#         temperature=0.1,
+#         max_tokens=1024, # 与您的测试脚本一致
+#         repeat_penalty=1.2, # 与您的测试脚本一致
+#         stop_sequences=["<|im_end|>"], # Qwen的停止标记
+#         task_type="kg_entity_relation_extraction_gbnf",
+#         user_query_for_log=user_question,
+#         model_name_for_log="qwen3_gguf_kg_ext_gbnf"
+#     )
 
-    if not llm_response_str:
-        llm_py_logger.warning(f"LLM call for KG entity/relation extraction (GBNF) returned None or empty. User question: '{user_question}'")
-        return None
+#     if not llm_response_str:
+#         llm_py_logger.warning(f"LLM call for KG entity/relation extraction (GBNF) returned None or empty. User question: '{user_question}'")
+#         return None
 
     # GBNF应该确保输出是有效的JSON，所以我们可以直接尝试解析
     try:
@@ -855,55 +854,52 @@ async def call_local_llm_with_gbnf(
     await log_interaction_data(log_success_data)
     return raw_llm_output_text
 
-async def generate_expansion_and_entities(user_query: str) -> Optional[QueryExpansionAndKGExtractionOutput]:
+async def generate_query_plan(user_query: str) -> Optional[RagQueryPlan]:
     """
-    Performs a single LLM call to get an execution plan: expanded queries, KG entities, and a metadata filter.
-    Uses GBNF for structured output.
-    V2: Includes metadata_filter generation.
+    Analyzes the user query and generates a structured plan for retrieval,
+    containing a core query string and a metadata filter.
+    Uses GBNF for reliable JSON output.
     """
-    # 使用新的Prompt和GBNF
-    from .rag_prompts import COMBINED_PLANNING_PROMPT_TEMPLATE, COMBINED_PLANNING_GBNF_STRING
-    from ..config.pydantic_models import QueryExpansionAndKGExtractionOutput
+    # 导入我们新定义的 Prompt, GBNF Schema 和 Pydantic 模型
+    from .rag_prompts import V2_PLANNING_PROMPT_TEMPLATE, V2_PLANNING_GBNF_SCHEMA
+    from ..config.pydantic_models import RagQueryPlan
 
-    llm_py_logger.info(f"Generating execution plan for: '{user_query[:100]}...'")
+    llm_py_logger.info(f"Generating RAG query plan for: '{user_query[:100]}...'")
 
-    # 1. 准备 Prompt
-    full_prompt = COMBINED_PLANNING_PROMPT_TEMPLATE.format(user_query=user_query)
+    # 1. 使用新的模板准备 Prompt
+    full_prompt = V2_PLANNING_PROMPT_TEMPLATE.format(user_query=user_query)
 
-    # 2. 调用带有 GBNF 约束的 LLM
+    # 2. 调用带有 GBNF 约束的本地 LLM
     llm_response_str = await call_local_llm_with_gbnf(
         full_prompt=full_prompt,
-        grammar_str=COMBINED_PLANNING_GBNF_STRING,
-        temperature=0.05, # 对于这种结构化任务，温度可以更低
-        max_tokens=1024,
-        task_type="planning_expansion_kg_filter", # 新的任务类型
+        grammar_str=V2_PLANNING_GBNF_SCHEMA,
+        temperature=0.0,  # 对于精确的JSON生成，使用零温度
+        max_tokens=512,  # 为过滤器和查询提供足够的空间
+        task_type="rag_query_planning", # 更新任务类型
         user_query_for_log=user_query,
-        model_name_for_log="qwen3_gguf_planning_task"
+        model_name_for_log="qwen3_gguf_rag_planner"
     )
 
     if not llm_response_str:
-        llm_py_logger.warning("LLM Planner call returned no response.")
-        return None
+        llm_py_logger.warning("LLM query planner call returned no response. Falling back to simple query.")
+        return RagQueryPlan(query=user_query, metadata_filter={})
 
     # 3. 解析结果并返回 Pydantic 对象
     try:
-        # 在解析前清理可能存在的```json ... ```包装
+        # 清理LLM可能返回的 markdown 代码块标记
         cleaned_response = llm_response_str.strip()
         if cleaned_response.startswith("```json"):
-            cleaned_response = cleaned_response[7:].strip()
+            cleaned_response = cleaned_response[len("```json"):].strip()
         if cleaned_response.endswith("```"):
             cleaned_response = cleaned_response[:-3].strip()
             
         parsed_data = json.loads(cleaned_response)
-        structured_output = QueryExpansionAndKGExtractionOutput(**parsed_data)
+        query_plan = RagQueryPlan(**parsed_data)
         
-        # 确保原始查询在扩展查询列表中
-        if user_query not in structured_output.expanded_queries:
-            structured_output.expanded_queries.append(user_query)
-        
-        llm_py_logger.info(f"Successfully parsed plan. Queries: {len(structured_output.expanded_queries)}, Entities: {len(structured_output.extracted_entities_for_kg.entities)}, Filter: {structured_output.metadata_filter}")
-        return structured_output
+        llm_py_logger.info(f"Successfully generated query plan. Query: '{query_plan.query}', Filter: {query_plan.metadata_filter}")
+        return query_plan
         
     except (json.JSONDecodeError, TypeError, ValidationError) as e:
-        llm_py_logger.error(f"Failed to parse or validate LLM plan. Error: {e}. Raw output: '{llm_response_str}'", exc_info=True)
-        return None
+        llm_py_logger.error(f"Failed to parse or validate LLM query plan. Error: {e}. Raw output: '{llm_response_str}'. Falling back to simple query.", exc_info=True)
+        # 即使解析失败，也要保证RAG流程能继续，返回一个基础的计划
+        return RagQueryPlan(query=user_query, metadata_filter={})

@@ -139,3 +139,14 @@ class QueryExpansionAndKGExtractionOutput(BaseModel):
         default=None,
         description="An optional metadata filter (e.g., {'filename': 'report.docx'}) to apply during retrieval, if a specific source is mentioned."
     )
+    
+class RagQueryPlan(BaseModel):
+    """
+    Represents the output of the V2 RAG query planner.
+    It contains the core query string and a metadata filter for precise retrieval.
+    """
+    query: str = Field(description="The refined, core query string for semantic vector search.")
+    metadata_filter: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="A ChromaDB-compatible 'where' filter for metadata-based pre-filtering of document chunks."
+    )

@@ -288,6 +288,29 @@ def split_code_block_by_blank_lines(
     return final_sub_chunks if final_sub_chunks else [code_text]
 
 
+def _get_element_text(element: Any, context: dg.AssetExecutionContext) -> Optional[str]:
+    """
+    Extracts the text content from a DocumentElement, handling various types.
+    """
+    # 检查 element 是否有 text 属性
+    if hasattr(element, 'text') and isinstance(element.text, str) and element.text.strip():
+        return element.text.strip()
+    
+    # 对TableElement，它的markdown表示更有用
+    if isinstance(element, TableElement) and hasattr(element, 'markdown_representation'):
+        return element.markdown_representation
+        
+    # 对CodeBlockElement，它的code属性是内容
+    if isinstance(element, CodeBlockElement) and hasattr(element, 'code'):
+        return element.code
+
+    # 最后的防线：尝试将元素转为字符串，但这通常表示有未处理的类型
+    # context.log.warning(f"Element of type {type(element).__name__} has no direct text attribute. Falling back to str().")
+    # return str(element)
+    return None # 如果没有明确的文本内容，则返回None，避免注入描述性文字
+
+
+
 @dg.asset(
     name="text_chunks",
     description="Cleans/chunks documents. Splits long elements, merges short ones, enriches with contextual metadata.",
@@ -299,30 +322,39 @@ def clean_chunk_text_asset(
     config: TextChunkerConfig,
     parsed_documents: List[ParsedDocumentOutput]
 ) -> List[ChunkOutput]:
-    all_chunks: List[ChunkOutput] = [] # 使用一个新列表，不再区分 initial 和 merged
+    all_chunks: List[ChunkOutput] = []
 
     for doc_idx, parsed_doc in enumerate(parsed_documents):
-        doc_id_from_meta = parsed_doc.original_metadata.get("filename", f"doc_{doc_idx}_{str(uuid.uuid4())}")
-        context.log.info(f"Processing document for chunking: {doc_id_from_meta}")
+        # 1. 从原始文档元数据中提取关键信息（采用更健壮的方式）
+        doc_meta = parsed_doc.original_metadata
+        # 兼容 "filename" 和 "file_name" 两种常见键名
+        doc_filename = doc_meta.get("filename") or doc_meta.get("file_name") or f"doc_{doc_idx}"
+        # 兼容多种可能的日期键名
+        doc_creation_date = doc_meta.get("creation_date") or doc_meta.get("creation_datetime")
+        doc_last_modified = doc_meta.get("last_modified") or doc_meta.get("last_modified_datetime")
+        doc_author = doc_meta.get("author") or doc_meta.get("authors") # 兼容单数和复数
+        
+        context.log.info(f"Processing document for chunking: {doc_filename}")
 
         current_title_hierarchy: Dict[int, str] = {}
         doc_internal_chunk_counter = 0
 
         for element_idx, element in enumerate(parsed_doc.elements):
-            # --- START: 覆盖这部分代码块 ---
-            # 1. 为每个“父元素”（如整个表格、整个代码块、整个段落）生成一个唯一的ID
             parent_id = str(uuid.uuid4())
             
-            # 2. 提取通用元数据
-            element_type_str = getattr(element, 'element_type', 'unknown')
-            base_chunk_meta = parsed_doc.original_metadata.copy()
-            base_chunk_meta.update({
-                "parent_id": parent_id, # 所有子块都将共享这个ID
+            # 2. 准备基础元数据
+            element_type_str = getattr(element, 'element_type', type(element).__name__)
+            base_chunk_meta = {
+                "parent_id": parent_id,
                 "paragraph_type": element_type_str,
                 "source_element_index": element_idx,
-            })
-            
-            # 添加并扁平化 title_hierarchy
+                "filename": doc_filename, # 统一使用 'filename'
+                "creation_date": doc_creation_date,
+                "last_modified": doc_last_modified,
+                "author": doc_author,
+            }
+            base_chunk_meta = {k: v for k, v in base_chunk_meta.items() if v is not None}
+
             if isinstance(element, TitleElement):
                  title_level = getattr(element, 'level', 1)
                  keys_to_remove = [lvl for lvl in current_title_hierarchy if lvl >= title_level]
@@ -333,52 +365,57 @@ def clean_chunk_text_asset(
             for level, title in current_title_hierarchy.items():
                 base_chunk_meta[f"title_hierarchy_{level}"] = title
             
-            # 添加页码等其他元数据
             if hasattr(element, 'metadata') and element.metadata:
                 page_num = getattr(element.metadata, 'page_number', None)
                 if page_num is not None:
-                    base_chunk_meta['page'] = page_num
-            # --- END: 覆盖结束 ---
+                    base_chunk_meta['page_number'] = page_num + 1
 
             # 3. 对不同类型的元素进行分块
             sub_chunks: List[Dict[str, Any]] = []
             
-            if element_type_str == "table":
-                markdown_repr = getattr(element, 'markdown_representation', "")
-                if markdown_repr:
-                    sub_chunks = split_markdown_table_by_rows(markdown_repr, config.target_sentence_split_chunk_size, config.max_merged_chunk_size, context)
+            # 优先使用新的辅助函数提取文本
+            text_content = _get_element_text(element, context)
             
-            # (未来可以添加对代码块等的专门分割逻辑)
+            if not text_content: # 如果没有提取到任何有效文本，则跳过此元素
+                context.log.debug(f"Skipping element {element_idx} in {doc_filename} due to empty content.")
+                continue
 
-            # 如果没有生成子块（例如对于普通段落或短表格），则将整个元素作为一个块
-            if not sub_chunks:
-                text_content = getattr(element, 'text', None) or getattr(element, 'code', None) or getattr(element, 'markdown_representation', '')
-                if text_content.strip():
-                    sub_chunks.append({"text": text_content.strip()})
+            if element_type_str == "TableElement":
+                 sub_chunks = split_markdown_table_by_rows(text_content, config.target_sentence_split_chunk_size, config.max_merged_chunk_size, context)
+            else:
+                # 对普通文本，如果过长，则使用句子分割器
+                if len(text_content) > config.max_element_text_length_before_split:
+                    sentences = split_text_into_sentences(text_content)
+                    # (未来可以加入更复杂的句子合并逻辑，现在简单地每个句子一块)
+                    for sent in sentences:
+                        if sent.strip():
+                            sub_chunks.append({"text": sent.strip()})
+                else:
+                    sub_chunks.append({"text": text_content})
 
-            # 4. 为所有生成的块（无论是父块还是子块）创建 ChunkOutput 对象
+            # 4. 为所有生成的块创建 ChunkOutput 对象
             for sub_chunk_data in sub_chunks:
                 doc_internal_chunk_counter += 1
                 chunk_meta_final = base_chunk_meta.copy()
                 chunk_meta_final["chunk_number_in_doc"] = doc_internal_chunk_counter
                 
-                # 如果是分割产生的子块，可以添加额外元数据
                 if "start_row_index" in sub_chunk_data:
                     chunk_meta_final["table_original_start_row"] = sub_chunk_data["start_row_index"]
                     chunk_meta_final["table_original_end_row"] = sub_chunk_data["end_row_index"]
 
                 all_chunks.append(ChunkOutput(
                     chunk_text=sub_chunk_data["text"],
-                    source_document_id=doc_id_from_meta,
+                    source_document_id=doc_filename,
                     chunk_metadata=chunk_meta_final
                 ))
 
     context.log.info(f"Chunking process finished. Total chunks generated: {len(all_chunks)}")
     if all_chunks:
-        context.log.info(f"Sample final chunk metadata: {all_chunks[-1].chunk_metadata if all_chunks else 'N/A'}")
+        context.log.info(f"Sample final chunk metadata: {all_chunks[-1].chunk_metadata}")
     
     context.add_output_metadata(metadata={"total_chunks_generated": len(all_chunks)})
     return all_chunks
+
 
 @dg.asset(
     name="text_embeddings",
@@ -657,490 +694,489 @@ def keyword_index_asset(
 
 # --- KG Extraction 相关的配置和资产 ---
 
-from zhz_rag.llm.rag_prompts import KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1, KG_EXTRACTION_BATCH_PROMPT_TEMPLATE_V1 # 导入常量
 
-class KGExtractionConfig(dg.Config):
-    extraction_prompt_template: str = KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1
-    local_llm_model_name: str = "Qwen3-1.7B-GGUF_via_llama.cpp"
+# class KGExtractionConfig(dg.Config):
+#     extraction_prompt_template: str = KG_EXTRACTION_SINGLE_CHUNK_PROMPT_TEMPLATE_V1
+#     local_llm_model_name: str = "Qwen3-1.7B-GGUF_via_llama.cpp"
 
-DEFAULT_KG_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "entities": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "提取到的实体原文"},
-                    "label": {"type": "string", "description": "实体类型 (例如: PERSON, ORGANIZATION, TASK)"}
-                },
-                "required": ["text", "label"]
-            },
-            "description": "从文本中提取出的实体列表。"
-        },
-        "relations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "head_entity_text": {"type": "string", "description": "头实体的文本"},
-                    "head_entity_label": {"type": "string", "description": "头实体的类型 (例如: PERSON, TASK)"},
-                    "relation_type": {"type": "string", "description": "关系类型 (例如: WORKS_AT, ASSIGNED_TO)"},
-                    "tail_entity_text": {"type": "string", "description": "尾实体的文本"},
-                    "tail_entity_label": {"type": "string", "description": "尾实体的类型 (例如: ORGANIZATION, PERSON)"}
-                },
-                "required": ["head_entity_text", "head_entity_label", "relation_type", "tail_entity_text", "tail_entity_label"]
-            },
-            "description": "从文本中提取出的关系三元组列表。"
-        }
-    },
-    "required": ["entities", "relations"]
-}
+# DEFAULT_KG_EXTRACTION_SCHEMA = {
+#     "type": "object",
+#     "properties": {
+#         "entities": {
+#             "type": "array",
+#             "items": {
+#                 "type": "object",
+#                 "properties": {
+#                     "text": {"type": "string", "description": "提取到的实体原文"},
+#                     "label": {"type": "string", "description": "实体类型 (例如: PERSON, ORGANIZATION, TASK)"}
+#                 },
+#                 "required": ["text", "label"]
+#             },
+#             "description": "从文本中提取出的实体列表。"
+#         },
+#         "relations": {
+#             "type": "array",
+#             "items": {
+#                 "type": "object",
+#                 "properties": {
+#                     "head_entity_text": {"type": "string", "description": "头实体的文本"},
+#                     "head_entity_label": {"type": "string", "description": "头实体的类型 (例如: PERSON, TASK)"},
+#                     "relation_type": {"type": "string", "description": "关系类型 (例如: WORKS_AT, ASSIGNED_TO)"},
+#                     "tail_entity_text": {"type": "string", "description": "尾实体的文本"},
+#                     "tail_entity_label": {"type": "string", "description": "尾实体的类型 (例如: ORGANIZATION, PERSON)"}
+#                 },
+#                 "required": ["head_entity_text", "head_entity_label", "relation_type", "tail_entity_text", "tail_entity_label"]
+#             },
+#             "description": "从文本中提取出的关系三元组列表。"
+#         }
+#     },
+#     "required": ["entities", "relations"]
+# }
 
 
-@dg.asset(
-    name="kg_extractions",
-    description="Extracts entities and relations from text chunks for knowledge graph construction.",
-    group_name="kg_building",
-    io_manager_key="pydantic_json_io_manager",
-    deps=["text_chunks"]
-)
-async def kg_extraction_asset(
-    context: dg.AssetExecutionContext, # Pylance 提示 dg.AssetExecutionContext 未定义 "SystemResource"
-    text_chunks: List[ChunkOutput],
-    config: KGExtractionConfig,
-    LocalLLM_api: LocalLLMAPIResource,
-    system_info: SystemResource  # <--- 我们添加了 system_info
-) -> List[KGTripleSetOutput]:
-    all_kg_outputs: List[KGTripleSetOutput] = []
-    if not text_chunks:
-        context.log.info("No text chunks received for KG extraction, skipping.")
-        return all_kg_outputs
+# @dg.asset(
+#     name="kg_extractions",
+#     description="Extracts entities and relations from text chunks for knowledge graph construction.",
+#     group_name="kg_building",
+#     io_manager_key="pydantic_json_io_manager",
+#     deps=["text_chunks"]
+# )
+# async def kg_extraction_asset(
+#     context: dg.AssetExecutionContext, # Pylance 提示 dg.AssetExecutionContext 未定义 "SystemResource"
+#     text_chunks: List[ChunkOutput],
+#     config: KGExtractionConfig,
+#     LocalLLM_api: LocalLLMAPIResource,
+#     system_info: SystemResource  # <--- 我们添加了 system_info
+# ) -> List[KGTripleSetOutput]:
+#     all_kg_outputs: List[KGTripleSetOutput] = []
+#     if not text_chunks:
+#         context.log.info("No text chunks received for KG extraction, skipping.")
+#         return all_kg_outputs
 
-    total_input_chunks = len(text_chunks)
-    total_entities_extracted_overall = 0
-    total_relations_extracted_overall = 0
-    successfully_processed_chunks_count = 0
+#     total_input_chunks = len(text_chunks)
+#     total_entities_extracted_overall = 0
+#     total_relations_extracted_overall = 0
+#     successfully_processed_chunks_count = 0
     
-    # 并发控制参数
-    recommended_concurrency = system_info.get_recommended_concurrent_tasks(task_type="kg_extraction_llm")
-    CONCURRENT_REQUESTS_LIMIT = max(1, recommended_concurrency) # 直接使用HAL推荐，但至少为1
-    context.log.info(f"HAL recommended concurrency for 'kg_extraction_llm': {recommended_concurrency}. Effective limit set to: {CONCURRENT_REQUESTS_LIMIT}")
-    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+#     # 并发控制参数
+#     recommended_concurrency = system_info.get_recommended_concurrent_tasks(task_type="kg_extraction_llm")
+#     CONCURRENT_REQUESTS_LIMIT = max(1, recommended_concurrency) # 直接使用HAL推荐，但至少为1
+#     context.log.info(f"HAL recommended concurrency for 'kg_extraction_llm': {recommended_concurrency}. Effective limit set to: {CONCURRENT_REQUESTS_LIMIT}")
+#     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
 
 
-    async def extract_kg_for_chunk(chunk: ChunkOutput) -> Optional[KGTripleSetOutput]:
-        async with semaphore:
-            # 使用单个chunk的prompt模板
-            prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
-            try:
-                context.log.debug(f"Starting KG extraction for chunk_id: {chunk.chunk_id}, Text (start): {chunk.chunk_text[:100]}...")
-                structured_response = await LocalLLM_api.generate_structured_output(
-                    prompt=prompt, 
-                    json_schema=DEFAULT_KG_EXTRACTION_SCHEMA # 使用单个对象的schema
-                )
+#     async def extract_kg_for_chunk(chunk: ChunkOutput) -> Optional[KGTripleSetOutput]:
+#         async with semaphore:
+#             # 使用单个chunk的prompt模板
+#             prompt = config.extraction_prompt_template.format(text_to_extract=chunk.chunk_text)
+#             try:
+#                 context.log.debug(f"Starting KG extraction for chunk_id: {chunk.chunk_id}, Text (start): {chunk.chunk_text[:100]}...")
+#                 structured_response = await LocalLLM_api.generate_structured_output(
+#                     prompt=prompt, 
+#                     json_schema=DEFAULT_KG_EXTRACTION_SCHEMA # 使用单个对象的schema
+#                 )
                 
-                # 确保 structured_response 是字典类型
-                if not isinstance(structured_response, dict):
-                    context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: LLM response was not a dict. Got: {type(structured_response)}. Response: {str(structured_response)[:200]}")
-                    return None
+#                 # 确保 structured_response 是字典类型
+#                 if not isinstance(structured_response, dict):
+#                     context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: LLM response was not a dict. Got: {type(structured_response)}. Response: {str(structured_response)[:200]}")
+#                     return None
 
-                entities_data = structured_response.get("entities", [])
-                extracted_entities_list = [
-                    ExtractedEntity(text=normalize_text_for_id(e.get("text","")), label=e.get("label","UNKNOWN").upper())
-                    for e in entities_data if isinstance(e, dict)
-                ]
+#                 entities_data = structured_response.get("entities", [])
+#                 extracted_entities_list = [
+#                     ExtractedEntity(text=normalize_text_for_id(e.get("text","")), label=e.get("label","UNKNOWN").upper())
+#                     for e in entities_data if isinstance(e, dict)
+#                 ]
                 
-                relations_data = structured_response.get("relations", [])
-                extracted_relations_list = [
-                    ExtractedRelation(
-                        head_entity_text=r.get('head_entity_text',""), 
-                        head_entity_label=r.get('head_entity_label',"UNKNOWN").upper(), 
-                        relation_type=r.get('relation_type',"UNKNOWN").upper(), 
-                        tail_entity_text=r.get('tail_entity_text',""), 
-                        tail_entity_label=r.get('tail_entity_label',"UNKNOWN").upper()
-                    ) 
-                    for r in relations_data if isinstance(r, dict) and 
-                                               r.get('head_entity_text') and r.get('head_entity_label') and
-                                               r.get('relation_type') and r.get('tail_entity_text') and
-                                               r.get('tail_entity_label')
-                ]
+#                 relations_data = structured_response.get("relations", [])
+#                 extracted_relations_list = [
+#                     ExtractedRelation(
+#                         head_entity_text=r.get('head_entity_text',""), 
+#                         head_entity_label=r.get('head_entity_label',"UNKNOWN").upper(), 
+#                         relation_type=r.get('relation_type',"UNKNOWN").upper(), 
+#                         tail_entity_text=r.get('tail_entity_text',""), 
+#                         tail_entity_label=r.get('tail_entity_label',"UNKNOWN").upper()
+#                     ) 
+#                     for r in relations_data if isinstance(r, dict) and 
+#                                                r.get('head_entity_text') and r.get('head_entity_label') and
+#                                                r.get('relation_type') and r.get('tail_entity_text') and
+#                                                r.get('tail_entity_label')
+#                 ]
                 
-                context.log.debug(f"Finished KG extraction for chunk_id: {chunk.chunk_id}. Entities: {len(extracted_entities_list)}, Relations: {len(extracted_relations_list)}")
-                return KGTripleSetOutput(
-                    chunk_id=chunk.chunk_id,
-                    extracted_entities=extracted_entities_list,
-                    extracted_relations=extracted_relations_list,
-                    extraction_model_name=config.local_llm_model_name,
-                    original_chunk_metadata=chunk.chunk_metadata
-                )
-            except Exception as e:
-                context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
-                return None 
+#                 context.log.debug(f"Finished KG extraction for chunk_id: {chunk.chunk_id}. Entities: {len(extracted_entities_list)}, Relations: {len(extracted_relations_list)}")
+#                 return KGTripleSetOutput(
+#                     chunk_id=chunk.chunk_id,
+#                     extracted_entities=extracted_entities_list,
+#                     extracted_relations=extracted_relations_list,
+#                     extraction_model_name=config.local_llm_model_name,
+#                     original_chunk_metadata=chunk.chunk_metadata
+#                 )
+#             except Exception as e:
+#                 context.log.error(f"Failed KG extraction for chunk {chunk.chunk_id}: {e}", exc_info=True)
+#                 return None 
 
-    context.log.info(f"Starting KG extraction for {total_input_chunks} chunks with concurrency limit: {CONCURRENT_REQUESTS_LIMIT}.")
+#     context.log.info(f"Starting KG extraction for {total_input_chunks} chunks with concurrency limit: {CONCURRENT_REQUESTS_LIMIT}.")
     
-    tasks = [extract_kg_for_chunk(chunk) for chunk in text_chunks]
+#     tasks = [extract_kg_for_chunk(chunk) for chunk in text_chunks]
     
-    results = await asyncio.gather(*tasks)
+#     results = await asyncio.gather(*tasks)
     
-    context.log.info(f"Finished all KG extraction tasks. Received {len(results)} results (including potential None for failures).")
+#     context.log.info(f"Finished all KG extraction tasks. Received {len(results)} results (including potential None for failures).")
 
-    for result_item in results:
-        if result_item and isinstance(result_item, KGTripleSetOutput):
-            all_kg_outputs.append(result_item)
-            total_entities_extracted_overall += len(result_item.extracted_entities)
-            total_relations_extracted_overall += len(result_item.extracted_relations)
-            successfully_processed_chunks_count +=1
-        elif result_item is None:
-            context.log.warning("A KG extraction task failed and returned None.")
+#     for result_item in results:
+#         if result_item and isinstance(result_item, KGTripleSetOutput):
+#             all_kg_outputs.append(result_item)
+#             total_entities_extracted_overall += len(result_item.extracted_entities)
+#             total_relations_extracted_overall += len(result_item.extracted_relations)
+#             successfully_processed_chunks_count +=1
+#         elif result_item is None:
+#             context.log.warning("A KG extraction task failed and returned None.")
             
-    context.log.info(f"KG extraction complete. Successfully processed {successfully_processed_chunks_count} out of {total_input_chunks} chunks.")
-    context.add_output_metadata(
-        metadata={
-            "total_chunks_input_to_kg": total_input_chunks, # 恢复为 total_input_chunks
-            "chunks_successfully_extracted_kg": successfully_processed_chunks_count,
-            "total_entities_extracted": total_entities_extracted_overall, 
-            "total_relations_extracted": total_relations_extracted_overall
-            # 移除了批处理相关的元数据 "total_batches_processed", "batch_size_configured"
-        }
-    )
-    return all_kg_outputs
+#     context.log.info(f"KG extraction complete. Successfully processed {successfully_processed_chunks_count} out of {total_input_chunks} chunks.")
+#     context.add_output_metadata(
+#         metadata={
+#             "total_chunks_input_to_kg": total_input_chunks, # 恢复为 total_input_chunks
+#             "chunks_successfully_extracted_kg": successfully_processed_chunks_count,
+#             "total_entities_extracted": total_entities_extracted_overall, 
+#             "total_relations_extracted": total_relations_extracted_overall
+#             # 移除了批处理相关的元数据 "total_batches_processed", "batch_size_configured"
+#         }
+#     )
+#     return all_kg_outputs
 
 
-# --- KuzuDB 构建资产链 ---
+# # --- KuzuDB 构建资产链 ---
 
-@dg.asset(
-    name="duckdb_schema", # <--- 修改资产名称
-    description="Creates the base schema (node and relation tables) in DuckDB.",
-    group_name="kg_building",
-    # deps=[kg_extraction_asset] # 保持依赖，确保在提取之后创建schema (逻辑上)
-                                 # 虽然schema创建本身不直接使用提取结果，但流水线顺序上合理
-)
-def duckdb_schema_asset(context: dg.AssetExecutionContext, duckdb_kg: DuckDBResource, embedder: GGUFEmbeddingResource): # <--- 修改函数名和资源参数
-    context.log.info("--- Starting DuckDB Schema Creation Asset ---")
+# @dg.asset(
+#     name="duckdb_schema", # <--- 修改资产名称
+#     description="Creates the base schema (node and relation tables) in DuckDB.",
+#     group_name="kg_building",
+#     # deps=[kg_extraction_asset] # 保持依赖，确保在提取之后创建schema (逻辑上)
+#                                  # 虽然schema创建本身不直接使用提取结果，但流水线顺序上合理
+# )
+# def duckdb_schema_asset(context: dg.AssetExecutionContext, duckdb_kg: DuckDBResource, embedder: GGUFEmbeddingResource): # <--- 修改函数名和资源参数
+#     context.log.info("--- Starting DuckDB Schema Creation Asset ---")
     
-    # 获取嵌入维度，与KuzuDB时类似
-    EMBEDDING_DIM = embedder.get_embedding_dimension()
-    if not EMBEDDING_DIM:
-        raise ValueError("Could not determine embedding dimension from GGUFEmbeddingResource.")
+#     # 获取嵌入维度，与KuzuDB时类似
+#     EMBEDDING_DIM = embedder.get_embedding_dimension()
+#     if not EMBEDDING_DIM:
+#         raise ValueError("Could not determine embedding dimension from GGUFEmbeddingResource.")
 
-    node_table_ddl = f"""
-    CREATE TABLE IF NOT EXISTS ExtractedEntity (
-        id_prop VARCHAR PRIMARY KEY,
-        text VARCHAR,
-        label VARCHAR,
-        embedding FLOAT[{EMBEDDING_DIM}]
-    );
-    """
+#     node_table_ddl = f"""
+#     CREATE TABLE IF NOT EXISTS ExtractedEntity (
+#         id_prop VARCHAR PRIMARY KEY,
+#         text VARCHAR,
+#         label VARCHAR,
+#         embedding FLOAT[{EMBEDDING_DIM}]
+#     );
+#     """
 
-    relation_table_ddl = f"""
-    CREATE TABLE IF NOT EXISTS KGExtractionRelation (
-        relation_id VARCHAR PRIMARY KEY,
-        source_node_id_prop VARCHAR,
-        target_node_id_prop VARCHAR,
-        relation_type VARCHAR
-        -- Optional: FOREIGN KEY (source_node_id_prop) REFERENCES ExtractedEntity(id_prop),
-        -- Optional: FOREIGN KEY (target_node_id_prop) REFERENCES ExtractedEntity(id_prop)
-    );
-    """
-    # 也可以为关系表的 (source, target, type) 创建复合唯一索引或普通索引以加速查询
-    relation_index_ddl = """
-    CREATE INDEX IF NOT EXISTS idx_relation_source_target_type 
-    ON KGExtractionRelation (source_node_id_prop, target_node_id_prop, relation_type);
-    """
+#     relation_table_ddl = f"""
+#     CREATE TABLE IF NOT EXISTS KGExtractionRelation (
+#         relation_id VARCHAR PRIMARY KEY,
+#         source_node_id_prop VARCHAR,
+#         target_node_id_prop VARCHAR,
+#         relation_type VARCHAR
+#         -- Optional: FOREIGN KEY (source_node_id_prop) REFERENCES ExtractedEntity(id_prop),
+#         -- Optional: FOREIGN KEY (target_node_id_prop) REFERENCES ExtractedEntity(id_prop)
+#     );
+#     """
+#     # 也可以为关系表的 (source, target, type) 创建复合唯一索引或普通索引以加速查询
+#     relation_index_ddl = """
+#     CREATE INDEX IF NOT EXISTS idx_relation_source_target_type 
+#     ON KGExtractionRelation (source_node_id_prop, target_node_id_prop, relation_type);
+#     """
     
-    ddl_commands = [node_table_ddl, relation_table_ddl, relation_index_ddl]
+#     ddl_commands = [node_table_ddl, relation_table_ddl, relation_index_ddl]
 
-    try:
-        with duckdb_kg.get_connection() as conn:
-            context.log.info("Executing DuckDB DDL commands...")
-            for command_idx, command in enumerate(ddl_commands):
-                context.log.debug(f"Executing DDL {command_idx+1}:\n{command.strip()}")
-                conn.execute(command)
-            context.log.info("DuckDB Schema DDL commands executed successfully.")
-    except Exception as e_ddl:
-        context.log.error(f"Error during DuckDB schema creation: {e_ddl}", exc_info=True)
-        raise
-    context.log.info("--- DuckDB Schema Creation Asset Finished ---")
+#     try:
+#         with duckdb_kg.get_connection() as conn:
+#             context.log.info("Executing DuckDB DDL commands...")
+#             for command_idx, command in enumerate(ddl_commands):
+#                 context.log.debug(f"Executing DDL {command_idx+1}:\n{command.strip()}")
+#                 conn.execute(command)
+#             context.log.info("DuckDB Schema DDL commands executed successfully.")
+#     except Exception as e_ddl:
+#         context.log.error(f"Error during DuckDB schema creation: {e_ddl}", exc_info=True)
+#         raise
+#     context.log.info("--- DuckDB Schema Creation Asset Finished ---")
 
 
-@dg.asset(
-    name="duckdb_nodes", # <--- 修改资产名称
-    description="Loads all unique extracted entities as nodes into DuckDB.",
-    group_name="kg_building",
-    deps=[duckdb_schema_asset, kg_extraction_asset] # <--- 修改依赖
-)
-def duckdb_nodes_asset(
-    context: dg.AssetExecutionContext,
-    kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset 的输出
-    duckdb_kg: DuckDBResource,               # <--- 修改资源参数
-    embedder: GGUFEmbeddingResource          # 保持对 embedder 的依赖，用于生成嵌入
-):
-        # --- START: 移动并强化初始日志 ---
-    print("<<<<< duckdb_nodes_asset FUNCTION ENTERED - PRINTING TO STDOUT >>>>>", flush=True) 
-    # 尝试使用 context.log，如果它此时可用
-    try:
-        context.log.info("<<<<< duckdb_nodes_asset FUNCTION CALLED - VIA CONTEXT.LOG - VERY BEGINNING >>>>>")
-    except Exception as e_log_init:
-        print(f"Context.log not available at the very beginning of duckdb_nodes_asset: {e_log_init}", flush=True)
-    # --- END: 移动并强化初始日志 ---
+# @dg.asset(
+#     name="duckdb_nodes", # <--- 修改资产名称
+#     description="Loads all unique extracted entities as nodes into DuckDB.",
+#     group_name="kg_building",
+#     deps=[duckdb_schema_asset, kg_extraction_asset] # <--- 修改依赖
+# )
+# def duckdb_nodes_asset(
+#     context: dg.AssetExecutionContext,
+#     kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset 的输出
+#     duckdb_kg: DuckDBResource,               # <--- 修改资源参数
+#     embedder: GGUFEmbeddingResource          # 保持对 embedder 的依赖，用于生成嵌入
+# ):
+#         # --- START: 移动并强化初始日志 ---
+#     print("<<<<< duckdb_nodes_asset FUNCTION ENTERED - PRINTING TO STDOUT >>>>>", flush=True) 
+#     # 尝试使用 context.log，如果它此时可用
+#     try:
+#         context.log.info("<<<<< duckdb_nodes_asset FUNCTION CALLED - VIA CONTEXT.LOG - VERY BEGINNING >>>>>")
+#     except Exception as e_log_init:
+#         print(f"Context.log not available at the very beginning of duckdb_nodes_asset: {e_log_init}", flush=True)
+#     # --- END: 移动并强化初始日志 ---
 
-    context.log.info("--- Starting DuckDB Node Loading Asset (Using INSERT ON CONFLICT) ---")
-    if not kg_extractions:
-        context.log.warning("No KG extractions received. Skipping node loading.")
-        return
+#     context.log.info("--- Starting DuckDB Node Loading Asset (Using INSERT ON CONFLICT) ---")
+#     if not kg_extractions:
+#         context.log.warning("No KG extractions received. Skipping node loading.")
+#         return
 
-    # +++ 新增调试日志：检查表是否存在 +++
-    try:
-        with duckdb_kg.get_connection() as conn_debug:
-            context.log.info("Attempting to list tables in DuckDB from duckdb_nodes_asset:")
-            tables = conn_debug.execute("SHOW TABLES;").fetchall()
-            context.log.info(f"Tables found: {tables}")
-            if any('"ExtractedEntity"' in str(table_row).upper() for table_row in tables) or \
-               any('ExtractedEntity' in str(table_row) for table_row in tables) : # 检查大小写不敏感的匹配
-                context.log.info("Table 'ExtractedEntity' (or similar) IS visible at the start of duckdb_nodes_asset.")
-            else:
-                context.log.warning("Table 'ExtractedEntity' IS NOT visible at the start of duckdb_nodes_asset. Schema asset might not have run correctly or changes are not reflected.")
-    except Exception as e_debug_show:
-        context.log.error(f"Error trying to list tables in duckdb_nodes_asset: {e_debug_show}")
-    # +++ 结束新增调试日志 +++
+#     # +++ 新增调试日志：检查表是否存在 +++
+#     try:
+#         with duckdb_kg.get_connection() as conn_debug:
+#             context.log.info("Attempting to list tables in DuckDB from duckdb_nodes_asset:")
+#             tables = conn_debug.execute("SHOW TABLES;").fetchall()
+#             context.log.info(f"Tables found: {tables}")
+#             if any('"ExtractedEntity"' in str(table_row).upper() for table_row in tables) or \
+#                any('ExtractedEntity' in str(table_row) for table_row in tables) : # 检查大小写不敏感的匹配
+#                 context.log.info("Table 'ExtractedEntity' (or similar) IS visible at the start of duckdb_nodes_asset.")
+#             else:
+#                 context.log.warning("Table 'ExtractedEntity' IS NOT visible at the start of duckdb_nodes_asset. Schema asset might not have run correctly or changes are not reflected.")
+#     except Exception as e_debug_show:
+#         context.log.error(f"Error trying to list tables in duckdb_nodes_asset: {e_debug_show}")
+#     # +++ 结束新增调试日志 +++
     
-    unique_nodes_data_for_insert: List[Dict[str, Any]] = []
-    unique_nodes_keys = set() # 用于在Python层面去重，避免多次尝试插入相同实体
+#     unique_nodes_data_for_insert: List[Dict[str, Any]] = []
+#     unique_nodes_keys = set() # 用于在Python层面去重，避免多次尝试插入相同实体
 
-    for kg_set in kg_extractions:
-        for entity in kg_set.extracted_entities:
-            # 规范化文本和标签，用于生成唯一键和存储
-            normalized_text = normalize_text_for_id(entity.text)
-            normalized_label = entity.label.upper() # 确保标签大写
+#     for kg_set in kg_extractions:
+#         for entity in kg_set.extracted_entities:
+#             # 规范化文本和标签，用于生成唯一键和存储
+#             normalized_text = normalize_text_for_id(entity.text)
+#             normalized_label = entity.label.upper() # 确保标签大写
             
-            # 为实体生成唯一ID (基于规范化文本和标签的哈希值)
-            # 注意：如果同一个实体（相同文本和标签）在不同chunk中被提取，它们的id_prop会一样
-            node_id_prop = hashlib.md5(f"{normalized_text}_{normalized_label}".encode('utf-8')).hexdigest()
+#             # 为实体生成唯一ID (基于规范化文本和标签的哈希值)
+#             # 注意：如果同一个实体（相同文本和标签）在不同chunk中被提取，它们的id_prop会一样
+#             node_id_prop = hashlib.md5(f"{normalized_text}_{normalized_label}".encode('utf-8')).hexdigest()
             
-            node_unique_key_for_py_dedup = (node_id_prop) # 使用id_prop进行Python层面的去重
+#             node_unique_key_for_py_dedup = (node_id_prop) # 使用id_prop进行Python层面的去重
 
-            if node_unique_key_for_py_dedup not in unique_nodes_keys:
-                unique_nodes_keys.add(node_unique_key_for_py_dedup)
+#             if node_unique_key_for_py_dedup not in unique_nodes_keys:
+#                 unique_nodes_keys.add(node_unique_key_for_py_dedup)
                 
-                # 生成嵌入向量 (与KuzuDB时逻辑相同)
-                embedding_vector_list = embedder.encode([normalized_text]) # embedder.encode期望一个列表
-                final_embedding_for_db: List[float]
+#                 # 生成嵌入向量 (与KuzuDB时逻辑相同)
+#                 embedding_vector_list = embedder.encode([normalized_text]) # embedder.encode期望一个列表
+#                 final_embedding_for_db: List[float]
 
-                if embedding_vector_list and embedding_vector_list[0] and \
-                   isinstance(embedding_vector_list[0], list) and \
-                   len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
-                    final_embedding_for_db = embedding_vector_list[0]
-                else:
-                    context.log.warning(f"Failed to generate valid embedding for node: {normalized_text} ({normalized_label}). Using zero vector. Embedding result: {embedding_vector_list}")
-                    final_embedding_for_db = [0.0] * embedder.get_embedding_dimension()
+#                 if embedding_vector_list and embedding_vector_list[0] and \
+#                    isinstance(embedding_vector_list[0], list) and \
+#                    len(embedding_vector_list[0]) == embedder.get_embedding_dimension():
+#                     final_embedding_for_db = embedding_vector_list[0]
+#                 else:
+#                     context.log.warning(f"Failed to generate valid embedding for node: {normalized_text} ({normalized_label}). Using zero vector. Embedding result: {embedding_vector_list}")
+#                     final_embedding_for_db = [0.0] * embedder.get_embedding_dimension()
                     
-                unique_nodes_data_for_insert.append({
-                    "id_prop": node_id_prop,
-                    "text": normalized_text,
-                    "label": normalized_label,
-                    "embedding": final_embedding_for_db # DuckDB的FLOAT[]可以直接接受Python的List[float]
-                })
+#                 unique_nodes_data_for_insert.append({
+#                     "id_prop": node_id_prop,
+#                     "text": normalized_text,
+#                     "label": normalized_label,
+#                     "embedding": final_embedding_for_db # DuckDB的FLOAT[]可以直接接受Python的List[float]
+#                 })
 
-    if not unique_nodes_data_for_insert:
-        context.log.warning("No unique nodes found in extractions to load into DuckDB.")
-        return
+#     if not unique_nodes_data_for_insert:
+#         context.log.warning("No unique nodes found in extractions to load into DuckDB.")
+#         return
 
-    nodes_processed_count = 0
-    nodes_inserted_count = 0
-    nodes_updated_count = 0
+#     nodes_processed_count = 0
+#     nodes_inserted_count = 0
+#     nodes_updated_count = 0
 
-    upsert_sql = f"""
-    INSERT INTO "ExtractedEntity" (id_prop, text, label, embedding)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (id_prop) DO UPDATE SET
-        text = excluded.text,
-        label = excluded.label,
-        embedding = excluded.embedding;
-    """
-    # excluded.column_name 用于引用试图插入但导致冲突的值
+#     upsert_sql = f"""
+#     INSERT INTO "ExtractedEntity" (id_prop, text, label, embedding)
+#     VALUES (?, ?, ?, ?)
+#     ON CONFLICT (id_prop) DO UPDATE SET
+#         text = excluded.text,
+#         label = excluded.label,
+#         embedding = excluded.embedding;
+#     """
+#     # excluded.column_name 用于引用试图插入但导致冲突的值
 
-    try:
-        with duckdb_kg.get_connection() as conn:
-            context.log.info(f"Attempting to UPSERT {len(unique_nodes_data_for_insert)} unique nodes into DuckDB ExtractedEntity table...")
+#     try:
+#         with duckdb_kg.get_connection() as conn:
+#             context.log.info(f"Attempting to UPSERT {len(unique_nodes_data_for_insert)} unique nodes into DuckDB ExtractedEntity table...")
             
-            # DuckDB 支持 executemany 用于批量操作，但对于 ON CONFLICT，逐条执行或构造大型 VALUES 列表可能更直接
-            # 或者使用 pandas DataFrame + duckdb.register + CREATE TABLE AS / INSERT INTO SELECT
-            # 这里为了清晰，我们先用循环执行，对于几千到几万个节点，性能尚可接受
-            # 如果节点数量非常大 (几十万以上)，应考虑更优化的批量upsert策略
+#             # DuckDB 支持 executemany 用于批量操作，但对于 ON CONFLICT，逐条执行或构造大型 VALUES 列表可能更直接
+#             # 或者使用 pandas DataFrame + duckdb.register + CREATE TABLE AS / INSERT INTO SELECT
+#             # 这里为了清晰，我们先用循环执行，对于几千到几万个节点，性能尚可接受
+#             # 如果节点数量非常大 (几十万以上)，应考虑更优化的批量upsert策略
 
-            for node_data_dict in unique_nodes_data_for_insert:
-                params = (
-                    node_data_dict["id_prop"],
-                    node_data_dict["text"],
-                    node_data_dict["label"],
-                    node_data_dict["embedding"]
-                )
-                try:
-                    # conn.execute() 对于 DML (如 INSERT, UPDATE) 不直接返回受影响的行数
-                    # 但我们可以假设它成功了，除非抛出异常
-                    conn.execute(upsert_sql, params)
-                    # 无法直接判断是insert还是update，除非查询前后对比，这里简化处理
-                    nodes_processed_count += 1 
-                except Exception as e_upsert_item:
-                    context.log.error(f"Error UPSERTING node with id_prop {node_data_dict.get('id_prop')} into DuckDB: {e_upsert_item}", exc_info=True)
+#             for node_data_dict in unique_nodes_data_for_insert:
+#                 params = (
+#                     node_data_dict["id_prop"],
+#                     node_data_dict["text"],
+#                     node_data_dict["label"],
+#                     node_data_dict["embedding"]
+#                 )
+#                 try:
+#                     # conn.execute() 对于 DML (如 INSERT, UPDATE) 不直接返回受影响的行数
+#                     # 但我们可以假设它成功了，除非抛出异常
+#                     conn.execute(upsert_sql, params)
+#                     # 无法直接判断是insert还是update，除非查询前后对比，这里简化处理
+#                     nodes_processed_count += 1 
+#                 except Exception as e_upsert_item:
+#                     context.log.error(f"Error UPSERTING node with id_prop {node_data_dict.get('id_prop')} into DuckDB: {e_upsert_item}", exc_info=True)
             
-            # 我们可以查一下表中的总行数来间接了解情况
-            total_rows_after = conn.execute('SELECT COUNT(*) FROM "ExtractedEntity"').fetchone()[0]
-            context.log.info(f"Successfully processed {nodes_processed_count} node upsert operations into DuckDB.")
-            context.log.info(f"Total rows in ExtractedEntity table after upsert: {total_rows_after}")
+#             # 我们可以查一下表中的总行数来间接了解情况
+#             total_rows_after = conn.execute('SELECT COUNT(*) FROM "ExtractedEntity"').fetchone()[0]
+#             context.log.info(f"Successfully processed {nodes_processed_count} node upsert operations into DuckDB.")
+#             context.log.info(f"Total rows in ExtractedEntity table after upsert: {total_rows_after}")
 
-    except Exception as e_db_nodes:
-        context.log.error(f"Error during DuckDB node loading: {e_db_nodes}", exc_info=True)
-        raise
+#     except Exception as e_db_nodes:
+#         context.log.error(f"Error during DuckDB node loading: {e_db_nodes}", exc_info=True)
+#         raise
     
-    context.add_output_metadata({
-        "nodes_prepared_for_upsert": len(unique_nodes_data_for_insert),
-        "nodes_processed_by_upsert_statement": nodes_processed_count,
-    })
-    context.log.info("--- DuckDB Node Loading Asset Finished ---")
+#     context.add_output_metadata({
+#         "nodes_prepared_for_upsert": len(unique_nodes_data_for_insert),
+#         "nodes_processed_by_upsert_statement": nodes_processed_count,
+#     })
+#     context.log.info("--- DuckDB Node Loading Asset Finished ---")
 
 
-@dg.asset(
-    name="duckdb_relations", # <--- 修改资产名称
-    description="Loads all extracted relationships into DuckDB.",
-    group_name="kg_building",
-    deps=[duckdb_nodes_asset] # <--- 修改依赖
-)
-def duckdb_relations_asset(
-    context: dg.AssetExecutionContext, 
-    kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset
-    duckdb_kg: DuckDBResource                # <--- 修改资源参数
-):
-    context.log.info("--- Starting DuckDB Relation Loading Asset ---")
-    if not kg_extractions:
-        context.log.warning("No KG extractions received. Skipping relation loading.")
-        return
+# @dg.asset(
+#     name="duckdb_relations", # <--- 修改资产名称
+#     description="Loads all extracted relationships into DuckDB.",
+#     group_name="kg_building",
+#     deps=[duckdb_nodes_asset] # <--- 修改依赖
+# )
+# def duckdb_relations_asset(
+#     context: dg.AssetExecutionContext, 
+#     kg_extractions: List[KGTripleSetOutput], # 来自 kg_extraction_asset
+#     duckdb_kg: DuckDBResource                # <--- 修改资源参数
+# ):
+#     context.log.info("--- Starting DuckDB Relation Loading Asset ---")
+#     if not kg_extractions:
+#         context.log.warning("No KG extractions received. Skipping relation loading.")
+#         return
 
-    relations_to_insert: List[Dict[str, str]] = []
-    unique_relation_keys = set() # 用于在Python层面去重
+#     relations_to_insert: List[Dict[str, str]] = []
+#     unique_relation_keys = set() # 用于在Python层面去重
 
-    for kg_set in kg_extractions:
-        for rel in kg_set.extracted_relations:
-            # 从实体文本和标签生成源节点和目标节点的ID (与 duckdb_nodes_asset 中一致)
-            source_node_text_norm = normalize_text_for_id(rel.head_entity_text)
-            source_node_label_norm = rel.head_entity_label.upper()
-            source_node_id = hashlib.md5(f"{source_node_text_norm}_{source_node_label_norm}".encode('utf-8')).hexdigest()
+#     for kg_set in kg_extractions:
+#         for rel in kg_set.extracted_relations:
+#             # 从实体文本和标签生成源节点和目标节点的ID (与 duckdb_nodes_asset 中一致)
+#             source_node_text_norm = normalize_text_for_id(rel.head_entity_text)
+#             source_node_label_norm = rel.head_entity_label.upper()
+#             source_node_id = hashlib.md5(f"{source_node_text_norm}_{source_node_label_norm}".encode('utf-8')).hexdigest()
 
-            target_node_text_norm = normalize_text_for_id(rel.tail_entity_text)
-            target_node_label_norm = rel.tail_entity_label.upper()
-            target_node_id = hashlib.md5(f"{target_node_text_norm}_{target_node_label_norm}".encode('utf-8')).hexdigest()
+#             target_node_text_norm = normalize_text_for_id(rel.tail_entity_text)
+#             target_node_label_norm = rel.tail_entity_label.upper()
+#             target_node_id = hashlib.md5(f"{target_node_text_norm}_{target_node_label_norm}".encode('utf-8')).hexdigest()
             
-            relation_type_norm = rel.relation_type.upper()
+#             relation_type_norm = rel.relation_type.upper()
 
-            # 为关系本身生成一个唯一ID
-            relation_unique_str = f"{source_node_id}_{relation_type_norm}_{target_node_id}"
-            relation_id = hashlib.md5(relation_unique_str.encode('utf-8')).hexdigest()
+#             # 为关系本身生成一个唯一ID
+#             relation_unique_str = f"{source_node_id}_{relation_type_norm}_{target_node_id}"
+#             relation_id = hashlib.md5(relation_unique_str.encode('utf-8')).hexdigest()
 
-            if relation_id not in unique_relation_keys:
-                unique_relation_keys.add(relation_id)
-                relations_to_insert.append({
-                    "relation_id": relation_id,
-                    "source_node_id_prop": source_node_id,
-                    "target_node_id_prop": target_node_id,
-                    "relation_type": relation_type_norm
-                })
+#             if relation_id not in unique_relation_keys:
+#                 unique_relation_keys.add(relation_id)
+#                 relations_to_insert.append({
+#                     "relation_id": relation_id,
+#                     "source_node_id_prop": source_node_id,
+#                     "target_node_id_prop": target_node_id,
+#                     "relation_type": relation_type_norm
+#                 })
     
-    if not relations_to_insert:
-        context.log.warning("No unique relations found in extractions to load into DuckDB.")
-        return
+#     if not relations_to_insert:
+#         context.log.warning("No unique relations found in extractions to load into DuckDB.")
+#         return
 
-    relations_processed_count = 0
+#     relations_processed_count = 0
     
-    # 使用 INSERT INTO ... ON CONFLICT DO NOTHING 来避免插入重复的关系 (基于 relation_id)
-    insert_sql = """
-    INSERT INTO KGExtractionRelation (relation_id, source_node_id_prop, target_node_id_prop, relation_type)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (relation_id) DO NOTHING;
-    """
+#     # 使用 INSERT INTO ... ON CONFLICT DO NOTHING 来避免插入重复的关系 (基于 relation_id)
+#     insert_sql = """
+#     INSERT INTO KGExtractionRelation (relation_id, source_node_id_prop, target_node_id_prop, relation_type)
+#     VALUES (?, ?, ?, ?)
+#     ON CONFLICT (relation_id) DO NOTHING;
+#     """
 
-    try:
-        with duckdb_kg.get_connection() as conn:
-            context.log.info(f"Attempting to INSERT {len(relations_to_insert)} unique relations into DuckDB KGExtractionRelation table...")
+#     try:
+#         with duckdb_kg.get_connection() as conn:
+#             context.log.info(f"Attempting to INSERT {len(relations_to_insert)} unique relations into DuckDB KGExtractionRelation table...")
             
-            for rel_data_dict in relations_to_insert:
-                params = (
-                    rel_data_dict["relation_id"],
-                    rel_data_dict["source_node_id_prop"],
-                    rel_data_dict["target_node_id_prop"],
-                    rel_data_dict["relation_type"]
-                )
-                try:
-                    conn.execute(insert_sql, params)
-                    # DuckDB的execute对于INSERT ON CONFLICT DO NOTHING不直接返回是否插入
-                    # 但我们可以假设它成功处理了（要么插入，要么忽略）
-                    relations_processed_count += 1
-                except Exception as e_insert_item:
-                    context.log.error(f"Error INSERTING relation with id {rel_data_dict.get('relation_id')} into DuckDB: {e_insert_item}", exc_info=True)
+#             for rel_data_dict in relations_to_insert:
+#                 params = (
+#                     rel_data_dict["relation_id"],
+#                     rel_data_dict["source_node_id_prop"],
+#                     rel_data_dict["target_node_id_prop"],
+#                     rel_data_dict["relation_type"]
+#                 )
+#                 try:
+#                     conn.execute(insert_sql, params)
+#                     # DuckDB的execute对于INSERT ON CONFLICT DO NOTHING不直接返回是否插入
+#                     # 但我们可以假设它成功处理了（要么插入，要么忽略）
+#                     relations_processed_count += 1
+#                 except Exception as e_insert_item:
+#                     context.log.error(f"Error INSERTING relation with id {rel_data_dict.get('relation_id')} into DuckDB: {e_insert_item}", exc_info=True)
             
-            total_rels_after = conn.execute("SELECT COUNT(*) FROM KGExtractionRelation").fetchone()[0]
-            context.log.info(f"Successfully processed {relations_processed_count} relation insert (ON CONFLICT DO NOTHING) operations.")
-            context.log.info(f"Total rows in KGExtractionRelation table after inserts: {total_rels_after}")
+#             total_rels_after = conn.execute("SELECT COUNT(*) FROM KGExtractionRelation").fetchone()[0]
+#             context.log.info(f"Successfully processed {relations_processed_count} relation insert (ON CONFLICT DO NOTHING) operations.")
+#             context.log.info(f"Total rows in KGExtractionRelation table after inserts: {total_rels_after}")
 
-    except Exception as e_db_rels:
-        context.log.error(f"Error during DuckDB relation loading: {e_db_rels}", exc_info=True)
-        raise
+#     except Exception as e_db_rels:
+#         context.log.error(f"Error during DuckDB relation loading: {e_db_rels}", exc_info=True)
+#         raise
         
-    context.add_output_metadata({
-        "relations_prepared_for_insert": len(relations_to_insert),
-        "relations_processed_by_insert_statement": relations_processed_count,
-    })
-    context.log.info("--- DuckDB Relation Loading Asset Finished ---")
+#     context.add_output_metadata({
+#         "relations_prepared_for_insert": len(relations_to_insert),
+#         "relations_processed_by_insert_statement": relations_processed_count,
+#     })
+#     context.log.info("--- DuckDB Relation Loading Asset Finished ---")
 
 
 
-@dg.asset(
-    name="duckdb_vector_index", # <--- 修改资产名称
-    description="Creates the HNSW vector index on the embedding column in DuckDB.",
-    group_name="kg_building",
-    deps=[duckdb_relations_asset]  # <--- 修改依赖
-)
-def duckdb_vector_index_asset(
-    context: dg.AssetExecutionContext, 
-    duckdb_kg: DuckDBResource # <--- 修改资源参数
-):
-    context.log.info("--- Starting DuckDB Vector Index Creation Asset ---")
+# @dg.asset(
+#     name="duckdb_vector_index", # <--- 修改资产名称
+#     description="Creates the HNSW vector index on the embedding column in DuckDB.",
+#     group_name="kg_building",
+#     deps=[duckdb_relations_asset]  # <--- 修改依赖
+# )
+# def duckdb_vector_index_asset(
+#     context: dg.AssetExecutionContext, 
+#     duckdb_kg: DuckDBResource # <--- 修改资源参数
+# ):
+#     context.log.info("--- Starting DuckDB Vector Index Creation Asset ---")
     
-    table_to_index = "ExtractedEntity"
-    column_to_index = "embedding"
-    # 索引名可以自定义，通常包含表名、列名和类型
-    index_name = f"{table_to_index}_{column_to_index}_hnsw_idx"
-    metric_type = "l2sq" # 欧氏距离的平方，与我们测试时一致
+#     table_to_index = "ExtractedEntity"
+#     column_to_index = "embedding"
+#     # 索引名可以自定义，通常包含表名、列名和类型
+#     index_name = f"{table_to_index}_{column_to_index}_hnsw_idx"
+#     metric_type = "l2sq" # 欧氏距离的平方，与我们测试时一致
 
-    # DuckDB 的 CREATE INDEX ... USING HNSW 语句
-    # IF NOT EXISTS 确保了幂等性
-    index_creation_sql = f"""
-    CREATE INDEX IF NOT EXISTS {index_name} 
-    ON {table_to_index} USING HNSW ({column_to_index}) 
-    WITH (metric='{metric_type}');
-    """
+#     # DuckDB 的 CREATE INDEX ... USING HNSW 语句
+#     # IF NOT EXISTS 确保了幂等性
+#     index_creation_sql = f"""
+#     CREATE INDEX IF NOT EXISTS {index_name} 
+#     ON {table_to_index} USING HNSW ({column_to_index}) 
+#     WITH (metric='{metric_type}');
+#     """
 
-    try:
-        with duckdb_kg.get_connection() as conn:
-            # 在创建索引前，确保vss扩展已加载且持久化已开启 (虽然DuckDBResource的setup已做)
-            try:
-                conn.execute("LOAD vss;")
-                conn.execute("SET hnsw_enable_experimental_persistence=true;")
-                context.log.info("DuckDB: VSS extension loaded and HNSW persistence re-confirmed for index creation asset.")
-            except Exception as e_vss_setup_idx:
-                context.log.warning(f"DuckDB: Failed to re-confirm VSS setup for index asset: {e_vss_setup_idx}. "
-                                     "Proceeding, assuming it was set by DuckDBResource.")
+#     try:
+#         with duckdb_kg.get_connection() as conn:
+#             # 在创建索引前，确保vss扩展已加载且持久化已开启 (虽然DuckDBResource的setup已做)
+#             try:
+#                 conn.execute("LOAD vss;")
+#                 conn.execute("SET hnsw_enable_experimental_persistence=true;")
+#                 context.log.info("DuckDB: VSS extension loaded and HNSW persistence re-confirmed for index creation asset.")
+#             except Exception as e_vss_setup_idx:
+#                 context.log.warning(f"DuckDB: Failed to re-confirm VSS setup for index asset: {e_vss_setup_idx}. "
+#                                      "Proceeding, assuming it was set by DuckDBResource.")
 
-            context.log.info(f"Executing DuckDB vector index creation command:\n{index_creation_sql.strip()}")
-            conn.execute(index_creation_sql)
-            context.log.info(f"DuckDB vector index '{index_name}' creation command executed successfully (or index already existed).")
+#             context.log.info(f"Executing DuckDB vector index creation command:\n{index_creation_sql.strip()}")
+#             conn.execute(index_creation_sql)
+#             context.log.info(f"DuckDB vector index '{index_name}' creation command executed successfully (or index already existed).")
 
-    except Exception as e_index_asset:
-        context.log.error(f"Error during DuckDB vector index creation: {e_index_asset}", exc_info=True)
-        raise
+#     except Exception as e_index_asset:
+#         context.log.error(f"Error during DuckDB vector index creation: {e_index_asset}", exc_info=True)
+#         raise
     
-    context.log.info("--- DuckDB Vector Index Creation Asset Finished ---")
+#     context.log.info("--- DuckDB Vector Index Creation Asset Finished ---")
 
 
 # --- 更新 all_processing_assets 列表 ---
@@ -1149,9 +1185,9 @@ all_processing_assets = [
     generate_embeddings_asset,
     vector_storage_asset,
     keyword_index_asset,
-    kg_extraction_asset,
-    duckdb_schema_asset,
-    duckdb_nodes_asset,
-    duckdb_relations_asset,
-    duckdb_vector_index_asset,
+    # kg_extraction_asset,
+    # duckdb_schema_asset,
+    # duckdb_nodes_asset,
+    # duckdb_relations_asset,
+    # duckdb_vector_index_asset,
 ]
