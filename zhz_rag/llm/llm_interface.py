@@ -1,5 +1,6 @@
 # zhz_agent/llm.py (renamed to llm_interface.py as per typical module naming)
 
+import pandas as pd
 from cachetools import TTLCache
 import os
 import httpx  # 用于异步HTTP请求
@@ -903,3 +904,65 @@ async def generate_query_plan(user_query: str) -> Optional[RagQueryPlan]:
         llm_py_logger.error(f"Failed to parse or validate LLM query plan. Error: {e}. Raw output: '{llm_response_str}'. Falling back to simple query.", exc_info=True)
         # 即使解析失败，也要保证RAG流程能继续，返回一个基础的计划
         return RagQueryPlan(query=user_query, metadata_filter={})
+    
+
+# --- V4 - Table QA Instruction Generation (Validated by PoC) ---
+
+TABLE_QA_INSTRUCTION_PROMPT_TEMPLATE = """
+# 指令
+你是一个专门从用户问题中提取表格查询指令的AI。你的唯一任务是分析【用户问题】和【表格列名】，然后输出一个包含`row_identifier`和`column_identifier`的JSON对象。
+
+## 表格信息
+【表格列名】: {column_names}
+
+## 用户问题
+【用户问题】: "{user_query}"
+
+## 输出要求
+请严格按照以下格式输出一个JSON对象，不要包含任何其他文字或解释。
+```json
+{{
+  "row_identifier": "string, 用户问题中提到的具体行名",
+  "column_identifier": "string, 用户问题中提到的具体列名"
+}}
+```
+你的JSON输出:
+"""
+# 使用主项目中已验证过的、最健壮的通用JSON GBNF Schema
+from .rag_prompts import V2_PLANNING_GBNF_SCHEMA as TABLE_QA_INSTRUCTION_GBNF_SCHEMA
+
+
+async def generate_table_lookup_instruction(user_query: str, table_column_names: List[str]) -> Optional[Dict[str, str]]:
+    """
+    Uses LLM to generate a structured instruction for table lookup, based on the user query and table columns.
+    Returns a dictionary like {"row_identifier": "...", "column_identifier": "..."}.
+    """
+    llm_py_logger.info(f"Generating table lookup instruction for query: '{user_query}'")
+    
+    prompt = TABLE_QA_INSTRUCTION_PROMPT_TEMPLATE.format(
+        column_names=", ".join(table_column_names),
+        user_query=user_query
+    )
+
+    llm_response_str = await call_local_llm_with_gbnf(
+        full_prompt=prompt,
+        grammar_str=TABLE_QA_INSTRUCTION_GBNF_SCHEMA,
+        temperature=0.0,
+        max_tokens=256,
+        task_type="table_qa_instruction_generation",
+        user_query_for_log=user_query
+    )
+    if not llm_response_str:
+        llm_py_logger.warning("LLM call for table instruction generation returned None.")
+        return None
+    try:
+        instruction_json = json.loads(llm_response_str)
+        if "row_identifier" in instruction_json and "column_identifier" in instruction_json:
+            llm_py_logger.info(f"Successfully generated table lookup instruction: {instruction_json}")
+            return instruction_json
+        else:
+            llm_py_logger.warning(f"Generated JSON is missing required keys: {instruction_json}")
+            return None
+    except json.JSONDecodeError:
+        llm_py_logger.error(f"Failed to decode JSON from LLM for table instruction: {llm_response_str}")
+        return None

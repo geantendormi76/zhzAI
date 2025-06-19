@@ -1,6 +1,8 @@
 # /home/zhz/zhz_agent/zhz_rag/api/rag_api_service.py
 # 版本: 3.1.0 - 手动实现 Small-to-Big Retrieval (更新异步检索调用, 修复prompts导入)
 
+import pandas as pd
+import io
 import os
 import asyncio
 from contextlib import asynccontextmanager
@@ -16,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from cachetools import TTLCache
 import hashlib
-
+import json
 # LangChain 相关导入 - 我们仍然需要 Document 和 InMemoryStore
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document as LangchainDocument
@@ -36,7 +38,8 @@ else:
 from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
 from zhz_rag.llm.llm_interface import (
     generate_answer_from_context,
-    generate_query_plan,  # <--- 修改点
+    generate_query_plan,
+    generate_table_lookup_instruction, # <--- 确保导入这个新函数
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
 # 修复: 移除 get_table_qa_messages 的导入，因为它导致了 AttributeError
@@ -211,12 +214,38 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         search_query = query_plan.query if query_plan else query_request.query
         metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
 
-        # 2. 简化元数据过滤器
-        if "$and" in metadata_filter and len(metadata_filter["$and"]) == 1:
+        # --- V2: 规范化并简化元数据过滤器 ---
+        api_logger.info(f"Normalizing filter: {metadata_filter}")
+
+        # 步骤a: 规范化 - 如果一个字典里有多个键，自动用$and包装
+        if isinstance(metadata_filter, dict) and len(metadata_filter) > 1 and not metadata_filter.keys() & {'$and', '$or', '$not'}:
+            # 只有在没有逻辑操作符的情况下，才进行包装
+            new_filter_list = [{key: value} for key, value in metadata_filter.items()]
+            metadata_filter = {"$and": new_filter_list}
+            api_logger.info(f"Wrapped multiple conditions into $and: {metadata_filter}")
+
+        # 步骤b: 净化 - 移除$and/$or列表中可能存在的空字典
+        if isinstance(metadata_filter, dict):
+            for op in ["$and", "$or"]:
+                if op in metadata_filter and isinstance(metadata_filter[op], list):
+                    cleaned_list = [item for item in metadata_filter[op] if item and isinstance(item, dict)]
+                    if cleaned_list:
+                        metadata_filter[op] = cleaned_list
+                    else:
+                        metadata_filter.pop(op)
+            if not metadata_filter:
+                metadata_filter = {}
+
+        # 步骤c: 简化 - 如果$and/$or中只剩一个元素，则剥离包装
+        if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
             metadata_filter = metadata_filter["$and"][0]
-        elif "$or" in metadata_filter and len(metadata_filter["$or"]) == 1:
+            api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
+        elif metadata_filter and ("$or" in metadata_filter) and len(metadata_filter["$or"]) == 1:
             metadata_filter = metadata_filter["$or"][0]
-        api_logger.info(f"Plan -> Query: '{search_query}', Filter: {metadata_filter}")
+            api_logger.info(f"Simplified single-element $or filter to: {metadata_filter}")
+        
+        api_logger.info(f"Final normalized filter: {metadata_filter}")
+        # --- 规范化与简化结束 ---
 
         # 3. 检索小块
         api_logger.info(f"--- Step 2: Retrieving child chunks with plan ---")
@@ -231,33 +260,108 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         final_context_docs_obj: List[RetrievedDocument] = []
         prompt_builder_to_use = get_answer_generation_messages # 默认为通用专家
 
-        # 4. 专家分派逻辑
+        # 4. 专家分派逻辑 (V3.3 - Hybrid Approach Implemented)
+        final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+        final_context_docs_obj: List[RetrievedDocument] = []
+
         if retrieved_child_chunks:
-            # 检查排名第一的小块是否是表格
             top_chunk = retrieved_child_chunks[0]
             top_chunk_meta = top_chunk.get('metadata', {})
             top_chunk_type = top_chunk_meta.get('paragraph_type')
+            top_chunk_content = top_chunk.get('document', '')
 
-            if top_chunk_type and 'Table' in top_chunk_type:
-                # --- 表格专家路径 ---
-                api_logger.info(f"EXPERT DISPATCH: Top chunk is a '{top_chunk_type}'. Using Table QA Expert.")
-                final_context_str = top_chunk.get('document', '') # 直接使用小块内容（即表格本身）
-                final_context_docs_obj = [RetrievedDocument(
-                    source_type="specialized_table_retrieval",
-                    content=final_context_str,
-                    score=top_chunk.get('distance', 1.0), # 可以用距离作为分数
-                    metadata=top_chunk_meta
-                )]
-                prompt_builder_to_use = get_table_qa_messages
+            # --- 表格专家路径 (Hybrid: LLM for Instruction, Code for Execution) ---
+            if top_chunk_type and 'Table' in top_chunk_type and top_chunk_content:
+                api_logger.info(f"EXPERT DISPATCH: Top chunk is a '{top_chunk_type}'. Activating Table QA Hybrid Expert.")
+                
+                # --- START: 修改点 ---
+                metadata_str = json.dumps(top_chunk_meta, indent=2, ensure_ascii=False)
+                final_context_str = (
+                    f"---\n"
+                    f"### Source Document Metadata:\n"
+                    f"```json\n{metadata_str}\n```\n\n"
+                    f"### Table Content (Markdown):\n{top_chunk_content}\n"
+                    f"---"
+                )
+                # --- END: 修改点 ---
+                
+                # a. 将表格Markdown加载到DataFrame
+                try:
+                    df = pd.read_csv(io.StringIO(top_chunk_content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
+                    df.columns = [col.strip() for col in df.columns]
+                    # 获取第一列的列名作为索引名
+                    index_col_name = df.columns[0]
+                    df = df.set_index(index_col_name)
+                    api_logger.info(f"Successfully loaded table into DataFrame. Index: '{index_col_name}', Columns: {df.columns.tolist()}")
+
+                    # b. 调用LLM生成查找指令
+                    instruction = await generate_table_lookup_instruction(
+                        user_query=query_request.query,
+                        table_column_names=[index_col_name] + df.columns.tolist() # 将索引名也加入列名列表
+                    )
+
+                    # c. 使用代码执行指令
+                    if instruction:
+                        row_id = instruction.get("row_identifier")
+                        col_id = instruction.get("column_identifier")
+                        api_logger.info(f"Executing instruction: Find row='{row_id}', column='{col_id}'")
+                        
+                        # d. 在DataFrame中精确查找
+                        if row_id in df.index and col_id in df.columns:
+                            value = df.at[row_id, col_id]
+                            final_answer = f"根据查找到的表格信息，{row_id}的{col_id}是{value}。"
+                            api_logger.info(f"SUCCESS: Found value '{value}' at ('{row_id}', '{col_id}').")
+                        else:
+                            api_logger.warning(f"Instruction execution failed: Row '{row_id}' or Column '{col_id}' not found in DataFrame.")
+                            final_answer = f"我在表格中找到了相关信息，但无法精确定位到'{row_id}'的'{col_id}'。"
+
+                    else:
+                        api_logger.warning("LLM failed to generate a valid table lookup instruction. Falling back to text summary.")
+                        # 如果指令生成失败，可以回退到通用总结模式
+                        final_context_str = top_chunk_content
+                        generated_final_answer = await generate_answer_from_context(
+                            user_query=query_request.query, 
+                            context_str=final_context_str,
+                            prompt_builder=get_answer_generation_messages
+                        )
+                        final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
+
+                    # 记录用于生成答案的上下文（即这个表格本身）
+                    final_context_docs_obj = [RetrievedDocument(
+                        source_type="hybrid_table_qa_execution",
+                        content=top_chunk_content,
+                        score=top_chunk.get('distance', 1.0),
+                        metadata=top_chunk_meta
+                    )]
+
+                except Exception as e_pandas:
+                    api_logger.error(f"Error during Hybrid Table QA execution: {e_pandas}", exc_info=True)
+                    final_answer = "处理表格数据时遇到错误。"
+
+            # --- 通用专家路径 (小块 -> 大块) ---
             else:
-                # --- 通用专家路径 (小块 -> 大块) ---
                 api_logger.info(f"EXPERT DISPATCH: Top chunk is '{top_chunk_type}'. Using General Context (Small-to-Big) Expert.")
                 parent_ids = list(set(
                     chunk['metadata']['parent_id'] 
                     for chunk in retrieved_child_chunks if chunk.get('metadata') and chunk['metadata'].get('parent_id')
                 ))
                 parent_docs = app_ctx.docstore.mget(parent_ids)
-                
+
+                # --- START: 修改点 ---
+                context_strings = []
+                for doc in final_context_docs_obj:
+                    # 将元数据字典转换为格式化的JSON字符串，以便LLM阅读
+                    metadata_str = json.dumps(doc.metadata, indent=2, ensure_ascii=False)
+                    context_strings.append(
+                        f"---\n"
+                        f"### Source Document Metadata:\n"
+                        f"```json\n{metadata_str}\n```\n\n"
+                        f"### Document Content:\n{doc.content}\n"
+                        f"---"
+                    )
+                final_context_str = "\n\n".join(context_strings)
+                # --- END: 修改点 ---
+
                 final_context_docs_obj = [
                     RetrievedDocument(
                         source_type="parent_document_retrieval",
@@ -268,20 +372,23 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 ]
                 context_strings = [f"Source: {doc.metadata.get('filename', 'N/A')}\nContent:\n{doc.content}" for doc in final_context_docs_obj]
                 final_context_str = "\n\n---\n\n".join(context_strings)
-
-        # 5. 生成答案
-        api_logger.info(f"--- Step 3: Generating final answer with selected expert ---")
-        if not final_context_str:
-            final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
-        else:
-            generated_final_answer = await generate_answer_from_context(
-                user_query=query_request.query, 
-                context_str=final_context_str,
-                prompt_builder=prompt_builder_to_use
-            )
-            final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
+                
+                if not final_context_str:
+                    final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+                else:
+                    generated_final_answer = await generate_answer_from_context(
+                        user_query=query_request.query, 
+                        context_str=final_context_str,
+                        prompt_builder=get_answer_generation_messages
+                    )
+                    final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
         
-        # --- END: 最终版专家分派逻辑 ---
+        # --- 整合最终结果 ---
+        response_to_return = HybridRAGResponse(
+            answer=final_answer, 
+            original_query=query_request.query, 
+            retrieved_sources=final_context_docs_obj
+        )
 
         response_to_return = HybridRAGResponse(
             answer=final_answer, 
