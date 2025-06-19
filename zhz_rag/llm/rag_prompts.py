@@ -376,14 +376,25 @@ Output JSON:
 <|im_start|>assistant
 """
 
-# V2: GBNF for the planner, supporting structured filters
+# --- START: 覆盖 GBNF 字符串 ---
+# GBNF for the combined task with advanced filtering
 COMBINED_PLANNING_GBNF_STRING = r"""
-root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object "," space "\"metadata_filter\"" ":" space (filter-object | "null") space "}"
+root ::= "{" space "\"expanded_queries\"" ":" space string-array "," space "\"extracted_entities_for_kg\"" ":" space kg-extraction-object ("," space "\"metadata_filter\"" ":" space (json-object | "null"))? space "}"
+
+# --- Common Definitions ---
 space ::= ([ \t\n\r])*
-
-char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 string ::= "\"" (char)* "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+number ::= "-"? ([0-9] | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+boolean ::= "true" | "false"
 
+# --- JSON structure for filter ---
+json-value ::= string | number | boolean | json-object | json-array | "null"
+json-object ::= "{" space (pair ("," space pair)*)? space "}"
+pair ::= string ":" space json-value
+json-array ::= "[" space (json-value ("," space json-value)*)? space "]"
+
+# --- Specific parts for our main object ---
 string-array ::= "[" space (string ("," space string)*)? space "]"
 
 kg-extraction-object ::= "{" space "\"entities\"" ":" space entities "," space "\"relations\"" ":" space relations "}"
@@ -391,87 +402,92 @@ entities ::= "[" space (entities-item ("," space entities-item)*)? space "]"
 entities-item ::= "{" space "\"text\"" ":" space string "," space "\"label\"" ":" space string "}"
 relations ::= "[" space (relations-item ("," space relations-item)*)? space "]"
 relations-item ::= "{" space "\"head_entity_text\"" ":" space string "," space "\"head_entity_label\"" ":" space string "," space "\"relation_type\"" ":" space string "," space "\"tail_entity_text\"" ":" space string "," space "\"tail_entity_label\"" ":" space string "}"
-
-filter-object ::= "{" space ("\"$and\"" | "\"$or\"") ":" space filter-array "}"
-filter-array ::= "[" space (condition-object ("," space condition-object)*)? space "]"
-condition-object ::= "{" space string ":" space string "}"
 """
-
+# --- END: 覆盖 GBNF 字符串 ---
 
 
 # V3: 更强大的规划器，支持层次化元数据过滤
+# Prompt Template for the combined task - V3 with Advanced Metadata Filter
 COMBINED_PLANNING_PROMPT_TEMPLATE = """<|im_start|>system
-You are a master query planner. Your task is to analyze the user's query and generate a structured JSON execution plan. This plan includes expanded queries for semantic search, entities for knowledge graph retrieval, and a precise metadata filter for targeted document retrieval.
+You are a highly efficient and structured query planner. Your task is to analyze the user's query and produce a single, valid JSON object to guide the retrieval process.
 
-**Actions to Perform & JSON Output Schema:**
-You MUST output a single, valid JSON object with the following structure. Do NOT include any text outside the JSON object.
+**Actions to Perform:**
+1.  **Query Expansion:** Generate 2-3 diverse, related sub-questions.
+2.  **KG Entity Extraction:** Extract key entities (PERSON, ORGANIZATION, TASK, etc.).
+3.  **Advanced Metadata Filter Generation:** Analyze the query for specific contextual constraints like filenames, chapters, sections, or page numbers. Construct a filter object accordingly.
+
+**Available Metadata Fields for Filtering:**
+- `filename`: string (e.g., "report.pdf")
+- `page`: integer (e.g., 5)
+- `paragraph_type`: string (e.g., "table", "title", "narrative_text")
+- `title_hierarchy_1`: string (e.g., "第一章 介绍")
+- `title_hierarchy_2`: string (e.g., "财务分析")
+- `title_hierarchy_...`: string (for deeper levels)
+
+**Output Format (Strict JSON):**
+You MUST output a single, valid JSON object. Do NOT include any explanations, markdown, or any text outside of the JSON object.
 
 ```json
 {{
   "expanded_queries": [
-    "string // Expanded question 1, for semantic exploration",
-    "string // Expanded question 2, another facet of the query",
-    "string // Expanded question 3, a broader related question"
-  ],
-  "extracted_entities_for_kg": {{
-    "entities": [ {{"text": "string", "label": "string"}} ],
-    "relations": [ {{"head_entity_text": "string", ...}} ]
-  }},
-  "metadata_filter": {{
-    "$and": [
-      {{"filename": "string // Optional: filename if mentioned"}},
-      {{"title_hierarchy_X": "string // Optional: chapter/section title mentioned"}},
-      {{"paragraph_type": "string // Optional: 'table', 'image', etc."}}
-    ]
-  }} or null
-}}
-Metadata Filtering Rules:
-filename: Extract if the user explicitly mentions a file (e.g., "report.docx", "sample.pdf").
-title_hierarchy_X: If the user mentions a chapter or section (e.g., "第二章", "chapter 3", "关于财务的部分"), identify its level (e.g., 2 for "第二章") and title. Construct a filter like {{"title_hierarchy_2": "财务分析"}}.
-paragraph_type: If the user mentions a content type (e.g., "表格", "图片", "代码"), add a filter like {{"paragraph_type": "table"}}.
-If multiple conditions are present, combine them with "$and".
-If no filter conditions are found, metadata_filter MUST be null.
-Example 1: Complex Query
-User Query: "在《2024年度报告.pdf》的第二章里，关于新产品线的财务数据表格怎么样？"
-Expected JSON Output:
-{{
-  "expanded_queries": [
-    "新产品线在2024年的详细财务表现如何？",
-    "《2024年度报告》中对新产品线的市场前景分析是什么？",
-    "对比历史数据，新产品线的盈利能力有何变化？"
+    "string"
   ],
   "extracted_entities_for_kg": {{
     "entities": [
-      {{"text": "新产品线", "label": "PRODUCT"}},
-      {{"text": "财务数据", "label": "TASK"}}
+      {{"text": "string", "label": "string"}}
     ],
+    "relations": []
+  }},
+  "metadata_filter": {{ ... }} or null
+}}
+Examples:
+Example 1: Simple Filename Filter
+User Query: "In the annual_report_2023.pdf file, what were the main conclusions?"
+Expected JSON Output:
+{{
+  "expanded_queries": [
+    "What are the key findings in the 2023 annual report?",
+    "Summarize the executive summary of annual_report_2023.pdf."
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [{{"text": "annual_report_2023.pdf", "label": "DOCUMENT"}}],
+    "relations": []
+  }},
+  "metadata_filter": {{"filename": "annual_report_2023.pdf"}}
+}}
+Example 2: Advanced Chapter and Content Type Filter
+User Query: "Show me the tables in the second chapter of the financial report."
+Expected JSON Output:
+{{
+  "expanded_queries": [
+    "What data is presented in the tables of chapter 2 of the financial report?",
+    "List all tables from the second chapter of the financial analysis document."
+  ],
+  "extracted_entities_for_kg": {{
+    "entities": [{{"text": "financial report", "label": "DOCUMENT"}}],
     "relations": []
   }},
   "metadata_filter": {{
     "$and": [
-      {{"filename": "2024年度报告.pdf"}},
-      {{"title_hierarchy_2": "财务数据"}},
+      {{"title_hierarchy_2": "财务分析"}},
       {{"paragraph_type": "table"}}
     ]
   }}
-}}```
-**Example 2: Simple Query**
-User Query: "张三在哪个项目工作？"
+}}
+Example 3: No Filter
+User Query: "Who is the project manager for Project Alpha?"
 Expected JSON Output:
-```json
 {{
   "expanded_queries": [
-    "张三参与了哪些项目？",
-    "查询张三的团队和项目分配情况。",
-    "张三的工作职责是什么？"
+    "Who leads Project Alpha?",
+    "What are the responsibilities of the project manager for Project Alpha?"
   ],
   "extracted_entities_for_kg": {{
     "entities": [
-      {{"text": "张三", "label": "PERSON"}}
+      {{"text": "Project Alpha", "label": "PROJECT"}},
+      {{"text": "project manager", "label": "TASK"}}
     ],
-    "relations": [
-      {{"head_entity_text": "张三", "head_entity_label": "PERSON", "relation_type": "WORKS_ON", "tail_entity_text": "项目", "tail_entity_label": "PROJECT"}}
-    ]
+    "relations": []
   }},
   "metadata_filter": null
 }}
@@ -482,6 +498,7 @@ Output JSON:
 <|im_end|>
 <|im_start|>assistant
 """
+
 
 
 def get_table_qa_messages(user_query: str, context_str: str) -> List[Dict[str, str]]:

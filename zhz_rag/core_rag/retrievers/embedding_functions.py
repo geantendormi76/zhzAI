@@ -35,95 +35,39 @@ def l2_normalize_embeddings(embeddings: List[List[float]]) -> List[List[float]]:
     return normalized_embeddings
 
 
+
 class LlamaCppEmbeddingFunction:
     """
-    一个自定义的 ChromaDB 嵌入函数，使用 LocalModelHandler (llama.cpp) 生成嵌入。
-    此类的方法现在设计为异步的，以正确桥接 LocalModelHandler 的异步嵌入方法。
-    ChromaDB 0.4.x 及以上版本支持异步嵌入函数。
-    【新增】此类包含一个简单的内存缓存，用于避免对相同的查询文本重复进行嵌入计算。
+    一个与 LangChain 兼容的 ChromaDB 嵌入函数。
+    V3: 恢复为原生异步，以解决同步/异步桥接导致的死锁问题。
     """
     def __init__(self, model_handler: 'LocalModelHandler'):
         if model_handler is None:
-            logger.error("LlamaCppEmbeddingFunction initialized with no model_handler.")
             raise ValueError("LocalModelHandler is required.")
-        if not model_handler.embedding_model_path:
-            logger.error("LlamaCppEmbeddingFunction initialized with a model_handler that does not have an embedding_model_path configured.")
-            raise ValueError("LocalModelHandler must have an embedding_model_path configured to be used for embeddings.")
         self.model_handler = model_handler
         self._dimension: Optional[int] = None
-        
-        # --- 新增：初始化查询缓存和异步锁 ---
-        self._query_cache: TTLCache = TTLCache(maxsize=200, ttl=3600) # 缓存200个查询向量，存活1小时
+        self._query_cache: TTLCache = TTLCache(maxsize=200, ttl=3600)
         self._cache_lock = asyncio.Lock()
         
         try:
             self._dimension = self.model_handler.get_embedding_dimension()
             if self._dimension:
                  logger.info(f"LlamaCppEmbeddingFunction initialized. Dimension from handler: {self._dimension}")
-            else:
-                 logger.info("LlamaCppEmbeddingFunction initialized. Dimension not immediately available, will be fetched on first embedding or via async get_dimension.")
         except Exception as e_dim_init:
-            logger.warning(f"LlamaCppEmbeddingFunction: Error trying to get dimension during init: {e_dim_init}. Will fetch on first use.")
+            logger.warning(f"LlamaCppEmbeddingFunction: Error trying to get dimension during init: {e_dim_init}.")
 
+    # --- 核心修改：恢复为 async def ---
     async def __call__(self, input: Documents) -> Embeddings:
-        if not isinstance(input, list):
-            logger.error(f"LlamaCppEmbeddingFunction received input of type {type(input)}, expected List[str].")
-            if isinstance(input, str):
-                processed_texts_for_handler = [input + "<|endoftext|>" if input and not input.endswith("<|endoftext|>") else input]
-            else:
-                try: 
-                    num_items = len(input)
-                    return [[] for _ in range(num_items)]
-                except TypeError:
-                    return [[]] 
-        elif not input: 
-            return [] 
-        else:
-            processed_texts_for_handler: List[str] = []
-            for text_item in input:
-                if isinstance(text_item, str):
-                    if text_item and not text_item.endswith("<|endoftext|>"):
-                        processed_texts_for_handler.append(text_item + "<|endoftext|>")
-                    else:
-                        processed_texts_for_handler.append(text_item) 
-                else:
-                    logger.warning(f"LlamaCppEmbeddingFunction received non-string item in input list: {type(text_item)}. Converting to string and adding <|endoftext|>.")
-                    str_item = str(text_item)
-                    processed_texts_for_handler.append(str_item + "<|endoftext|>" if str_item and not str_item.endswith("<|endoftext|>") else str_item)
-        
-        logger.info(f"LlamaCppEmbeddingFunction: Generating embeddings for {len(processed_texts_for_handler)} processed texts (async).")
-        if processed_texts_for_handler:
-            logger.debug(f"LlamaCppEmbeddingFunction: First processed text for embedding: '{processed_texts_for_handler[0][:150]}...'")
+        if not input:
+            return []
+        logger.info(f"LlamaCppEmbeddingFunction (ASYNC __call__): Generating embeddings for {len(input)} documents.")
+        # 直接 await 异步方法
+        return await self.model_handler.embed_documents(list(input))
 
-        try:
-            raw_embeddings_list = await self.model_handler.embed_documents(processed_texts_for_handler)
-            embeddings_list = raw_embeddings_list if raw_embeddings_list else []
-            
-            if self._dimension is None and embeddings_list and embeddings_list[0]:
-                self._dimension = len(embeddings_list[0])
-                logger.info(f"LlamaCppEmbeddingFunction: Dimension updated from embedding result: {self._dimension}")
-            elif embeddings_list and embeddings_list[0] and self._dimension and len(embeddings_list[0]) != self._dimension: 
-                logger.warning(f"LlamaCppEmbeddingFunction: Inconsistent embedding dimension detected! Expected {self._dimension}, got {len(embeddings_list[0])}.")
-            
-            return embeddings_list
-        except Exception as e:
-            logger.error(f"LlamaCppEmbeddingFunction: Error during async embedding generation: {e}", exc_info=True)
-            return [([0.0] * (self._dimension or 1024)) if self._dimension else [] for _ in input]
-
-    async def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
-        return await self.__call__(input=list(texts))
+    async def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return await self.__call__(texts)
 
     async def embed_query(self, text: str) -> List[float]:
-        if not text or not text.strip():
-            async with self._cache_lock:
-                if self._dimension is None:
-                    dim_from_handler = self.model_handler.get_embedding_dimension()
-                    if dim_from_handler is None:
-                        dim_from_handler = await self.model_handler._get_embedding_dimension_from_worker_once()
-                    self._dimension = dim_from_handler
-            return [0.0] * (self._dimension or 1024) if self._dimension else []
-
-        # --- 更新: 使用 TTLCache 和异步锁进行缓存检查 ---
         async with self._cache_lock:
             cached_result = self._query_cache.get(text)
         
@@ -132,50 +76,12 @@ class LlamaCppEmbeddingFunction:
             return cached_result
         
         logger.info(f"Query Vector CACHE MISS for query: '{text[:50]}...'. Generating new embedding.")
-        
-        # 调用模型生成向量
         embedding_vector = await self.model_handler.embed_query(text)
-
-        # 缓存新生成的向量
+        
         if embedding_vector:
             async with self._cache_lock:
-                if self._dimension is None:
-                    self._dimension = len(embedding_vector)
-                    logger.info(f"LlamaCppEmbeddingFunction: Dimension updated from query embedding result: {self._dimension}")
-                elif len(embedding_vector) != self._dimension:
-                    logger.warning(f"LlamaCppEmbeddingFunction: Query embedding dimension mismatch! Expected {self._dimension}, got {len(embedding_vector)}. Not caching this result.")
-                    return embedding_vector # 直接返回，但不缓存
-
-                # 存储到缓存
                 self._query_cache[text] = embedding_vector
-                logger.info(f"Cached new embedding for query: '{text[:50]}...'")
-        else: # embed_query 返回了 None 或空列表
-            logger.warning(f"Failed to generate embedding for query: '{text[:50]}...'. Returning empty list or zero vector.")
-            async with self._cache_lock:
-                if self._dimension is None:
-                    dim_from_handler = await self.model_handler._get_embedding_dimension_from_worker_once()
-                    self._dimension = dim_from_handler
-            # 即使生成失败，也返回一个正确维度的零向量
-            embedding_vector = [0.0] * (self._dimension or 1024) if self._dimension else []
+        else:
+            embedding_vector = [0.0] * (self._dimension or 1024)
 
         return embedding_vector
-    
-    async def get_dimension(self) -> Optional[int]:
-        if self._dimension is None:
-            async with self._cache_lock:
-                # 再次检查，防止在等待锁的过程中其他协程已经设置了维度
-                if self._dimension is None:
-                    dim_from_handler_sync = self.model_handler.get_embedding_dimension()
-                    if dim_from_handler_sync is not None:
-                        self._dimension = dim_from_handler_sync
-                    else:
-                        logger.info("LlamaCppEmbeddingFunction: Dimension not cached, attempting async fetch from worker.")
-                        dim_from_worker = await self.model_handler._get_embedding_dimension_from_worker_once()
-                        if dim_from_worker is not None:
-                            self._dimension = dim_from_worker
-                        else:
-                            logger.error("LlamaCppEmbeddingFunction: Failed to get dimension asynchronously.")
-                            return None
-                    if self._dimension:
-                        logger.info(f"LlamaCppEmbeddingFunction: Dimension fetched/updated: {self._dimension}")
-        return self._dimension
