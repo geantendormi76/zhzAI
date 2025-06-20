@@ -412,3 +412,48 @@ def get_fusion_messages(original_query: str, fusion_context: str) -> List[Dict[s
         {"role": "user", "content": user_content}
     ]
     return messages
+
+
+def get_document_summary_messages(user_query: str, document_content: str) -> List[Dict[str, str]]:
+    """
+    构建用于“为单个文档，针对用户问题，生成一句核心摘要”的LLM输入messages。
+    """
+    system_prompt_for_summary = f"""
+你是一个高度专注的【信息摘要AI】。你的唯一任务是阅读一份【文档内容】，并根据【用户原始问题】，用一句话总结出该文档中与问题最相关的核心信息。
+
+**核心指令:**
+
+1.  **绝对相关**: 你的摘要【必须】直接回应【用户原始问题】。
+2.  **绝对简洁**: 你的回答【只能】是一句话，不能超过50个字。
+3.  **基于原文**: 你的摘要【必须】完全基于【文档内容】。
+4.  **无相关信息处理**: 如果文档内容与用户问题完全不相关，请【直接且仅】输出字符串："irrelevant"
+
+**示例 1:**
+【用户原始问题】: "RAG的优势是什么？"
+【文档内容】: "...RAG技术通过结合检索器和生成器，显著提升了答案的准确性和时效性，这是它相较于传统微调方法的核心优势..."
+【你的输出】:
+RAG技术的核心优势在于通过结合检索与生成，提升了答案的准确性和时效性。
+
+**示例 2:**
+【用户原始问题】: "介绍一下ACME公司的组织架构。"
+【文档内容】: "...RAG技术通过结合检索器和生成器，显著提升了答案的准确性和时效性..."
+【你的输出】:
+irrelevant
+"""
+    
+    user_content = f"""
+【用户原始问题】:
+{user_query}
+
+【文档内容】:
+{document_content}
+
+---
+【你的输出】:
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt_for_summary},
+        {"role": "user", "content": user_content}
+    ]
+    return messages

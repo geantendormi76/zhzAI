@@ -9,7 +9,8 @@ import uuid
 class LoadedDocumentOutput(BaseModel):
     document_path: str
     file_type: str
-    raw_content: Union[str, bytes]
+    # --- VITAL FIX: Make raw_content optional and always a string ---
+    raw_content: Optional[str] = None # raw_content is now optional and will only hold decoded text
     metadata: Dict[str, Any]
 
 # --- 修改：在 ParsedDocumentOutput 定义之前定义其依赖的 Element 类型 ---

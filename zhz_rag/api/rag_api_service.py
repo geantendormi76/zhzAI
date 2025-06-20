@@ -43,7 +43,8 @@ from zhz_rag.llm.llm_interface import (
     generate_query_plan,
     generate_table_lookup_instruction,
     generate_actionable_suggestion,
-    generate_expanded_queries, # <--- 添加这一行
+    generate_expanded_queries,
+    generate_document_summary, # <--- 确保导入
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
 from zhz_rag.utils.hardware_manager import HardwareManager
@@ -243,9 +244,10 @@ app = FastAPI(
 )
 
 # --- API 端点 (V3.5 - Final Fix) ---
+# --- API 端点 (V7.0 - Step-by-Step Synthesis) ---
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
-    api_logger.info(f"\n--- Received RAG query (v6.0 - Reranker Integrated): '{query_request.query}' ---") # Updated version
+    api_logger.info(f"\n--- Received RAG query (v7.0 - Step-by-Step Synthesis): '{query_request.query}' ---") # Updated version
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
     if not app_ctx or not app_ctx.llm_gbnf_instance or not app_ctx.fusion_engine: # Added fusion_engine check
@@ -256,78 +258,53 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     response_to_return: Optional[HybridRAGResponse] = None
 
     try:
+        # Cache logic remains the same
         cache_key = hashlib.md5(query_request.model_dump_json().encode('utf-8')).hexdigest()
         cached_response = app_ctx.answer_cache.get(cache_key)
         if cached_response is not None:
             api_logger.info(f"FINAL ANSWER CACHE HIT for query: '{query_request.query}'")
             return cached_response
 
-        # --- Stage 1: Query Expansion & Planning (Serialized for Stability) ---
-        api_logger.info(f"--- Step 1: Generating unified query plan and expansion ---")
-        
-        # 向LLM调用传递预加载的实例
+        # Stage 1 & 2: Expansion, Planning, Retrieval (remains the same)
+        api_logger.info("--- Step 1 & 2: Expansion, Planning, Retrieval ---")
         query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, user_query=query_request.query)
         sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, original_query=query_request.query)
-        
-        all_queries = [query_plan.query] + sub_queries if query_plan else sub_queries
-        unique_queries = list(dict.fromkeys(q for q in all_queries if q))
-        api_logger.info(f"Unified queries for retrieval: {unique_queries}")
-
-        # --- Stage 2: Unified & Parallel Retrieval ---
-        api_logger.info(f"--- Step 2: Retrieving all contexts in parallel ---")
-        metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
-        
-        # --- VITAL FIX: Simplify ChromaDB filter if needed ---
+        unique_queries = list(dict.fromkeys([query_plan.query] + sub_queries if query_plan else sub_queries))
+        metadata_filter = query_plan.metadata_filter if query_plan else {}
         if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
             metadata_filter = metadata_filter["$and"][0]
-            api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
         
-        retrieval_tasks = []
-        for q in unique_queries:
-            task = app_ctx.chroma_retriever.retrieve(
-                query_text=q,
-                n_results=query_request.top_k_vector,
-                where_filter=metadata_filter if metadata_filter else None
-            )
-            retrieval_tasks.append(task)
-        
+        retrieval_tasks = [app_ctx.chroma_retriever.retrieve(q, query_request.top_k_vector, metadata_filter or None) for q in unique_queries]
         all_child_chunks_results = await asyncio.gather(*retrieval_tasks)
-        
-        all_parent_ids = set()
-        for chunk_list in all_child_chunks_results:
-            for chunk in chunk_list:
-                if 'parent_id' in chunk.get('metadata', {}):
-                    all_parent_ids.add(chunk['metadata']['parent_id'])
-        
+        all_parent_ids = {chunk['metadata']['parent_id'] for chunk_list in all_child_chunks_results for chunk in chunk_list if 'parent_id' in chunk.get('metadata', {})}
         parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
         valid_parent_docs = [doc for doc in parent_docs if doc]
         api_logger.info(f"Retrieved {len(valid_parent_docs)} unique candidate documents.")
 
-        # --- NEW Stage 3: Reranking ---
+        # Stage 3: Reranking (remains the same)
         api_logger.info(f"--- Step 3: Reranking {len(valid_parent_docs)} documents... ---")
         reranked_docs = await app_ctx.fusion_engine.rerank_documents(
             query=query_request.query, # Use the original query for relevance scoring
-            # --- 修改下面这一行 ---
             documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="retrieved_parent") for doc in valid_parent_docs],
             top_n=5 # We'll feed the top 5 most relevant docs to the LLM
         )
         api_logger.info(f"Reranking complete. Top {len(reranked_docs)} documents selected.")
 
-        # --- Stage 4: Intelligent Dispatch & Answer Generation (Max 1 LLM Call) ---
+        # --- NEW Stage 4: Step-by-Step Synthesis ---
+        api_logger.info(f"--- Step 4: Step-by-Step Synthesis on {len(reranked_docs)} reranked documents ---")
         final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
         failure_reason = ""
         
-        if not reranked_docs: # Changed from valid_parent_docs to reranked_docs
+        if not reranked_docs:
             failure_reason = "知识库中未能找到任何与您问题相关的信息。"
         else:
-            is_single_table_context = (len(reranked_docs) == 1 and 
-                                       reranked_docs[0].metadata.get("paragraph_type") == "table")
-            
+            # Table expert logic is still prioritized
+            is_single_table_context = (len(reranked_docs) == 1 and reranked_docs[0].metadata.get("paragraph_type") == "table")
             if is_single_table_context:
                 api_logger.info("Dispatching to Table QA Hybrid Expert.")
-                table_doc = reranked_docs[0] # Changed from valid_parent_docs[0] to reranked_docs[0]
+                table_doc = reranked_docs[0]
                 try:
-                    df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:] # Changed doc.page_content to doc.content
+                    df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
                     df.columns = [col.strip() for col in df.columns]
                     index_col_name = df.columns[0]
                     df = df.set_index(index_col_name)
@@ -351,52 +328,47 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     api_logger.warning(f"Table QA Expert failed: {failure_reason}. Downgrading to Fusion Expert.")
             
             if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
-                api_logger.info(f"Dispatching to Fusion Expert with {len(reranked_docs)} reranked documents.") # Added reranked docs count
-                context_strings = []
-                for doc in reranked_docs: # Changed from valid_parent_docs to reranked_docs
-                    metadata_str = json.dumps(doc.metadata, indent=2, ensure_ascii=False)
-                    context_strings.append(f"---\n### Source Document Metadata:\n```json\n{metadata_str}\n```\n\n### Document Content:\n{doc.content}\n---") # Changed doc.page_content to doc.content
+                # --- 分步合成开始 ---
+                # 1. 并行生成所有文档的摘要
+                summary_tasks = [generate_document_summary(app_ctx.llm_gbnf_instance, user_query=query_request.query, document_content=doc.content) for doc in reranked_docs]
+                summaries = await asyncio.gather(*summary_tasks)
                 
-                fusion_context = "\n\n".join(context_strings)
-                # from zhz_rag.llm.rag_prompts import get_fusion_messages # Already imported at the top
+                # 2. 过滤掉不相关的摘要，并构建融合上下文
+                relevant_summaries = []
+                for doc, summary in zip(reranked_docs, summaries):
+                    if summary:
+                        # 在摘要前附加上下文来源，让最终融合时模型知道信息出处
+                        filename = doc.metadata.get('filename', '未知文档')
+                        relevant_summaries.append(f"根据文档《{filename}》的信息：{summary}")
                 
-                final_answer = await generate_answer_from_context(
-                    user_query=query_request.query,
-                    context_str=fusion_context,
-                    prompt_builder=lambda q, c: get_fusion_messages(q, c)
-                )
+                api_logger.info(f"Generated {len(relevant_summaries)} relevant summaries.")
 
+                if not relevant_summaries:
+                    failure_reason = "虽然检索到了相关文档，但无法从中提炼出与您问题直接相关的核心信息。"
+                else:
+                    # 3. 将精炼后的摘要交给最终的融合专家
+                    fusion_context = "\n\n".join(relevant_summaries)
+                    final_answer = await generate_answer_from_context(user_query=query_request.query, context_str=fusion_context, prompt_builder=lambda q, c: get_fusion_messages(q, c))
+            
+        # Final failure handling and response assembly (remains the same)
         if not final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in final_answer:
-            if not failure_reason:
-                failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
-            suggestion = await generate_actionable_suggestion(user_query=query_request.query, failure_reason=failure_reason)
+            if not failure_reason: failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
+            suggestion = await generate_actionable_suggestion(app_ctx.llm_gbnf_instance, user_query=query_request.query, failure_reason=failure_reason)
             final_answer = f"{failure_reason} {suggestion}" if suggestion else failure_reason
 
-        # --- Final Assembly (using reranked_docs for the response) ---
-        retrieved_sources_for_response = [
-            RetrievedDocument(source_type="parent_document", content=doc.content, score=doc.score, metadata=doc.metadata) # Changed doc.page_content to doc.content, added doc.score
-            for doc in reranked_docs # Changed from valid_parent_docs to reranked_docs
-        ]
-        response_to_return = HybridRAGResponse(
-            answer=final_answer, 
-            original_query=query_request.query, 
-            retrieved_sources=retrieved_sources_for_response
-        )
-
+        response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=reranked_docs)
         if not failure_reason and NO_ANSWER_PHRASE_ANSWER_CLEAN not in final_answer:
             app_ctx.answer_cache[cache_key] = response_to_return
             api_logger.info(f"FINAL ANSWER CACHED.")
-
     except Exception as e:
         exception_occurred = e
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
         response_to_return = HybridRAGResponse(answer=f"An internal server error occurred: {e}", original_query=query_request.query, retrieved_sources=[])
-    
     finally:
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         log_data_for_finally = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "rag_query_processing_v6_0_reranker_integrated", # Updated task_type
+            "task_type": "rag_query_processing_v7_0_step_by_step_synthesis", # Updated task_type
             "original_user_query": query_request.query,
             "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
             "final_context_docs_full": [doc.model_dump() for doc in response_to_return.retrieved_sources] if response_to_return else [],
@@ -417,7 +389,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         
         return response_to_return
     
-
+    
 if __name__ == "__main__":
     api_logger.info("Starting Standalone RAG API Service with Manual Small-to-Big Retrieval...")
     uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=False)
