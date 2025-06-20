@@ -720,8 +720,9 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
     
 
 async def call_local_llm_with_gbnf(
+    llm_instance: Llama, # <--- 接受一个已加载的实例作为参数
     full_prompt: str,
-    grammar_str: str, # GBNF语法字符串
+    grammar_str: str,
     temperature: float = 0.1,
     max_tokens: int = 1024,
     repeat_penalty: float = 1.2,
@@ -737,21 +738,20 @@ async def call_local_llm_with_gbnf(
     error_info = None
     
     try:
-        # 编译GBNF语法
         compiled_grammar = LlamaGrammar.from_string(grammar_str)
+        
+        # 不再需要获取实例，直接使用传入的 llm_instance
+        if llm_instance is None:
+            raise ValueError("LLM GBNF instance is not available in the application context.")
 
-        # 获取共享的、已加载的LLM实例 (性能优化)
-        async with _llm_gbnf_instance_lock:
-            llm_instance = await asyncio.to_thread(_get_gbnf_llm_instance)
-
-        def _blocking_llm_call(): # 封装阻塞操作
+        def _blocking_llm_call():
             response = llm_instance.create_completion(
                 prompt=full_prompt,
                 grammar=compiled_grammar,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 repeat_penalty=repeat_penalty,
-                stop=stop_sequences or [] # 确保 stop 是列表
+                stop=stop_sequences or []
             )
             return response['choices'][0]['text']
 
@@ -783,7 +783,7 @@ async def call_local_llm_with_gbnf(
     return raw_llm_output_text
 
 
-async def generate_query_plan(user_query: str) -> Optional[RagQueryPlan]:
+async def generate_query_plan(llm_instance: Llama, user_query: str) -> Optional[RagQueryPlan]:
     """
     Analyzes the user query and generates a structured plan for retrieval,
     containing a core query string and a metadata filter.
@@ -800,6 +800,7 @@ async def generate_query_plan(user_query: str) -> Optional[RagQueryPlan]:
 
     # 2. 调用带有 GBNF 约束的本地 LLM
     llm_response_str = await call_local_llm_with_gbnf(
+        llm_instance=llm_instance,
         full_prompt=full_prompt,
         grammar_str=V2_PLANNING_GBNF_SCHEMA,
         temperature=0.0,  # 对于精确的JSON生成，使用零温度
@@ -921,7 +922,7 @@ async def generate_actionable_suggestion(user_query: str, failure_reason: str) -
     return "您可以尝试换个问法，或检查相关文档是否已在知识库中。" # 默认的兜底建议
 
 
-async def generate_expanded_queries(original_query: str) -> List[str]:
+async def generate_expanded_queries(llm_instance: Llama, original_query: str) -> List[str]:
     """
     Expands a single user query into multiple related sub-queries to enhance retrieval coverage.
     Uses GBNF for reliable JSON output and caches the results.
@@ -937,6 +938,7 @@ async def generate_expanded_queries(original_query: str) -> List[str]:
     full_prompt += "<|im_start|>assistant\n"
 
     llm_response_str = await call_local_llm_with_gbnf(
+        llm_instance=llm_instance,
         full_prompt=full_prompt,
         grammar_str=V2_PLANNING_GBNF_SCHEMA,
         temperature=0.6,

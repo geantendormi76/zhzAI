@@ -83,7 +83,8 @@ async def main_evaluation_runner(
         return
 
     with open(questions_file, 'r', encoding='utf-8') as f:
-        questions = [line.strip() for line in f if line.strip()]
+        # --- 优化：跳过注释行 (#) 和空行 ---
+        questions = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
     
     batch_answer_eval_logger.info(f"Loaded {len(questions)} questions from '{questions_file.name}'. Starting evaluation...")
     
@@ -100,20 +101,21 @@ async def main_evaluation_runner(
             if rag_response is None:
                 batch_answer_eval_logger.warning(f"Skipping evaluation for '{question}' due to RAG API failure.")
                 failed_evals += 1
-                await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+                await asyncio.sleep(api_call_delay) # 使用传入的延迟参数
                 continue
 
             # 2. 从RAG API响应中提取评估所需的信息
             answer_text = rag_response.get("answer")
             retrieved_sources_raw = rag_response.get("retrieved_sources", [])
             
+            # 即使有答案，如果没有上下文来源，对于研究型问题也认为是失败
             if not answer_text or not retrieved_sources_raw:
                 batch_answer_eval_logger.warning(
                     f"RAG API response for '{question}' is incomplete. "
                     f"Answer: '{answer_text}', Sources: {len(retrieved_sources_raw)}. Skipping evaluation."
                 )
                 failed_evals += 1
-                await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+                await asyncio.sleep(api_call_delay) # 使用传入的延迟参数
                 continue
 
             # 3. 准备评估函数的输入
@@ -131,12 +133,13 @@ async def main_evaluation_runner(
             )
             successful_evals += 1
             
-            batch_answer_eval_logger.info(f"Successfully evaluated question {i}. Sleeping for {DELAY_BETWEEN_REQUESTS} seconds...")
-            await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
+            batch_answer_eval_logger.info(f"Successfully evaluated question {i}. Sleeping for {api_call_delay} seconds...")
+            await asyncio.sleep(api_call_delay) # 使用传入的延迟参数
 
     batch_answer_eval_logger.info("--- Batch Answer Evaluation Finished ---")
     batch_answer_eval_logger.info(f"Summary: Successfully evaluated {successful_evals} questions, Failed/Skipped {failed_evals} questions.")
 
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run batch evaluation of RAG answers using a questions file.")
     

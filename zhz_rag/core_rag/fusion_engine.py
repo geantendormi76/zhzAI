@@ -1,8 +1,10 @@
+import os
 import hashlib
 import jieba
 from typing import List, Dict, Any, Optional
 import logging
-import asyncio # 确保存在，未来可能用到
+import asyncio
+from sentence_transformers import CrossEncoder
 
 from zhz_rag.config.pydantic_models import RetrievedDocument
 
@@ -12,29 +14,97 @@ class FusionEngine:
             self.logger = logger
         else:
             self.logger = logging.getLogger("FusionEngineLogger")
-            # (如果需要，可以在这里添加基本的日志配置)
+            if not self.logger.hasHandlers():
+                self.logger.setLevel(logging.INFO)
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
         
         self.rrf_k = rrf_k
-        self.logger.info(f"FusionEngine initialized. Strategy: RRF with k={self.rrf_k}.")
+        self.cross_encoder: Optional[CrossEncoder] = None # 明确类型
+        
+        # --- 在初始化时就调用加载 ---
+        self._initialize_reranker()
 
-    def _tokenize_text(self, text: str) -> set[str]:
-        if not isinstance(text, str):
-            self.logger.warning(f"FusionEngine: _tokenize_text received non-string input: {type(text)}. Returning empty set.")
-            return set()
-        return set(jieba.cut(text))
+    def _initialize_reranker(self):
+        """
+        严格从本地路径初始化Cross-Encoder模型。
+        如果本地路径不存在，则禁用再排序功能。
+        """
+        # --- 使用您指定的本地模型路径 ---
+        # 模型名称/ID
+        model_name = "BAAI/bge-reranker-base"
+        # 构建本地路径
+        local_model_path = os.path.join(os.path.expanduser("~"), "models", model_name)
 
-    def _calculate_jaccard_similarity(self, query_tokens: set[str], doc_tokens: set[str]) -> float:
-        if not query_tokens or not doc_tokens:
-            return 0.0
-        intersection = len(query_tokens.intersection(doc_tokens))
-        union = len(query_tokens.union(doc_tokens))
-        return intersection / union if union > 0 else 0.0
+        self.logger.info(f"Attempting to load reranker model from local path: {local_model_path}")
 
+        if not os.path.isdir(local_model_path):
+            self.logger.error(f"Reranker model directory not found at: '{local_model_path}'. Reranking will be disabled.")
+            self.cross_encoder = None
+            return
+
+        try:
+            # 直接将本地路径传递给CrossEncoder
+            self.cross_encoder = CrossEncoder(local_model_path, max_length=512)
+            self.logger.info(f"Cross-Encoder model loaded successfully from '{local_model_path}'.")
+        except Exception as e:
+            self.logger.error(f"Failed to load Cross-Encoder model from '{local_model_path}': {e}", exc_info=True)
+            self.cross_encoder = None
+            
+    async def rerank_documents(
+        self,
+        query: str,
+        documents: List[RetrievedDocument],
+        top_n: int = 5
+    ) -> List[RetrievedDocument]:
+        """
+        使用Cross-Encoder模型对文档列表进行再排序，返回相关性最高的top_n个文档。
+        """
+        if self.cross_encoder is None:
+            self.logger.warning("Reranker is not available, returning top_n documents without reranking.")
+            return documents[:top_n]
+
+        if not documents:
+            return []
+
+        if not query:
+            self.logger.warning("Reranking query is empty. Returning original documents.")
+            return documents
+        
+        self.logger.info(f"Reranking {len(documents)} documents for query: '{query[:50]}...'")
+
+        model_input_pairs = [[query, doc.content] for doc in documents]
+        
+        def _predict():
+            # 使用 try-except 包装 predict 调用，增加鲁棒性
+            try:
+                return self.cross_encoder.predict(model_input_pairs, show_progress_bar=False)
+            except Exception as e:
+                self.logger.error(f"Error during Cross-Encoder prediction: {e}", exc_info=True)
+                return [] # 返回空列表表示预测失败
+            
+        scores = await asyncio.to_thread(_predict)
+
+        if len(scores) != len(documents):
+            self.logger.error("Reranking failed: number of scores does not match number of documents.")
+            return documents[:top_n] # 失败时返回原始文档
+        
+        for doc, score in zip(documents, scores):
+            doc.score = float(score)
+
+        reranked_docs = sorted(documents, key=lambda d: d.score or -1.0, reverse=True)
+        
+        if reranked_docs:
+            self.logger.info(f"Reranking complete. Top score: {reranked_docs[0].score:.4f}")
+        
+        return reranked_docs[:top_n]
+
+    # ( _apply_rrf 和 fuse_results_with_rrf 方法保持不变 )
     def _apply_rrf(self, all_docs: List[RetrievedDocument]) -> List[RetrievedDocument]:
         if not all_docs:
             return []
-
-        # 1. 按召回源对文档进行分组，并记录其原始排名
         docs_by_source: Dict[str, List[RetrievedDocument]] = {}
         for doc in all_docs:
             source_type = doc.source_type or "unknown_source"
@@ -42,254 +112,30 @@ class FusionEngine:
                 docs_by_source[source_type] = []
             docs_by_source[source_type].append(doc)
 
-        # 2. 计算每个文档的RRF分数
         doc_scores: Dict[str, float] = {}
         doc_objects: Dict[str, RetrievedDocument] = {}
 
         for source_type, docs_list in docs_by_source.items():
-            # 按原始分数降序排序，分数越高排名越靠前
-            sorted_docs = sorted(docs_list, key=lambda d: d.score if d.score is not None else -float('inf'), reverse=True)
-            
-            for rank, doc in enumerate(sorted_docs, 1): # rank 从1开始
-                # 使用内容的哈希值作为文档的唯一标识符
+            sorted_docs = sorted(docs_list, key=lambda d: d.score if d.score is not None else -1, reverse=True)
+            for rank, doc in enumerate(sorted_docs, 1):
                 content_hash = hashlib.md5(doc.content.encode('utf-8')).hexdigest()
-                
                 if content_hash not in doc_scores:
                     doc_scores[content_hash] = 0.0
                     doc_objects[content_hash] = doc
-                
-                # 累加RRF分数
                 doc_scores[content_hash] += 1.0 / (self.rrf_k + rank)
-
-        # 3. 将RRF分数更新到文档对象中
         fused_results = []
         for content_hash, rrf_score in doc_scores.items():
             doc_obj = doc_objects[content_hash]
-            doc_obj.score = rrf_score  # 使用RRF分数覆盖原始分数
+            doc_obj.score = rrf_score
             fused_results.append(doc_obj)
-        
-        # 4. 根据RRF分数对最终结果进行排序
         fused_results.sort(key=lambda d: d.score or 0.0, reverse=True)
-        
-        self.logger.info(f"RRF processing complete. Returning {len(fused_results)} unique documents sorted by RRF score.")
         return fused_results
 
-    async def fuse_results(
+    async def fuse_results_with_rrf(
         self,
         all_raw_retrievals: List[RetrievedDocument],
-        user_query: str,
         top_n_final: int = 3
     ) -> List[RetrievedDocument]:
-        self.logger.info(f"FusionEngine: Fusing {len(all_raw_retrievals)} raw documents for query: '{user_query}' using RRF.")
-
-        if not all_raw_retrievals:
-            return []
-
-        # 1. 初步筛选 (Light Screening) - 对非KG来源的文档进行Jaccard相似度过滤
-        JACCARD_THRESHOLD = 0.02
-        query_tokens = self._tokenize_text(user_query)
-        screened_docs: List[RetrievedDocument] = []
-        
-        for doc in all_raw_retrievals:
-            # KG召回的结果通常是实体或关系，Jaccard相似度不适用，应直接通过
-            if doc.source_type in ["knowledge_graph", "duckdb_kg"]:
-                screened_docs.append(doc)
-                continue
-
-            # 对于其他来源，进行Jaccard相似度检查
-            if query_tokens:
-                doc_tokens = self._tokenize_text(doc.content)
-                similarity = self._calculate_jaccard_similarity(query_tokens, doc_tokens)
-                if similarity >= JACCARD_THRESHOLD:
-                    screened_docs.append(doc)
-                else:
-                    self.logger.debug(f"Screening REJECT (Jaccard): Doc from {doc.source_type}, Sim: {similarity:.4f} < {JACCARD_THRESHOLD}. Content: '{doc.content[:80]}...'")
-            else:
-                # 如果查询为空，则不进行Jaccard过滤
-                screened_docs.append(doc)
-        
-        self.logger.info(f"After light screening, {len(screened_docs)} documents remain for RRF.")
-
-        if not screened_docs:
-            return []
-
-        # 2. 去重并应用RRF融合
-        # RRF算法天然地处理了来自不同源的相同内容，因为它会累加分数到同一个content_hash上
-        # 我们只需将所有筛选后的文档传入即可
-        fused_and_ranked_results = self._apply_rrf(screened_docs)
-
-        self.logger.info(f"Fusion engine returning final top {top_n_final} documents after RRF.")
+        self.logger.info(f"Fusing {len(all_raw_retrievals)} raw documents using RRF.")
+        fused_and_ranked_results = self._apply_rrf(all_raw_retrievals)
         return fused_and_ranked_results[:top_n_final]
-    def __init__(self, logger: Optional[logging.Logger] = None, rrf_k: int = 60): # 移除了 use_rrf
-        if logger:
-            self.logger = logger
-        else:
-            self.logger = logging.getLogger("FusionEngineLogger")
-            if not self.logger.hasHandlers(): # 基本的日志配置
-                self.logger.setLevel(logging.INFO)
-                ch = logging.StreamHandler() # 默认输出到控制台
-                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
-                ch.setFormatter(formatter)
-                self.logger.addHandler(ch)
-                # self.logger.propagate = False # 通常不需要，除非您有特定的父logger行为
-                self.logger.info("FusionEngine initialized with its own basic logger.")
-
-        self.rrf_k = rrf_k
-        self.logger.info(f"FusionEngine initialized. Default strategy: RRF with k={self.rrf_k}.")
-
-
-    def _tokenize_text(self, text: str) -> set[str]:
-        if not isinstance(text, str):
-            self.logger.warning(f"FusionEngine: _tokenize_text received non-string input: {type(text)}. Returning empty set.")
-            return set()
-        return set(jieba.cut(text))
-
-    def _calculate_jaccard_similarity(self, query_tokens: set[str], doc_tokens: set[str]) -> float:
-        if not query_tokens or not doc_tokens:
-            return 0.0
-        intersection = len(query_tokens.intersection(doc_tokens))
-        union = len(query_tokens.union(doc_tokens))
-        return intersection / union if union > 0 else 0.0
-
-    def _apply_rrf(self, query: str, all_screened_docs: List[RetrievedDocument]) -> List[RetrievedDocument]: # query参数保留，可能未来RRF变种会用到
-        if not all_screened_docs:
-            return []
-
-        self.logger.info(f"Applying RRF to {len(all_screened_docs)} screened documents with k={self.rrf_k}.")
-
-        doc_scores_by_content_hash: Dict[str, Dict[str, Any]] = {} # 使用 content_hash 作为主键
-
-
-        # 1. 按召回源对文档进行分组，并记录其原始排名
-        docs_by_source: Dict[str, List[RetrievedDocument]] = {}
-        for doc in all_screened_docs:
-            source_type = doc.source_type or "unknown_source" # 处理 source_type 可能为 None 的情况
-            if source_type not in docs_by_source:
-                docs_by_source[source_type] = []
-            docs_by_source[source_type].append(doc)
-
-        for source_type, docs_list in docs_by_source.items():
-            # 假设分数越高排名越靠前，如果分数相同则按出现顺序 (Python的sorted是稳定的)
-            sorted_docs_from_source = sorted(docs_list, key=lambda d: d.score if d.score is not None else -float('inf'), reverse=True)
-            for rank, doc_from_source in enumerate(sorted_docs_from_source, 1): # rank 从1开始
-                content_hash = hashlib.md5(doc_from_source.content.encode('utf-8')).hexdigest()
-                
-                if content_hash not in doc_scores_by_content_hash:
-                    # 存储第一个遇到的具有此内容的文档对象，并初始化RRF分数
-                    doc_scores_by_content_hash[content_hash] = {
-                        "rrf_score": 0.0,
-                        "doc_object": doc_from_source # 存储原始文档对象
-                    }
-                
-                # 累加RRF分数
-                doc_scores_by_content_hash[content_hash]["rrf_score"] += 1.0 / (self.rrf_k + rank)
-
-        # 2. 将RRF分数更新回文档对象并收集结果
-        final_rrf_results = []
-        for content_hash, data in doc_scores_by_content_hash.items():
-            doc_obj_to_update = data["doc_object"]
-            doc_obj_to_update.score = data["rrf_score"] # 用RRF分数覆盖原始分数
-            final_rrf_results.append(doc_obj_to_update)
-        
-        # 3. 根据RRF分数对最终结果进行排序
-        final_rrf_results.sort(key=lambda d: d.score if d.score is not None else 0.0, reverse=True) # 确保score为None时有默认值
-        
-        self.logger.info(f"RRF processing complete. Returning {len(final_rrf_results)} documents sorted by RRF score.")
-        return final_rrf_results
-        
-    async def fuse_results(
-        self,
-        all_raw_retrievals: List[RetrievedDocument],
-        user_query: str,
-        top_n_final: int = 3
-    ) -> List[RetrievedDocument]:
-        self.logger.info(f"FusionEngine: Fusing {len(all_raw_retrievals)} raw retrieved documents for query: '{user_query}'. Target top_n_final: {top_n_final}")
-
-        if not all_raw_retrievals:
-            self.logger.info("FusionEngine: No documents to fuse.")
-            return []
-
-        # 1. 去重 (基于内容的哈希值) - 逻辑保持不变
-        unique_docs_map: Dict[str, RetrievedDocument] = {}
-        for doc in all_raw_retrievals:
-            if not isinstance(doc.content, str) or not doc.content.strip():
-                self.logger.debug(f"FusionEngine: Skipping doc with invalid content for hashing: {doc.metadata.get('chunk_id', 'N/A') if doc.metadata else 'N/A'}")
-                continue
-            content_hash = hashlib.md5(doc.content.encode('utf-8')).hexdigest()
-            if content_hash not in unique_docs_map:
-                unique_docs_map[content_hash] = doc
-            else:
-                # 保留分数较高的一个（如果分数可比）
-                if doc.score is not None and unique_docs_map[content_hash].score is not None:
-                    if doc.score > unique_docs_map[content_hash].score: # type: ignore
-                        unique_docs_map[content_hash] = doc
-                elif doc.score is not None: # 当前文档有分数，已存的没有
-                       unique_docs_map[content_hash] = doc
-        
-        unique_docs = list(unique_docs_map.values())
-        self.logger.info(f"FusionEngine: After deduplication (content hash): {len(unique_docs)} documents.")
-
-        if not unique_docs:
-            return []
-
-        # 2. 初步筛选 (基于长度和Jaccard相似度) - 逻辑保持不变，除了日志中的jaccard_display
-        JACCARD_THRESHOLD = 0.02 
-        MIN_DOC_LENGTH_CHARS_KG = 10    
-        MIN_DOC_LENGTH_CHARS_OTHER = 10 
-        MAX_DOC_LENGTH_CHARS = 1500 
-
-        query_tokens_set = self._tokenize_text(user_query)
-        screened_results: List[RetrievedDocument] = []
-        
-        self.logger.info(f"FusionEngine: Starting light screening for {len(unique_docs)} unique documents. Query tokens: {query_tokens_set if query_tokens_set else 'N/A'}")
-        for doc_idx, doc in enumerate(unique_docs):
-            doc_content_str = str(doc.content)
-            doc_length = len(doc_content_str)
-            doc_id_for_log = doc.metadata.get("chunk_id", doc.metadata.get("id", f"doc_idx_{doc_idx}")) if doc.metadata else f"doc_idx_{doc_idx}"
-            
-            min_len_chars_for_current_doc = MIN_DOC_LENGTH_CHARS_KG if doc.source_type in ["knowledge_graph", "duckdb_kg"] else MIN_DOC_LENGTH_CHARS_OTHER
-            if not (min_len_chars_for_current_doc <= doc_length <= MAX_DOC_LENGTH_CHARS):
-                self.logger.info(f"  Screening REJECT (Length): DocID: {doc_id_for_log}, Length: {doc_length}, Expected: [{min_len_chars_for_current_doc}-{MAX_DOC_LENGTH_CHARS}], Type: {doc.source_type}. Content: '{doc_content_str[:100].replace(chr(10), ' ')}...'")
-                continue
-
-            jaccard_sim = -1.0 
-            apply_jaccard_filter = True
-            if doc.source_type in ["duckdb_kg", "knowledge_graph"]:
-                apply_jaccard_filter = False
-                self.logger.info(f"  Screening INFO (Jaccard - KG Skip): DocID: {doc_id_for_log}, Type: {doc.source_type}. Skipping Jaccard filter.")
-            
-            if apply_jaccard_filter and query_tokens_set:
-                doc_tokens_set = self._tokenize_text(doc_content_str)
-                jaccard_sim = self._calculate_jaccard_similarity(query_tokens_set, doc_tokens_set)
-                if jaccard_sim < JACCARD_THRESHOLD:
-                    self.logger.info(f"  Screening REJECT (Jaccard - Non-KG): DocID: {doc_id_for_log}, Similarity: {jaccard_sim:.4f} < {JACCARD_THRESHOLD}. Doc Tokens: {list(doc_tokens_set)[:20] if doc_tokens_set else 'N/A'} Content: '{doc_content_str[:100].replace(chr(10), ' ')}...'")
-                    continue
-            elif apply_jaccard_filter and not query_tokens_set:
-                self.logger.info(f"  Screening SKIP (Jaccard - Empty Query Tokens): DocID: {doc_id_for_log}")
-            
-            jaccard_display = f"{jaccard_sim:.4f}" if jaccard_sim != -1.0 else "N/A (KG or no query tokens)" # 更清晰的日志
-            screened_results.append(doc)
-            self.logger.info(f"  Screening PASS: DocID: {doc_id_for_log}, Length: {doc_length}, Jaccard: {jaccard_display}, Type: {doc.source_type}. Content: '{doc_content_str[:100].replace(chr(10), ' ')}...'")
-            
-        self.logger.info(f"FusionEngine: After light screening: {len(screened_results)} documents remain.")
-        
-        if not screened_results:
-            self.logger.info("FusionEngine: No documents remain after light screening. Returning empty list.")
-            return []
-        
-        # --- 直接使用 RRF ---
-        self.logger.info("FusionEngine: Using RRF for fusion and ranking.")
-        fused_and_ranked_results = await asyncio.to_thread(
-            self._apply_rrf, # 直接调用 _apply_rrf
-            query=user_query, # query 参数仍然传递，以备未来RRF变种可能需要
-            all_screened_docs=screened_results
-        )
-        # --- RRF 调用结束 ---
-
-        self.logger.info(f"FusionEngine: After RRF processing: {len(fused_and_ranked_results)} documents.") # 更新日志
-        for i_doc, doc_ranked in enumerate(fused_and_ranked_results[:top_n_final+5]): # 更新变量名
-            self.logger.debug(f"   RRF Ranked Doc {i_doc}: Source={doc_ranked.source_type}, RRF_Score={doc_ranked.score:.4f}, Content='{str(doc_ranked.content)[:100]}...'")
-
-        final_output_documents = fused_and_ranked_results[:top_n_final]
-        self.logger.info(f"FusionEngine: Returning final top {len(final_output_documents)} documents after RRF.")
-        return final_output_documents

@@ -23,6 +23,8 @@ import json
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document as LangchainDocument
 
+from zhz_rag.core_rag.fusion_engine import FusionEngine # <-- 添加导入
+
 # --- .env 文件加载 (保持不变) ---
 _current_file_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root_dir = os.path.abspath(os.path.join(_current_file_dir, "..", ".."))
@@ -44,8 +46,10 @@ from zhz_rag.llm.llm_interface import (
     generate_expanded_queries, # <--- 添加这一行
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
+from zhz_rag.utils.hardware_manager import HardwareManager
+
 # 修复: 移除 get_table_qa_messages 的导入，因为它导致了 AttributeError
-from zhz_rag.llm.rag_prompts import get_answer_generation_messages, get_table_qa_messages
+from zhz_rag.llm.rag_prompts import get_answer_generation_messages, get_table_qa_messages, get_fusion_messages # <--- 修正导入 get_fusion_messages
 from zhz_rag.core_rag.retrievers.chromadb_retriever import ChromaDBRetriever
 from zhz_rag.core_rag.retrievers.embedding_functions import LlamaCppEmbeddingFunction
 from zhz_rag.llm.local_model_handler import LlamaCppEmbeddingFunction as LocalModelHandlerWrapper
@@ -83,12 +87,48 @@ class RAGAppContext:
     docstore: InMemoryStore             # docstore 仍然用来存储父文档
     gguf_embedding_resource: GGUFEmbeddingResource
     answer_cache: TTLCache
+    llm_gbnf_instance: Any
+    fusion_engine: FusionEngine # <-- 添加这一行
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    api_logger.info("--- RAG API Service (v3.1): Initializing for Manual Small-to-Big Retrieval... ---")
+    api_logger.info("--- RAG API Service (v5.4 - HAL Corrected): Initializing... ---")
     
-    # --- 资源初始化 (大部分保持不变) ---
+    # --- 1. 使用 HAL 获取硬件建议 ---
+    hal = HardwareManager()
+    
+    # --- 2. 在应用层加载 GBNF LLM 模型 ---
+    gbnf_llm = None
+    model_path = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
+    if not model_path or not os.path.exists(model_path):
+        api_logger.error(f"LLM model path not found or invalid: {model_path}. GBNF features will be disabled.")
+    else:
+        try:
+            model_size_gb = os.path.getsize(model_path) / (1024**3)
+            # 假设层数，这个值对于推荐很重要
+            model_total_layers = 28 # Qwen3-1.7B
+            
+            n_gpu_layers = hal.recommend_llm_gpu_layers(
+                model_total_layers=model_total_layers,
+                model_size_on_disk_gb=model_size_gb
+            )
+            
+            api_logger.info(f"Loading GBNF LLM from: {model_path} with {n_gpu_layers} layers offloaded to GPU.")
+            # 导入Llama类
+            from llama_cpp import Llama
+            gbnf_llm = Llama(
+                model_path=model_path,
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=int(os.getenv("LLM_N_CTX", 4096)),
+                verbose=False
+            )
+            api_logger.info("GBNF LLM instance pre-loaded successfully in API lifespan.")
+        except Exception as e:
+            api_logger.critical(f"FATAL: Failed to pre-load GBNF LLM model: {e}", exc_info=True)
+            gbnf_llm = None
+
+    # --- 3. 初始化其他服务 ---
     embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://127.0.0.1:8089")
     chroma_persist_dir = os.getenv("CHROMA_PERSIST_DIRECTORY")
     chroma_collection_name = os.getenv("CHROMA_COLLECTION_NAME", "zhz_rag_collection")
@@ -102,7 +142,6 @@ async def lifespan(app: FastAPI):
     chroma_embedding_function = LlamaCppEmbeddingFunction(model_handler=model_handler)
     
     try:
-        # 直接实例化我们自己的 ChromaDBRetriever
         chroma_retriever_instance = ChromaDBRetriever(
             collection_name=chroma_collection_name,
             persist_directory=chroma_persist_dir,
@@ -110,12 +149,10 @@ async def lifespan(app: FastAPI):
         )
         api_logger.info(f"Initialized ChromaDBRetriever. Collection: '{chroma_collection_name}'")
 
-        # --- 在生命周期函数中构建 docstore ---
         api_logger.info("Building docstore from ChromaDB metadata upon service startup...")
         docstore = InMemoryStore()
         
         try:
-            # 确保 _collection 存在且可以被访问
             count = chroma_retriever_instance._collection.count()
             if count > 0:
                 all_chunks_from_db = chroma_retriever_instance._collection.get(include=["metadatas", "documents"])
@@ -142,33 +179,47 @@ async def lifespan(app: FastAPI):
 
         except Exception as e:
             api_logger.error(f"Failed to build docstore during startup: {e}", exc_info=True)
-            # 即使构建失败，也继续，只是手动检索可能无法完全发挥作用
             docstore = InMemoryStore() # Ensure docstore is initialized even on failure
+            
+        # --- 新增：初始化 FusionEngine ---
+        fusion_engine_instance = FusionEngine(logger=api_logger)
 
         app.state.rag_context = RAGAppContext(
             chroma_retriever=chroma_retriever_instance,
             docstore=docstore,
             gguf_embedding_resource=gguf_embed_resource,
-            answer_cache=TTLCache(maxsize=100, ttl=900)
+            answer_cache=TTLCache(maxsize=100, ttl=900),
+            llm_gbnf_instance=gbnf_llm,
+            fusion_engine=fusion_engine_instance # <-- 传递实例
         )
+        
         api_logger.info("--- RAG components initialized successfully. ---")
+        
+        # The previous version had a duplicate assignment of app.state.rag_context here, removed it.
+        # app.state.rag_context = RAGAppContext(
+        #     chroma_retriever=chroma_retriever_instance,
+        #     docstore=docstore,
+        #     gguf_embedding_resource=gguf_embed_resource,
+        #     answer_cache=TTLCache(maxsize=100, ttl=900),
+        #     llm_gbnf_instance=gbnf_llm # 存储在应用启动时加载的实例
+        # )
+        # api_logger.info("--- RAG components initialized successfully. ---")
         asyncio.create_task(log_writer_task())
     except Exception as e:
         api_logger.critical(f"FATAL: Failed to initialize RAG components: {e}", exc_info=True)
         app.state.rag_context = None
     
-    yield # This is the FastAPI lifespan's yield point
+    yield
     
     api_logger.info("--- RAG API Service: Cleaning up resources ---")
     
-    # Clean up GGUFEmbeddingResource using its teardown_for_execution method
-    if app.state.rag_context and app.state.rag_context.gguf_embedding_resource:
+    if hasattr(app.state, 'rag_context') and app.state.rag_context and app.state.rag_context.gguf_embedding_resource:
         if hasattr(app.state.rag_context.gguf_embedding_resource, 'teardown_for_execution'):
             api_logger.info("Calling teardown_for_execution on GGUFEmbeddingResource...")
-            class FakeDagsterContext: # Temporary helper class for teardown
+            class FakeDagsterContextTeardown:
                 def __init__(self, logger_instance):
                     self.log = logger_instance
-            fake_dagster_context_teardown = FakeDagsterContext(api_logger)
+            fake_dagster_context_teardown = FakeDagsterContextTeardown(api_logger)
             await asyncio.to_thread(app.state.rag_context.gguf_embedding_resource.teardown_for_execution, fake_dagster_context_teardown)
             api_logger.info("GGUFEmbeddingResource teardown_for_execution called.")
         else:
@@ -176,7 +227,12 @@ async def lifespan(app: FastAPI):
     else:
         api_logger.warning("No RAGAppContext or GGUFEmbeddingResource found for teardown.")
 
+    if hasattr(app.state, 'rag_context') and app.state.rag_context and app.state.rag_context.llm_gbnf_instance:
+        app.state.rag_context.llm_gbnf_instance = None
+        api_logger.info("GBNF LLM instance released.")
+
     api_logger.info("--- Cleanup complete. ---")
+
 
 # --- FastAPI 应用实例 (保持不变) ---
 app = FastAPI(
@@ -189,11 +245,11 @@ app = FastAPI(
 # --- API 端点 (V3.5 - Final Fix) ---
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
-    api_logger.info(f"\n--- Received RAG query (v4.1 - Hybrid Expert Reinstated): '{query_request.query}' ---")
+    api_logger.info(f"\n--- Received RAG query (v6.0 - Reranker Integrated): '{query_request.query}' ---") # Updated version
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
-    if not app_ctx:
-        raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
+    if not app_ctx or not app_ctx.llm_gbnf_instance or not app_ctx.fusion_engine: # Added fusion_engine check
+        raise HTTPException(status_code=503, detail="RAG service or its core components are not initialized.")
 
     interaction_id_for_log = str(uuid.uuid4())
     exception_occurred: Optional[Exception] = None
@@ -206,141 +262,141 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             api_logger.info(f"FINAL ANSWER CACHE HIT for query: '{query_request.query}'")
             return cached_response
 
-        # --- 1. 查询扩展 ---
-        api_logger.info(f"--- Step 1: Expanding original query '{query_request.query}' ---")
-        sub_queries = await generate_expanded_queries(query_request.query)
-        api_logger.info(f"Generated {len(sub_queries)} sub-queries for processing: {sub_queries}")
-
-        # --- 2. 对每个子问题独立执行RAG流程 ---
-        sub_answers = []
-        all_retrieved_docs_map: Dict[str, RetrievedDocument] = {}
-        all_valid_parent_docs: List[LangchainDocument] = []
-
-        for i, sub_query in enumerate(sub_queries):
-            api_logger.info(f"--- [Sub-Task {i+1}/{len(sub_queries)}] Processing sub-query: '{sub_query}' ---")
-            
-            query_plan = await generate_query_plan(user_query=sub_query)
-            search_query = query_plan.query if query_plan else sub_query
-            metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
-            
-            if isinstance(metadata_filter, dict) and len(metadata_filter) > 1 and not metadata_filter.keys() & {'$and', '$or', '$not'}:
-                metadata_filter = {"$and": [{key: value} for key, value in metadata_filter.items()]}
-            # (其他过滤器规范化逻辑...)
-            api_logger.debug(f"Normalized filter for sub-query '{sub_query}': {metadata_filter}")
-
-            retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
-                query_text=search_query, n_results=query_request.top_k_vector, where_filter=metadata_filter if metadata_filter else None
-            )
-
-            if not retrieved_child_chunks: continue
-
-            parent_ids = list(set(chunk['metadata']['parent_id'] for chunk in retrieved_child_chunks if 'parent_id' in chunk.get('metadata', {})))
-            parent_docs = app_ctx.docstore.mget(parent_ids)
-            
-            for doc in parent_docs:
-                if doc and doc.metadata.get("doc_id") not in all_retrieved_docs_map:
-                    all_valid_parent_docs.append(doc)
-                    retrieved_doc_obj = RetrievedDocument(source_type="parent_document_from_expansion", content=doc.page_content, score=1.0, metadata=doc.metadata)
-                    all_retrieved_docs_map[doc.metadata["doc_id"]] = retrieved_doc_obj
+        # --- Stage 1: Query Expansion & Planning (Serialized for Stability) ---
+        api_logger.info(f"--- Step 1: Generating unified query plan and expansion ---")
         
-        # --- 3. 智能分派：决定使用哪个“专家” ---
+        # 向LLM调用传递预加载的实例
+        query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, user_query=query_request.query)
+        sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, original_query=query_request.query)
+        
+        all_queries = [query_plan.query] + sub_queries if query_plan else sub_queries
+        unique_queries = list(dict.fromkeys(q for q in all_queries if q))
+        api_logger.info(f"Unified queries for retrieval: {unique_queries}")
+
+        # --- Stage 2: Unified & Parallel Retrieval ---
+        api_logger.info(f"--- Step 2: Retrieving all contexts in parallel ---")
+        metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
+        
+        # --- VITAL FIX: Simplify ChromaDB filter if needed ---
+        if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
+            metadata_filter = metadata_filter["$and"][0]
+            api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
+        
+        retrieval_tasks = []
+        for q in unique_queries:
+            task = app_ctx.chroma_retriever.retrieve(
+                query_text=q,
+                n_results=query_request.top_k_vector,
+                where_filter=metadata_filter if metadata_filter else None
+            )
+            retrieval_tasks.append(task)
+        
+        all_child_chunks_results = await asyncio.gather(*retrieval_tasks)
+        
+        all_parent_ids = set()
+        for chunk_list in all_child_chunks_results:
+            for chunk in chunk_list:
+                if 'parent_id' in chunk.get('metadata', {}):
+                    all_parent_ids.add(chunk['metadata']['parent_id'])
+        
+        parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
+        valid_parent_docs = [doc for doc in parent_docs if doc]
+        api_logger.info(f"Retrieved {len(valid_parent_docs)} unique candidate documents.")
+
+        # --- NEW Stage 3: Reranking ---
+        api_logger.info(f"--- Step 3: Reranking {len(valid_parent_docs)} documents... ---")
+        reranked_docs = await app_ctx.fusion_engine.rerank_documents(
+            query=query_request.query, # Use the original query for relevance scoring
+            # --- 修改下面这一行 ---
+            documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="retrieved_parent") for doc in valid_parent_docs],
+            top_n=5 # We'll feed the top 5 most relevant docs to the LLM
+        )
+        api_logger.info(f"Reranking complete. Top {len(reranked_docs)} documents selected.")
+
+        # --- Stage 4: Intelligent Dispatch & Answer Generation (Max 1 LLM Call) ---
         final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
         failure_reason = ""
         
-        # ** 决策点: 检查是否是单一表格的精确查询 **
-        # 条件: 1.只找到了一个父文档 2.该文档是表格 3.原始问题看起来像在问表格
-        is_single_table_context = (len(all_valid_parent_docs) == 1 and 
-                                   all_valid_parent_docs[0].metadata.get("paragraph_type") == "table")
-
-        if is_single_table_context:
-            api_logger.info("Single table context detected. Activating Table QA Hybrid Expert.")
-            table_doc = all_valid_parent_docs[0]
-            try:
-                # 使用Pandas精确执行
-                df = pd.read_csv(io.StringIO(table_doc.page_content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
-                df.columns = [col.strip() for col in df.columns]
-                index_col_name = df.columns[0]
-                df = df.set_index(index_col_name)
-                
-                instruction = await generate_table_lookup_instruction(
-                    user_query=query_request.query, # **用原始问题生成指令**
-                    table_column_names=[index_col_name] + df.columns.tolist()
-                )
-                
-                if instruction and "row_identifier" in instruction and "column_identifier" in instruction:
-                    row_id, col_id = instruction.get("row_identifier"), instruction.get("column_identifier")
-                    if row_id in df.index and col_id in df.columns:
-                        value = df.at[row_id, col_id]
-                        final_answer = f"根据查找到的表格信息，{row_id}的{col_id}是{value}。"
-                        api_logger.info(f"Table QA Expert succeeded: Found value '{value}' for row '{row_id}', col '{col_id}'.")
-                    else:
-                        failure_reason = f"模型指令无法执行：在表格中未能同时找到行'{row_id}'和列'{col_id}'。"
-                else:
-                    failure_reason = "模型未能从问题中生成有效的表格查询指令。"
-            except Exception as e_pandas:
-                failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
+        if not reranked_docs: # Changed from valid_parent_docs to reranked_docs
+            failure_reason = "知识库中未能找到任何与您问题相关的信息。"
+        else:
+            is_single_table_context = (len(reranked_docs) == 1 and 
+                                       reranked_docs[0].metadata.get("paragraph_type") == "table")
             
-            # 如果表格专家失败，则降级到通用总结专家
-            if failure_reason:
-                api_logger.warning(f"Table QA Expert failed: {failure_reason}. Downgrading to General Summarization.")
-                # Fall through to the fusion expert below
-
-        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
-            # 进入通用总结或融合流程
-            if not all_valid_parent_docs:
-                failure_reason = "知识库中未能找到任何与您问题相关的信息。"
-            else:
-                for doc in all_valid_parent_docs:
-                    sub_context_str = f"---\n### Source Document Metadata:\n```json\n{json.dumps(doc.metadata, indent=2, ensure_ascii=False)}\n```\n\n### Document Content:\n{doc.page_content}\n---"
-                    sub_answer = await generate_answer_from_context(user_query=query_request.query, context_str=sub_context_str) # 使用原始问题
-                    if sub_answer and NO_ANSWER_PHRASE_ANSWER_CLEAN not in sub_answer:
-                        sub_answers.append({"query": doc.metadata.get("filename", "unknown"), "answer": sub_answer})
-
-                if not sub_answers:
-                    failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
-                elif len(sub_answers) == 1:
-                    final_answer = sub_answers[0]["answer"]
-                else:
-                    api_logger.info(f"--- Fusing {len(sub_answers)} sub-answers into a final report ---")
-                    fusion_context = "".join([f"### 关于文档: {item['query']}\n{item['answer']}\n\n" for item in sub_answers])
-                    from zhz_rag.llm.rag_prompts import get_fusion_messages
-                    fusion_messages = get_fusion_messages(query_request.query, fusion_context)
-                    final_answer = await generate_answer_from_context(
-                        user_query=query_request.query, context_str=fusion_context, prompt_builder=lambda q, c: fusion_messages
+            if is_single_table_context:
+                api_logger.info("Dispatching to Table QA Hybrid Expert.")
+                table_doc = reranked_docs[0] # Changed from valid_parent_docs[0] to reranked_docs[0]
+                try:
+                    df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:] # Changed doc.page_content to doc.content
+                    df.columns = [col.strip() for col in df.columns]
+                    index_col_name = df.columns[0]
+                    df = df.set_index(index_col_name)
+                    instruction = await generate_table_lookup_instruction(
+                        user_query=query_request.query,
+                        table_column_names=[index_col_name] + df.columns.tolist()
                     )
-        
-        # --- 4. 最终失败处理与建议生成 ---
+                    if instruction and "row_identifier" in instruction and "column_identifier" in instruction:
+                        row_id, col_id = instruction.get("row_identifier"), instruction.get("column_identifier")
+                        if row_id in df.index and col_id in df.columns:
+                            value = df.at[row_id, col_id]
+                            final_answer = f"根据查找到的表格信息，{row_id}的{col_id}是{value}。"
+                        else:
+                            failure_reason = f"模型指令无法执行：在表格中未能同时找到行'{row_id}'和列'{col_id}'。"
+                    else:
+                        failure_reason = "模型未能从问题中生成有效的表格查询指令。"
+                except Exception as e_pandas:
+                    failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
+                
+                if failure_reason:
+                    api_logger.warning(f"Table QA Expert failed: {failure_reason}. Downgrading to Fusion Expert.")
+            
+            if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
+                api_logger.info(f"Dispatching to Fusion Expert with {len(reranked_docs)} reranked documents.") # Added reranked docs count
+                context_strings = []
+                for doc in reranked_docs: # Changed from valid_parent_docs to reranked_docs
+                    metadata_str = json.dumps(doc.metadata, indent=2, ensure_ascii=False)
+                    context_strings.append(f"---\n### Source Document Metadata:\n```json\n{metadata_str}\n```\n\n### Document Content:\n{doc.content}\n---") # Changed doc.page_content to doc.content
+                
+                fusion_context = "\n\n".join(context_strings)
+                # from zhz_rag.llm.rag_prompts import get_fusion_messages # Already imported at the top
+                
+                final_answer = await generate_answer_from_context(
+                    user_query=query_request.query,
+                    context_str=fusion_context,
+                    prompt_builder=lambda q, c: get_fusion_messages(q, c)
+                )
+
         if not final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in final_answer:
             if not failure_reason:
-                failure_reason = "已检索到相关信息，但无法整合成一个连贯的答案。"
-            
-            api_logger.warning(f"Final answer is empty or no-answer. Reason: {failure_reason}. Generating suggestions...")
+                failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
             suggestion = await generate_actionable_suggestion(user_query=query_request.query, failure_reason=failure_reason)
-            # --- 修改下面这一行 ---
             final_answer = f"{failure_reason} {suggestion}" if suggestion else failure_reason
 
-        # --- 整合最终结果 ---
+        # --- Final Assembly (using reranked_docs for the response) ---
+        retrieved_sources_for_response = [
+            RetrievedDocument(source_type="parent_document", content=doc.content, score=doc.score, metadata=doc.metadata) # Changed doc.page_content to doc.content, added doc.score
+            for doc in reranked_docs # Changed from valid_parent_docs to reranked_docs
+        ]
         response_to_return = HybridRAGResponse(
             answer=final_answer, 
             original_query=query_request.query, 
-            retrieved_sources=list(all_retrieved_docs_map.values())
+            retrieved_sources=retrieved_sources_for_response
         )
 
-        if not failure_reason and final_answer != NO_ANSWER_PHRASE_ANSWER_CLEAN:
+        if not failure_reason and NO_ANSWER_PHRASE_ANSWER_CLEAN not in final_answer:
             app_ctx.answer_cache[cache_key] = response_to_return
-            api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
-        
+            api_logger.info(f"FINAL ANSWER CACHED.")
+
     except Exception as e:
         exception_occurred = e
         api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
         response_to_return = HybridRAGResponse(answer=f"An internal server error occurred: {e}", original_query=query_request.query, retrieved_sources=[])
     
     finally:
-        # 日志记录逻辑... (保持不变)
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         log_data_for_finally = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "rag_query_processing_v4_1_hybrid",
+            "task_type": "rag_query_processing_v6_0_reranker_integrated", # Updated task_type
             "original_user_query": query_request.query,
             "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
             "final_context_docs_full": [doc.model_dump() for doc in response_to_return.retrieved_sources] if response_to_return else [],
