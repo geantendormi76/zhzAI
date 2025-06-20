@@ -1,9 +1,35 @@
-# Byte-compiled / optimized / DLL files
+# =================================================================
+# Project Specific - VERY IMPORTANT
+# =================================================================
+# Python Virtual Environment (as seen in your logs)
+.venv-uv-rag/
+
+# All models (LLMs, Embeddings, Rerankers, etc.)
+models/
+
+# All stored data (ChromaDB, BM25, KG, etc.)
+stored_data/
+
+# All raw source documents for the knowledge base
+data/raw_documents/
+
+# Dagster local instance storage
+dagster_home/
+
+# Local database files
+*.db
+*.sqlite3
+
+# Log files
+*.log
+logs/
+
+# =================================================================
+# Python General
+# =================================================================
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
 # Distribution / packaging
@@ -27,15 +53,9 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
+# =================================================================
 # Unit test / coverage reports
+# =================================================================
 htmlcov/
 .tox/
 .nox/
@@ -49,50 +69,28 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
-# Environments - VERY IMPORTANT
+# =================================================================
+# Environments and Secrets - DO NOT COMMIT
+# =================================================================
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-.envrc  # Added based on your files
+.envrc
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# VS Code - Optional, but good practice
+# =================================================================
+# IDE / Editor specific
+# =================================================================
+# VS Code
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-*.code-workspace
 
-# Local databases (根据你的截图，这个文件可能是本地数据库)
-ZHZ_AGENT_tasks.db
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# Log files
-kg_retriever.log
-*.log
-
-# OS generated files
+# =================================================================
+# OS specific
+# =================================================================
 .DS_Store
 .DS_Store?
 ._*
@@ -100,10 +98,3 @@ kg_retriever.log
 .Trashes
 ehthumbs.db
 Thumbs.db
-
-local_models/
-stored_data/
-manual_tests
-mini_service_payload/
-project_snapshot.txt
-raw_documents/
