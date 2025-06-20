@@ -39,7 +39,9 @@ from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, Retr
 from zhz_rag.llm.llm_interface import (
     generate_answer_from_context,
     generate_query_plan,
-    generate_table_lookup_instruction, # <--- 确保导入这个新函数
+    generate_table_lookup_instruction,
+    generate_actionable_suggestion,
+    generate_expanded_queries, # <--- 添加这一行
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
 # 修复: 移除 get_table_qa_messages 的导入，因为它导致了 AttributeError
@@ -56,7 +58,7 @@ api_logger.setLevel(logging.INFO)
 if not api_logger.hasHandlers():
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
-    handler.setFormatter(formatter)
+    handler.setFormatter(handler)
     api_logger.addHandler(handler)
     api_logger.propagate = False
 
@@ -184,19 +186,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# --- API 端点 ---
+# --- API 端点 (V3.5 - Final Fix) ---
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
-    api_logger.info(f"\n--- Received RAG query (v3.2 - Expert Dispatch): '{query_request.query}' ---")
+    api_logger.info(f"\n--- Received RAG query (v3.5 - Final Fix): '{query_request.query}' ---")
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
     if not app_ctx:
         raise HTTPException(status_code=503, detail="RAG service is not properly initialized.")
 
-    response_to_return: Optional[HybridRAGResponse] = None
-    exception_occurred: Optional[Exception] = None
     interaction_id_for_log = str(uuid.uuid4())
-    log_data_for_finally: Dict[str, Any] = {}
+    
+    # --- 修复1：确保 exception_occurred 在任何路径下都已定义 ---
+    exception_occurred: Optional[Exception] = None
+    response_to_return: Optional[HybridRAGResponse] = None
 
     try:
         # --- 缓存逻辑保持不变 ---
@@ -206,183 +209,118 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             api_logger.info(f"FINAL ANSWER CACHE HIT for query: '{query_request.query}'")
             return cached_response
 
-        # --- START: V3.2 - 最终版专家分派逻辑 ---
+        # --- 1. 查询扩展 ---
+        api_logger.info(f"--- Step 1: Expanding original query ---")
+        sub_queries = await generate_expanded_queries(query_request.query)
+        api_logger.info(f"Generated {len(sub_queries)} sub-queries: {sub_queries}")
         
-        # 1. 生成查询计划
-        api_logger.info(f"--- Step 1: Generating query plan for: '{query_request.query}' ---")
-        query_plan = await generate_query_plan(user_query=query_request.query)
-        search_query = query_plan.query if query_plan else query_request.query
-        metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
-
-        # --- V2: 规范化并简化元数据过滤器 ---
-        api_logger.info(f"Normalizing filter: {metadata_filter}")
-
-        # 步骤a: 规范化 - 如果一个字典里有多个键，自动用$and包装
-        if isinstance(metadata_filter, dict) and len(metadata_filter) > 1 and not metadata_filter.keys() & {'$and', '$or', '$not'}:
-            # 只有在没有逻辑操作符的情况下，才进行包装
-            new_filter_list = [{key: value} for key, value in metadata_filter.items()]
-            metadata_filter = {"$and": new_filter_list}
-            api_logger.info(f"Wrapped multiple conditions into $and: {metadata_filter}")
-
-        # 步骤b: 净化 - 移除$and/$or列表中可能存在的空字典
-        if isinstance(metadata_filter, dict):
-            for op in ["$and", "$or"]:
-                if op in metadata_filter and isinstance(metadata_filter[op], list):
-                    cleaned_list = [item for item in metadata_filter[op] if item and isinstance(item, dict)]
-                    if cleaned_list:
-                        metadata_filter[op] = cleaned_list
-                    else:
-                        metadata_filter.pop(op)
-            if not metadata_filter:
-                metadata_filter = {}
-
-        # 步骤c: 简化 - 如果$and/$or中只剩一个元素，则剥离包装
-        if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
-            metadata_filter = metadata_filter["$and"][0]
-            api_logger.info(f"Simplified single-element $and filter to: {metadata_filter}")
-        elif metadata_filter and ("$or" in metadata_filter) and len(metadata_filter["$or"]) == 1:
-            metadata_filter = metadata_filter["$or"][0]
-            api_logger.info(f"Simplified single-element $or filter to: {metadata_filter}")
+        # --- 2. 对每个子问题执行RAG，并收集所有独特的上下文 ---
+        all_retrieved_docs_map: Dict[str, RetrievedDocument] = {}
         
-        api_logger.info(f"Final normalized filter: {metadata_filter}")
-        # --- 规范化与简化结束 ---
+        for sub_query in sub_queries:
+            api_logger.info(f"--- Processing sub-query: '{sub_query}' ---")
+            
+            # a. 为子问题生成查询计划
+            query_plan = await generate_query_plan(user_query=sub_query)
+            search_query = query_plan.query if query_plan else sub_query
+            metadata_filter = query_plan.metadata_filter if query_plan and query_plan.metadata_filter else {}
+            
+            # --- 修复2：在循环内部应用过滤器规范化逻辑 ---
+            if isinstance(metadata_filter, dict) and len(metadata_filter) > 1 and not metadata_filter.keys() & {'$and', '$or', '$not'}:
+                metadata_filter = {"$and": [{key: value} for key, value in metadata_filter.items()]}
+            if isinstance(metadata_filter, dict):
+                for op in ["$and", "$or"]:
+                    if op in metadata_filter and isinstance(metadata_filter[op], list):
+                        cleaned_list = [item for item in metadata_filter[op] if item and isinstance(item, dict)]
+                        if cleaned_list: metadata_filter[op] = cleaned_list
+                        else: metadata_filter.pop(op)
+                if not metadata_filter: metadata_filter = {}
+            if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
+                metadata_filter = metadata_filter["$and"][0]
+            elif metadata_filter and ("$or" in metadata_filter) and len(metadata_filter["$or"]) == 1:
+                metadata_filter = metadata_filter["$or"][0]
+            api_logger.info(f"Normalized filter for sub-query: {metadata_filter}")
+            # --- 过滤器规范化结束 ---
+            
+            # b. 检索小块
+            retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
+                query_text=search_query,
+                n_results=query_request.top_k_vector,
+                where_filter=metadata_filter if metadata_filter else None
+            )
 
-        # 3. 检索小块
-        api_logger.info(f"--- Step 2: Retrieving child chunks with plan ---")
-        retrieved_child_chunks = await app_ctx.chroma_retriever.retrieve(
-            query_text=search_query,
-            n_results=query_request.top_k_vector,
-            where_filter=metadata_filter if metadata_filter else None
-        )
-        api_logger.info(f"Retrieved {len(retrieved_child_chunks)} child chunks.")
+            # c. 获取父文档 (小块->大块)
+            parent_ids = list(set(chunk['metadata']['parent_id'] for chunk in retrieved_child_chunks if chunk.get('metadata', {}).get('parent_id')))
+            parent_docs = app_ctx.docstore.mget(parent_ids)
+            
+            # d. 收集并去重上下文
+            for doc in parent_docs:
+                if doc and doc.metadata.get("doc_id") not in all_retrieved_docs_map:
+                    retrieved_doc_obj = RetrievedDocument(source_type="parent_document_from_expansion", content=doc.page_content, score=1.0, metadata=doc.metadata)
+                    all_retrieved_docs_map[doc.metadata["doc_id"]] = retrieved_doc_obj
 
-        final_context_str = ""
-        final_context_docs_obj: List[RetrievedDocument] = []
-        prompt_builder_to_use = get_answer_generation_messages # 默认为通用专家
+        final_context_docs_obj = list(all_retrieved_docs_map.values())
+        api_logger.info(f"Collected {len(final_context_docs_obj)} unique parent documents from all sub-queries.")
 
-        # 4. 专家分派逻辑 (V3.3 - Hybrid Approach Implemented)
+        # --- 3. 基于所有收集到的上下文，生成最终答案 ---
         final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
-        final_context_docs_obj: List[RetrievedDocument] = []
-
-        if retrieved_child_chunks:
-            top_chunk = retrieved_child_chunks[0]
-            top_chunk_meta = top_chunk.get('metadata', {})
-            top_chunk_type = top_chunk_meta.get('paragraph_type')
-            top_chunk_content = top_chunk.get('document', '')
-
-            # --- 表格专家路径 (Hybrid: LLM for Instruction, Code for Execution) ---
-            if top_chunk_type and 'Table' in top_chunk_type and top_chunk_content:
-                api_logger.info(f"EXPERT DISPATCH: Top chunk is a '{top_chunk_type}'. Activating Table QA Hybrid Expert.")
-                
-                # --- START: 修改点 ---
-                metadata_str = json.dumps(top_chunk_meta, indent=2, ensure_ascii=False)
-                final_context_str = (
-                    f"---\n"
-                    f"### Source Document Metadata:\n"
-                    f"```json\n{metadata_str}\n```\n\n"
-                    f"### Table Content (Markdown):\n{top_chunk_content}\n"
-                    f"---"
-                )
-                # --- END: 修改点 ---
-                
-                # a. 将表格Markdown加载到DataFrame
+        failure_reason = ""
+        
+        if not final_context_docs_obj:
+            failure_reason = "经过查询扩展后，在知识库中仍未找到任何相关文档。"
+        else:
+            # 检查是否有表格，并决定是否使用表格专家
+            is_table_context = any('Table' in doc.metadata.get('paragraph_type', '') for doc in final_context_docs_obj)
+            
+            if is_table_context and len(final_context_docs_obj) == 1:
+                # 如果只找到了一个表格上下文，则使用混合方法
+                api_logger.info("Single table context detected. Activating Table QA Hybrid Expert.")
+                table_doc = final_context_docs_obj[0]
                 try:
-                    df = pd.read_csv(io.StringIO(top_chunk_content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
+                    df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
                     df.columns = [col.strip() for col in df.columns]
-                    # 获取第一列的列名作为索引名
                     index_col_name = df.columns[0]
                     df = df.set_index(index_col_name)
-                    api_logger.info(f"Successfully loaded table into DataFrame. Index: '{index_col_name}', Columns: {df.columns.tolist()}")
-
-                    # b. 调用LLM生成查找指令
+                    
                     instruction = await generate_table_lookup_instruction(
-                        user_query=query_request.query,
-                        table_column_names=[index_col_name] + df.columns.tolist() # 将索引名也加入列名列表
+                        user_query=query_request.query, # 注意：这里用原始问题来生成指令
+                        table_column_names=[index_col_name] + df.columns.tolist()
                     )
-
-                    # c. 使用代码执行指令
+                    
                     if instruction:
-                        row_id = instruction.get("row_identifier")
-                        col_id = instruction.get("column_identifier")
-                        api_logger.info(f"Executing instruction: Find row='{row_id}', column='{col_id}'")
-                        
-                        # d. 在DataFrame中精确查找
+                        row_id, col_id = instruction.get("row_identifier"), instruction.get("column_identifier")
                         if row_id in df.index and col_id in df.columns:
                             value = df.at[row_id, col_id]
                             final_answer = f"根据查找到的表格信息，{row_id}的{col_id}是{value}。"
-                            api_logger.info(f"SUCCESS: Found value '{value}' at ('{row_id}', '{col_id}').")
                         else:
-                            api_logger.warning(f"Instruction execution failed: Row '{row_id}' or Column '{col_id}' not found in DataFrame.")
-                            final_answer = f"我在表格中找到了相关信息，但无法精确定位到'{row_id}'的'{col_id}'。"
-
+                            failure_reason = f"模型指令无法执行：在表格中未能同时找到行'{row_id}'和列'{col_id}'。"
                     else:
-                        api_logger.warning("LLM failed to generate a valid table lookup instruction. Falling back to text summary.")
-                        # 如果指令生成失败，可以回退到通用总结模式
-                        final_context_str = top_chunk_content
-                        generated_final_answer = await generate_answer_from_context(
-                            user_query=query_request.query, 
-                            context_str=final_context_str,
-                            prompt_builder=get_answer_generation_messages
-                        )
-                        final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
-
-                    # 记录用于生成答案的上下文（即这个表格本身）
-                    final_context_docs_obj = [RetrievedDocument(
-                        source_type="hybrid_table_qa_execution",
-                        content=top_chunk_content,
-                        score=top_chunk.get('distance', 1.0),
-                        metadata=top_chunk_meta
-                    )]
+                        failure_reason = "模型未能从问题中生成有效的表格查询指令。"
 
                 except Exception as e_pandas:
-                    api_logger.error(f"Error during Hybrid Table QA execution: {e_pandas}", exc_info=True)
-                    final_answer = "处理表格数据时遇到错误。"
-
-            # --- 通用专家路径 (小块 -> 大块) ---
+                    failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
             else:
-                api_logger.info(f"EXPERT DISPATCH: Top chunk is '{top_chunk_type}'. Using General Context (Small-to-Big) Expert.")
-                parent_ids = list(set(
-                    chunk['metadata']['parent_id'] 
-                    for chunk in retrieved_child_chunks if chunk.get('metadata') and chunk['metadata'].get('parent_id')
-                ))
-                parent_docs = app_ctx.docstore.mget(parent_ids)
-
-                # --- START: 修改点 ---
+                # 对于多个上下文或纯文本上下文，使用通用总结专家
+                api_logger.info("Multiple/text contexts detected. Using General Summarization Expert.")
                 context_strings = []
                 for doc in final_context_docs_obj:
-                    # 将元数据字典转换为格式化的JSON字符串，以便LLM阅读
                     metadata_str = json.dumps(doc.metadata, indent=2, ensure_ascii=False)
-                    context_strings.append(
-                        f"---\n"
-                        f"### Source Document Metadata:\n"
-                        f"```json\n{metadata_str}\n```\n\n"
-                        f"### Document Content:\n{doc.content}\n"
-                        f"---"
-                    )
+                    context_strings.append(f"---\n### Source Document Metadata:\n```json\n{metadata_str}\n```\n\n### Document Content:\n{doc.content}\n---")
                 final_context_str = "\n\n".join(context_strings)
-                # --- END: 修改点 ---
 
-                final_context_docs_obj = [
-                    RetrievedDocument(
-                        source_type="parent_document_retrieval",
-                        content=doc.page_content,
-                        score=1.0,
-                        metadata=doc.metadata
-                    ) for doc in parent_docs if doc is not None
-                ]
-                context_strings = [f"Source: {doc.metadata.get('filename', 'N/A')}\nContent:\n{doc.content}" for doc in final_context_docs_obj]
-                final_context_str = "\n\n---\n\n".join(context_strings)
-                
-                if not final_context_str:
-                    final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+                generated_final_answer = await generate_answer_from_context(user_query=query_request.query, context_str=final_context_str)
+                if not generated_final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in generated_final_answer:
+                    failure_reason = "已检索到相关上下文，但模型无法从中提炼出明确答案。"
                 else:
-                    generated_final_answer = await generate_answer_from_context(
-                        user_query=query_request.query, 
-                        context_str=final_context_str,
-                        prompt_builder=get_answer_generation_messages
-                    )
-                    final_answer = generated_final_answer if generated_final_answer else NO_ANSWER_PHRASE_ANSWER_CLEAN
-        
+                    final_answer = generated_final_answer
+
+        # 4. 如果失败，生成智能建议
+        if failure_reason:
+            api_logger.info(f"Answer generation failed. Reason: {failure_reason}. Generating suggestions...")
+            suggestion = await generate_actionable_suggestion(user_query=query_request.query, failure_reason=failure_reason)
+            if suggestion:
+                final_answer = f"{NO_ANSWER_PHRASE_ANSWER_CLEAN} {suggestion}"
+
         # --- 整合最终结果 ---
         response_to_return = HybridRAGResponse(
             answer=final_answer, 
@@ -390,42 +328,41 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             retrieved_sources=final_context_docs_obj
         )
 
-        response_to_return = HybridRAGResponse(
-            answer=final_answer, 
-            original_query=query_request.query, 
-            retrieved_sources=final_context_docs_obj
-        )
-        
-        if final_answer != NO_ANSWER_PHRASE_ANSWER_CLEAN:
+        if not failure_reason:
             app_ctx.answer_cache[cache_key] = response_to_return
             api_logger.info(f"FINAL ANSWER CACHED for query: '{query_request.query}'")
+        
+    except Exception as e:
+        exception_occurred = e
+        api_logger.error(f"Critical error in query_rag_endpoint: {e}", exc_info=True)
+        # 直接在这里构建失败的响应，而不是依赖finally块
+        response_to_return = HybridRAGResponse(answer=f"An internal server error occurred: {e}", original_query=query_request.query, retrieved_sources=[])
+    
     finally:
+        # --- 日志记录逻辑 ---
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
-        interaction_log_entry = {
+        log_data_for_finally = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "rag_query_processing_full_log_v3_1", # Updated task type for v3.1
+            "task_type": "rag_query_processing_v3_3",
             "original_user_query": query_request.query,
-            "final_answer_from_llm": log_data_for_finally.get("final_answer", "N/A"),
-            "final_context_docs_full": log_data_for_finally.get("final_docs", []),
+            "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
+            "final_context_docs_full": [doc.model_dump() for doc in response_to_return.retrieved_sources] if response_to_return else [],
             "retrieval_parameters": query_request.model_dump(),
-            "expanded_queries_count": len(log_data_for_finally.get("expanded_queries", [])),
             "processing_time_seconds": round(processing_time_seconds, 3)
         }
         if exception_occurred:
-            interaction_log_entry["error_details"] = f"{type(exception_occurred).__name__}: {str(exception_occurred)}"
-            interaction_log_entry["error_traceback"] = traceback.format_exc() if hasattr(exception_occurred, '__traceback__') else "No traceback available"
+            log_data_for_finally["error_details"] = f"{type(exception_occurred).__name__}: {str(exception_occurred)}"
+            log_data_for_finally["error_traceback"] = traceback.format_exc()
         
-        try:
-            await log_queue.put(interaction_log_entry)
-            api_logger.info(f"Log queue put successful for interaction: {interaction_id_for_log}")
-        except Exception as log_e_final:
-            api_logger.error(f"Failed to queue log for interaction {interaction_id_for_log}: {log_e_final}", exc_info=True)
+        await log_queue.put(log_data_for_finally)
         
         if exception_occurred:
-            raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(exception_occurred)}")
+            raise HTTPException(status_code=500, detail=str(exception_occurred))
         
+        # This should ideally be handled within the try block to ensure response_to_return is always set
+        # But as a final fallback for the `finally` block, ensure it exists or raise an error
         if response_to_return is None:
-            raise HTTPException(status_code=500, detail="Internal Server Error: Response generation failed unexpectedly.")
+            raise HTTPException(status_code=500, detail="Response generation failed unexpectedly after logging.")
         
         return response_to_return
     

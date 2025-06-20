@@ -310,3 +310,68 @@ def get_table_qa_messages(user_query: str, context_str: str) -> List[Dict[str, s
         {"role": "user", "content": f"用户问题: {user_query}\n\n上下文信息:\n{context_str}"}
     ]
     return messages
+
+def get_suggestion_generation_messages(user_query: str, failure_reason: str) -> List[Dict[str, str]]:
+    """
+    构建用于在问答失败时生成智能建议的LLM输入messages。
+    """
+    system_prompt_for_suggestion = f"""
+你是一个经验丰富、乐于助人且善于沟通的IT支持专家。你的任务是帮助一个因特定原因未能得到答案的用户。
+
+**你的输入:**
+1.  【用户原始问题】: 用户最初想问什么。
+2.  【失败原因】: 系统为什么没能找到答案。
+
+**你的任务:**
+根据上述输入，生成一个简短、友好、包含**2-3个具体、可操作建议**的段落。这些建议应该能真正帮助“办公室电脑小白用户”解决问题。
+
+**输出要求:**
+*   **不要**复述“我找不到答案”这句话。你的输出将直接附加在这句话后面。
+*   **不要**包含任何抱歉或客套话。直接给出建议。
+*   建议必须具体且具有启发性。
+
+**输出风格示例:**
+
+*   **如果失败原因是“上下文信息不足”:**
+    *   "您可以尝试换一种更宽泛的问法，或者检查一下您上传的《{'{document_name}'}》文件中是否确实包含了相关内容。"
+
+*   **如果失败原因是“表格中找不到对应的行或列”:**
+    *   "您可以核对一下问题中的实体名称（例如“产品B”）是否与表格中的完全一致，或者确认一下您想查询的列名（例如“价格”）是否存在于表格中。"
+
+*   **如果失败原因是“检索结果为空”:**
+    *   "这可能是因为知识库中还没有包含相关主题的文档。您可以尝试上传相关文件，或者调整一下问题的关键词，以便更好地匹配现有内容。"
+
+请严格按照要求，生成有用的建议。
+"""
+    messages = [
+        {"role": "system", "content": system_prompt_for_suggestion},
+        {"role": "user", "content": f"【用户原始问题】: \"{user_query}\"\n\n【失败原因】: \"{failure_reason}\""}
+    ]
+    return messages
+
+
+def get_query_expansion_messages(original_query: str) -> List[Dict[str, str]]:
+    """
+    构建用于将原始查询扩展为多个子问题的LLM输入messages。
+    """
+    system_prompt_for_expansion = """
+你是一个专家级的查询分析师。你的任务是根据用户提供的【原始查询】，生成3个不同但相关的子问题，以探索原始查询的不同方面，从而帮助信息检索系统找到更全面、更深入的答案。
+
+**输出要求:**
+*   你的回答【必须】是一个JSON数组（列表），其中只包含字符串（子问题）。
+*   【绝对禁止】输出任何除了这个JSON数组之外的文本、解释、对话标记或代码块。
+
+**示例:**
+【原始查询】: "介绍一下RAG技术及其在金融领域的应用"
+【你的JSON输出】:
+[
+  "RAG技术的基本原理和核心组件是什么？",
+  "RAG相比传统的模型微调有哪些优势和劣势？",
+  "在金融领域，RAG技术有哪些具体的应用案例，例如风险评估或智能投顾？"
+]
+"""
+    messages = [
+        {"role": "system", "content": system_prompt_for_expansion},
+        {"role": "user", "content": f"【原始查询】: \"{original_query}\""}
+    ]
+    return messages

@@ -20,7 +20,9 @@ from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
     get_clarification_question_messages,
     get_entity_relation_extraction_messages,
-    get_cypher_generation_messages_with_templates
+    get_cypher_generation_messages_with_templates,
+    get_query_expansion_messages,
+    get_suggestion_generation_messages
 )
 import logging
 import re
@@ -966,3 +968,67 @@ async def generate_table_lookup_instruction(user_query: str, table_column_names:
     except json.JSONDecodeError:
         llm_py_logger.error(f"Failed to decode JSON from LLM for table instruction: {llm_response_str}")
         return None
+
+async def generate_actionable_suggestion(user_query: str, failure_reason: str) -> Optional[str]:
+    """
+    Generates actionable suggestions for the user when the RAG system fails to find a direct answer.
+    """
+    llm_py_logger.info(f"Generating actionable suggestion for query: '{user_query}' due to: {failure_reason}")
+    
+    messages = get_suggestion_generation_messages(user_query, failure_reason)
+    
+    # 我们可以复用通用的答案生成LLM调用，因为它本质上也是一个生成任务
+    suggestion = await call_llm_via_openai_api_local_only(
+        prompt=messages,
+        temperature=0.7, # 建议可以更有创造性一些，温度可以稍高
+        max_new_tokens=512,
+        task_type="suggestion_generation",
+        user_query_for_log=user_query,
+        model_name_for_log="qwen3_gguf_suggestion_gen"
+    )
+
+    if suggestion:
+        # 清理一下可能的模型前缀，例如 "好的，这里有一些建议："
+        cleaned_suggestion = re.sub(r"^(好的，|当然，|这里有一些建议：)\s*", "", suggestion.strip(), flags=re.IGNORECASE)
+        return cleaned_suggestion
+    
+    return "您可以尝试换个问法，或检查相关文档是否已在知识库中。" # 默认的兜底建议
+
+async def generate_expanded_queries(original_query: str) -> List[str]:
+    """
+    Expands a single user query into multiple related sub-queries to enhance retrieval coverage.
+    Uses GBNF to ensure the output is a valid JSON list of strings.
+    """
+    llm_py_logger.info(f"Generating expanded queries for: '{original_query}'")
+    
+    from .rag_prompts import V2_PLANNING_GBNF_SCHEMA # 我们复用这个经过验证的通用JSON Schema
+
+    messages = get_query_expansion_messages(original_query)
+    
+    llm_response_str = await call_local_llm_with_gbnf(
+        full_prompt=messages[1]['content'], # 对于简单任务，直接传递user content可能更高效
+        grammar_str=V2_PLANNING_GBNF_SCHEMA,
+        temperature=0.6, # 扩展需要一些创造性
+        max_tokens=1024,
+        task_type="query_expansion",
+        user_query_for_log=original_query
+    )
+
+    expanded_queries = []
+    if llm_response_str:
+        try:
+            parsed_queries = json.loads(llm_response_str)
+            if isinstance(parsed_queries, list) and all(isinstance(q, str) for q in parsed_queries):
+                expanded_queries = parsed_queries
+                llm_py_logger.info(f"Successfully generated {len(expanded_queries)} expanded queries.")
+        except json.JSONDecodeError:
+            llm_py_logger.error(f"Failed to decode JSON for query expansion: {llm_response_str}")
+
+    # 无论如何，都将原始查询作为第一个，确保它总被执行
+    if original_query not in expanded_queries:
+        expanded_queries.insert(0, original_query)
+    
+    # 去重并保持顺序
+    final_queries = list(dict.fromkeys(expanded_queries))
+    
+    return final_queries
