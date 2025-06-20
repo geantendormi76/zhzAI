@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+# from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
 
 
 # 可以将 NO_ANSWER_PHRASE_ANSWER_CLEAN 也移到这里，或者从 constants.py 导入
@@ -99,127 +99,127 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
     return messages
 
 # --- 精简的Cypher模板定义 (只保留一个核心模板) ---
-SIMPLIFIED_CYPHER_TEMPLATES = [
-    {
-        "id": "template_find_entity_attributes_by_text_label",
-        "description": "根据提供的实体文本和实体标签，查找该实体的所有基本属性。",
-        "template": "MATCH (n:ExtractedEntity {{text: $entity_text, label: $entity_label}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1",
-        "params_needed": ["entity_text", "entity_label"]
-    }
-]
+# SIMPLIFIED_CYPHER_TEMPLATES = [
+#     {
+#         "id": "template_find_entity_attributes_by_text_label",
+#         "description": "根据提供的实体文本和实体标签，查找该实体的所有基本属性。",
+#         "template": "MATCH (n:ExtractedEntity {{text: $entity_text, label: $entity_label}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1",
+#         "params_needed": ["entity_text", "entity_label"]
+#     }
+# ]
 
-def get_cypher_generation_messages_with_templates(user_question: str) -> List[Dict[str, str]]: # 函数名保持一致
-    """
-    构建用于（基于【单个指定模板】）生成Cypher查询的LLM输入messages。
-    这个版本用于测试模型对单个模板的参数提取能力。
-    """
+# def get_cypher_generation_messages_with_templates(user_question: str) -> List[Dict[str, str]]: # 函数名保持一致
+#     """
+#     构建用于（基于【单个指定模板】）生成Cypher查询的LLM输入messages。
+#     这个版本用于测试模型对单个模板的参数提取能力。
+#     """
     
-    # 在这个测试版本中，我们假设总是使用第一个（也是唯一一个）模板
-    selected_template = SIMPLIFIED_CYPHER_TEMPLATES[0]
+#     # 在这个测试版本中，我们假设总是使用第一个（也是唯一一个）模板
+#     selected_template = SIMPLIFIED_CYPHER_TEMPLATES[0]
     
-    template_description_for_prompt = f"""你将使用以下Cypher查询模板：
-Template ID: {selected_template['id']}
-Description: {selected_template['description']}
-Cypher Structure: {selected_template['template']}
-Parameters Needed: {', '.join(selected_template['params_needed'])}
-"""
+#     template_description_for_prompt = f"""你将使用以下Cypher查询模板：
+# Template ID: {selected_template['id']}
+# Description: {selected_template['description']}
+# Cypher Structure: {selected_template['template']}
+# Parameters Needed: {', '.join(selected_template['params_needed'])}
+# """
 
-    system_prompt_for_cypher = f"""你是一个精确的参数提取助手。你的任务是根据用户问题，为下面提供的【唯一Cypher查询模板】提取参数，并构建一个Cypher查询。
+#     system_prompt_for_cypher = f"""你是一个精确的参数提取助手。你的任务是根据用户问题，为下面提供的【唯一Cypher查询模板】提取参数，并构建一个Cypher查询。
 
-**【图谱Schema核心部分参考】**
-(你主要关注 `:ExtractedEntity` 节点及其属性: `text`, `label`, `id_prop`。其中 `label` 的常见值是 "PERSON", "ORGANIZATION", "TASK"。)
-{NEW_KG_SCHEMA_DESCRIPTION} 
-# ^^^ Schema描述已包含输出JSON格式 {{"status": "success/unable_to_generate", "query": "..."}} 的指导，请严格遵循该JSON输出格式。
+# **【图谱Schema核心部分参考】**
+# (你主要关注 `:ExtractedEntity` 节点及其属性: `text`, `label`, `id_prop`。其中 `label` 的常见值是 "PERSON", "ORGANIZATION", "TASK"。)
+# {NEW_KG_SCHEMA_DESCRIPTION} 
+# # ^^^ Schema描述已包含输出JSON格式 {{"status": "success/unable_to_generate", "query": "..."}} 的指导，请严格遵循该JSON输出格式。
 
-**【你的任务与输出要求】**
-1.  仔细分析【用户问题】，理解其核心查询意图。
-2.  判断该意图是否与提供的【当前需要填充的Cypher查询模板】描述相符。
-3.  如果相符：
-    a.  从【用户问题】中提取填充该模板所需的所有【Parameters Needed】。确保参数值与Schema中的实体文本和标签格式相符（例如，标签应为大写 "PERSON", "ORGANIZATION", "TASK"）。
-    b.  将提取的参数值替换到模板的Cypher语句中（例如，`$entity_text` 替换为提取到的实体名）。
-    c.  最终输出一个JSON对象，格式为：`{{"status": "success", "query": "填充好参数的Cypher语句"}}`。
-4.  如果不相符（例如，用户问题意图与模板描述不符，或无法从问题中提取到模板所需的所有关键参数）：
-    a.  最终输出一个JSON对象，格式为：`{{"status": "unable_to_generate", "query": "无法生成Cypher查询."}}`。
-5.  【绝对禁止】输出任何除了上述指定JSON对象之外的文本、解释或思考过程。
+# **【你的任务与输出要求】**
+# 1.  仔细分析【用户问题】，理解其核心查询意图。
+# 2.  判断该意图是否与提供的【当前需要填充的Cypher查询模板】描述相符。
+# 3.  如果相符：
+#     a.  从【用户问题】中提取填充该模板所需的所有【Parameters Needed】。确保参数值与Schema中的实体文本和标签格式相符（例如，标签应为大写 "PERSON", "ORGANIZATION", "TASK"）。
+#     b.  将提取的参数值替换到模板的Cypher语句中（例如，`$entity_text` 替换为提取到的实体名）。
+#     c.  最终输出一个JSON对象，格式为：`{{"status": "success", "query": "填充好参数的Cypher语句"}}`。
+# 4.  如果不相符（例如，用户问题意图与模板描述不符，或无法从问题中提取到模板所需的所有关键参数）：
+#     a.  最终输出一个JSON对象，格式为：`{{"status": "unable_to_generate", "query": "无法生成Cypher查询."}}`。
+# 5.  【绝对禁止】输出任何除了上述指定JSON对象之外的文本、解释或思考过程。
 
 
-**【处理示例】**
-<example>
-  <user_question>我想知道张三的详细信息。</user_question>
-  <assistant_output_json>{{
-    "status": "success",
-    "query": "MATCH (n:ExtractedEntity {{text: '张三', label: 'PERSON'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
-  }}</assistant_output_json>
-</example>
-<example>
-  <user_question>项目Alpha的文档编写任务是什么？</user_question>
-  <assistant_output_json>{{
-    "status": "success",
-    "query": "MATCH (n:ExtractedEntity {{text: '项目alpha的文档编写任务', label: 'TASK'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
-  }}</assistant_output_json>
-</example>
-<example>
-  <user_question>法国的首都是哪里？</user_question>
-  <assistant_output_json>{{
-    "status": "unable_to_generate",
-    "query": "无法生成Cypher查询."
-  }}</assistant_output_json>
-</example>
-"""
-    user_content = f"用户问题: {user_question}"
+# **【处理示例】**
+# <example>
+#   <user_question>我想知道张三的详细信息。</user_question>
+#   <assistant_output_json>{{
+#     "status": "success",
+#     "query": "MATCH (n:ExtractedEntity {{text: '张三', label: 'PERSON'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
+#   }}</assistant_output_json>
+# </example>
+# <example>
+#   <user_question>项目Alpha的文档编写任务是什么？</user_question>
+#   <assistant_output_json>{{
+#     "status": "success",
+#     "query": "MATCH (n:ExtractedEntity {{text: '项目alpha的文档编写任务', label: 'TASK'}}) RETURN n.text AS text, n.label AS label, n.id_prop AS id_prop LIMIT 1"
+#   }}</assistant_output_json>
+# </example>
+# <example>
+#   <user_question>法国的首都是哪里？</user_question>
+#   <assistant_output_json>{{
+#     "status": "unable_to_generate",
+#     "query": "无法生成Cypher查询."
+#   }}</assistant_output_json>
+# </example>
+# """
+#     user_content = f"用户问题: {user_question}"
 
-    messages = [
-        {"role": "system", "content": system_prompt_for_cypher},
-        {"role": "user", "content": user_content}
-    ]
-    return messages
+#     messages = [
+#         {"role": "system", "content": system_prompt_for_cypher},
+#         {"role": "user", "content": user_content}
+#     ]
+#     return messages
 
 # --- 新增：实体与关系意图提取的提示词生成函数 ---
-def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str, str]]:
-    """
-    构建用于从用户查询中提取核心实体和关系意图的LLM输入messages。
-    目标是输出一个符合 ExtractedEntitiesAndRelationIntent Pydantic 模型结构的纯净JSON对象。
-    这个版本的Prompt极度强调JSON输出格式。
-    """
-    import re
-    match = re.search(r'label\s*:\s*STRING\s*\(实体类型。\s*允许的值\s*:\s*("([^"]+)"(?:,\s*"([^"]+)")*)\)', NEW_KG_SCHEMA_DESCRIPTION)
-    allowed_entity_labels_str = "PERSON, ORGANIZATION, TASK, DOCUMENT, PROJECT, REGION, PRODUCT, OTHER"
-    if match:
-        labels_group = match.group(1)
-        extracted_labels = re.findall(r'"([^"]+)"', labels_group)
-        if extracted_labels:
-            allowed_entity_labels_str = ", ".join(extracted_labels)
-            if "OTHER" not in extracted_labels:
-                allowed_entity_labels_str += ", OTHER"
+# def get_entity_relation_extraction_messages(user_question: str) -> List[Dict[str, str]]:
+#     """
+#     构建用于从用户查询中提取核心实体和关系意图的LLM输入messages。
+#     目标是输出一个符合 ExtractedEntitiesAndRelationIntent Pydantic 模型结构的纯净JSON对象。
+#     这个版本的Prompt极度强调JSON输出格式。
+#     """
+#     import re
+#     match = re.search(r'label\s*:\s*STRING\s*\(实体类型。\s*允许的值\s*:\s*("([^"]+)"(?:,\s*"([^"]+)")*)\)', NEW_KG_SCHEMA_DESCRIPTION)
+#     allowed_entity_labels_str = "PERSON, ORGANIZATION, TASK, DOCUMENT, PROJECT, REGION, PRODUCT, OTHER"
+#     if match:
+#         labels_group = match.group(1)
+#         extracted_labels = re.findall(r'"([^"]+)"', labels_group)
+#         if extracted_labels:
+#             allowed_entity_labels_str = ", ".join(extracted_labels)
+#             if "OTHER" not in extracted_labels:
+#                 allowed_entity_labels_str += ", OTHER"
 
-    # --- V3 "最最严格" Prompt ---
-    system_prompt_for_entity_extraction = f"""<|im_start|>system
-USER_QUERY_TO_PROCESS:
-{user_question}
+#     # --- V3 "最最严格" Prompt ---
+#     system_prompt_for_entity_extraction = f"""<|im_start|>system
+# USER_QUERY_TO_PROCESS:
+# {user_question}
 
-TASK: Analyze USER_QUERY_TO_PROCESS. Output ONLY a valid JSON object.
-NO EXPLANATIONS. NO EXTRA TEXT. NO MARKDOWN. JUST JSON.
+# TASK: Analyze USER_QUERY_TO_PROCESS. Output ONLY a valid JSON object.
+# NO EXPLANATIONS. NO EXTRA TEXT. NO MARKDOWN. JUST JSON.
 
-JSON_OUTPUT_SCHEMA:
-{{
-  "entities": [
-    {{"text": "string, extracted entity text from USER_QUERY_TO_PROCESS", "label": "string, entity type from: [{allowed_entity_labels_str}], or OTHER"}}
-  ],
-  "relation_hint": "string, relation described in USER_QUERY_TO_PROCESS, or empty string"
-}}
+# JSON_OUTPUT_SCHEMA:
+# {{
+#   "entities": [
+#     {{"text": "string, extracted entity text from USER_QUERY_TO_PROCESS", "label": "string, entity type from: [{allowed_entity_labels_str}], or OTHER"}}
+#   ],
+#   "relation_hint": "string, relation described in USER_QUERY_TO_PROCESS, or empty string"
+# }}
 
-RULES:
-1. Max 2 entities in "entities" array. If none, "entities" is `[]`.
-2. "label" MUST be from the provided list or "OTHER".
-3. If no relation_hint, value is `""`.
-4. If USER_QUERY_TO_PROCESS yields no entities or relation, output: `{{"entities": [], "relation_hint": ""}}`
+# RULES:
+# 1. Max 2 entities in "entities" array. If none, "entities" is `[]`.
+# 2. "label" MUST be from the provided list or "OTHER".
+# 3. If no relation_hint, value is `""`.
+# 4. If USER_QUERY_TO_PROCESS yields no entities or relation, output: `{{"entities": [], "relation_hint": ""}}`
 
-YOUR_VALID_JSON_OUTPUT_ONLY:<|im_end|>""" # <--- 结尾引导更加直接
+# YOUR_VALID_JSON_OUTPUT_ONLY:<|im_end|>""" # <--- 结尾引导更加直接
 
-    messages = [
-        {"role": "system", "content": system_prompt_for_entity_extraction}
-    ]
-    return messages
+#     messages = [
+#         {"role": "system", "content": system_prompt_for_entity_extraction}
+#     ]
+#     return messages
 
 
 # =================================================================================================
@@ -373,5 +373,42 @@ def get_query_expansion_messages(original_query: str) -> List[Dict[str, str]]:
     messages = [
         {"role": "system", "content": system_prompt_for_expansion},
         {"role": "user", "content": f"【原始查询】: \"{original_query}\""}
+    ]
+    return messages
+
+def get_fusion_messages(original_query: str, fusion_context: str) -> List[Dict[str, str]]:
+    """
+    构建用于将多个子答案融合成一个最终报告的LLM输入messages。
+    """
+    system_prompt_for_fusion = """
+你是一个顶级的【信息整合与报告撰写专家】。
+你的任务是将一系列针对【原始问题】的【子问题与子答案】进行分析、整合、去重，并最终撰写成一份逻辑清晰、内容全面、专业且连贯的【最终报告】。
+
+**核心指令:**
+
+1.  **目标导向**: 你的【最终报告】必须直接、完整地回答【原始问题】。
+2.  **信息来源**: 你【只能】使用【子问题与子答案】中提供的信息。严禁引入任何外部知识或进行不合理的推断。
+3.  **整合与去重**: 将不同子答案中的相关信息进行逻辑上的连接和整合。如果多个子答案提到相同的事实，请在最终报告中只提及一次，避免重复。
+4.  **结构化输出**: 如果内容复杂，请使用标题、列表（如 1., 2., ... 或 -）等方式来组织你的【最终报告】，使其易于阅读。
+5.  **专业风格**: 保持客观、中立的语气。直接开始撰写报告内容，不要添加如“好的，这是您的报告”等多余的开场白。
+6.  **处理矛盾/不足**: 如果提供的子答案信息不足以形成一份有意义的报告，或者信息之间存在明显矛盾，请直接回答“根据现有信息，无法就您的问题给出一个全面统一的答案。”
+
+请现在基于以下信息，开始你的报告撰写工作。
+"""
+    
+    user_content = f"""
+【原始问题】:
+{original_query}
+
+【子问题与子答案】:
+{fusion_context}
+
+---
+【你的最终报告】:
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt_for_fusion},
+        {"role": "user", "content": user_content}
     ]
     return messages

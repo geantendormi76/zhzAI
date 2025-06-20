@@ -19,16 +19,44 @@ from llama_cpp import Llama, LlamaGrammar
 from zhz_rag.llm.rag_prompts import (
     get_answer_generation_messages, 
     get_clarification_question_messages,
-    get_entity_relation_extraction_messages,
-    get_cypher_generation_messages_with_templates,
+    # get_entity_relation_extraction_messages, # 已停用
+    # get_cypher_generation_messages_with_templates, # 已停用
     get_query_expansion_messages,
-    get_suggestion_generation_messages
+    get_suggestion_generation_messages,
+    get_fusion_messages # 确保这个新函数被导入
 )
 import logging
 import re
 import uuid  # 用于生成 interaction_id
 from datetime import datetime, timezone  # 用于生成时间戳
 import litellm # <--- 确保这个导入存在
+
+# --- 全局 GBNF 模型实例管理 (性能优化) ---
+_llm_gbnf_instance: Optional[Llama] = None
+_llm_gbnf_instance_lock = asyncio.Lock()
+
+def _get_gbnf_llm_instance() -> Llama:
+    """
+    获取一个单例的、线程安全的 Llama GBNF 模型实例。
+    在第一次调用时初始化。
+    """
+    global _llm_gbnf_instance
+    if _llm_gbnf_instance is None:
+        model_path_from_env = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
+        if not model_path_from_env or not os.path.exists(model_path_from_env):
+            llm_py_logger.critical(f"关键错误: GBNF 调用的 LLM 模型路径未设置或无效: {model_path_from_env}")
+            raise ValueError("LOCAL_LLM_GGUF_MODEL_PATH 环境变量未配置或路径无效。")
+        
+        llm_py_logger.info(f"--- 正在加载 GBNF LLM 模型，请稍候... Path: {model_path_from_env} ---")
+        _llm_gbnf_instance = Llama(
+            model_path=model_path_from_env,
+            n_gpu_layers=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
+            n_ctx=int(os.getenv("LLM_N_CTX", 4096)),
+            verbose=False
+        )
+        llm_py_logger.info("--- GBNF LLM 模型加载成功 ---")
+    return _llm_gbnf_instance
+# --- 全局 GBNF 模型实例管理结束 ---
 
 load_dotenv()  # 确保加载.env文件
 
@@ -78,54 +106,54 @@ NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到�
 NO_ANSWER_PHRASE_KG_CLEAN = "从知识图谱中未找到直接相关信息。"
 UNIQUE_STOP_TOKEN = "<|im_endofunable|>"
 NO_ANSWER_PHRASE_ANSWER_WITH_STOP_TOKEN = f"{NO_ANSWER_PHRASE_ANSWER_CLEAN}{UNIQUE_STOP_TOKEN}"
-NO_ANSWER_PHRASE_KG_WITH_STOP_TOKEN = f"{NO_ANSWER_PHRASE_KG_CLEAN}{UNIQUE_STOP_TOKEN}"
+# NO_ANSWER_PHRASE_KG_WITH_STOP_TOKEN = f"{NO_ANSWER_PHRASE_KG_CLEAN}{UNIQUE_STOP_TOKEN}"
 
-# Placeholder for the schema description. Replace with actual schema.
-NEW_KG_SCHEMA_DESCRIPTION = """
-{
-  "node_labels": ["Person", "Project", "Task", "Document", "Region", "SalesAmount", "Product"],
-  "relationship_types": ["WORKS_ON", "ASSIGNED_TO", "HAS_DOCUMENT", "HAS_SALES_AMOUNT", "RELATED_TO"],
-  "node_properties": {
-    "Person": [{"property": "name", "type": "STRING"}, {"property": "role", "type": "STRING"}],
-    "Project": [{"property": "name", "type": "STRING"}, {"property": "status", "type": "STRING"}],
-    "Task": [{"property": "name", "type": "STRING"}, {"property": "status", "type": "STRING"}, {"property": "priority", "type": "STRING"}],
-    "Document": [{"property": "id", "type": "STRING"}, {"property": "title", "type": "STRING"}, {"property": "type", "type": "STRING"}],
-    "Region": [{"property": "name", "type": "STRING"}],
-    "SalesAmount": [{"property": "period", "type": "STRING"}, {"property": "numeric_amount", "type": "FLOAT"}, {"property": "unit", "type": "STRING"}],
-    "Product": [{"property": "name", "type": "STRING"}, {"property": "category", "type": "STRING"}]
-  },
-  "relationship_properties": {},
-  "output_format_guidance": {
-    "description": "Your response MUST be a JSON object with two fields: 'status' and 'query'.",
-    "status_field": {
-      "description": "The 'status' field can be one of two values: 'success' or 'unable_to_generate'.",
-      "success": "If you can generate a Cypher query, status should be 'success'.",
-      "unable_to_generate": "If you cannot generate a Cypher query based on the question and schema, status should be 'unable_to_generate'."
-    },
-    "query_field": {
-      "description": "The 'query' field contains the Cypher query as a string if status is 'success'.",
-      "success_example": "MATCH (n) RETURN n LIMIT 1",
-      "unable_to_generate_example": "无法生成Cypher查询."
-    }
-  },
-  "examples": [
-    {
-      "User Question": "Who is task 'FixBug123' assigned to?",
-      "Your EXACT Response": {
-        "status": "success",
-        "query": "MATCH (t:Task {name: 'FixBug123'})<-[:ASSIGNED_TO]-(p:Person) RETURN p.name AS assignedTo"
-      }
-    },
-    {
-      "User Question": "What is the color of the sky?",
-      "Your EXACT Response": {
-        "status": "unable_to_generate",
-        "query": "无法生成Cypher查询."
-      }
-    }
-  ]
-}
-"""
+# # Placeholder for the schema description. Replace with actual schema.
+# NEW_KG_SCHEMA_DESCRIPTION = """
+# {
+#   "node_labels": ["Person", "Project", "Task", "Document", "Region", "SalesAmount", "Product"],
+#   "relationship_types": ["WORKS_ON", "ASSIGNED_TO", "HAS_DOCUMENT", "HAS_SALES_AMOUNT", "RELATED_TO"],
+#   "node_properties": {
+#     "Person": [{"property": "name", "type": "STRING"}, {"property": "role", "type": "STRING"}],
+#     "Project": [{"property": "name", "type": "STRING"}, {"property": "status", "type": "STRING"}],
+#     "Task": [{"property": "name", "type": "STRING"}, {"property": "status", "type": "STRING"}, {"property": "priority", "type": "STRING"}],
+#     "Document": [{"property": "id", "type": "STRING"}, {"property": "title", "type": "STRING"}, {"property": "type", "type": "STRING"}],
+#     "Region": [{"property": "name", "type": "STRING"}],
+#     "SalesAmount": [{"property": "period", "type": "STRING"}, {"property": "numeric_amount", "type": "FLOAT"}, {"property": "unit", "type": "STRING"}],
+#     "Product": [{"property": "name", "type": "STRING"}, {"property": "category", "type": "STRING"}]
+#   },
+#   "relationship_properties": {},
+#   "output_format_guidance": {
+#     "description": "Your response MUST be a JSON object with two fields: 'status' and 'query'.",
+#     "status_field": {
+#       "description": "The 'status' field can be one of two values: 'success' or 'unable_to_generate'.",
+#       "success": "If you can generate a Cypher query, status should be 'success'.",
+#       "unable_to_generate": "If you cannot generate a Cypher query based on the question and schema, status should be 'unable_to_generate'."
+#     },
+#     "query_field": {
+#       "description": "The 'query' field contains the Cypher query as a string if status is 'success'.",
+#       "success_example": "MATCH (n) RETURN n LIMIT 1",
+#       "unable_to_generate_example": "无法生成Cypher查询."
+#     }
+#   },
+#   "examples": [
+#     {
+#       "User Question": "Who is task 'FixBug123' assigned to?",
+#       "Your EXACT Response": {
+#         "status": "success",
+#         "query": "MATCH (t:Task {name: 'FixBug123'})<-[:ASSIGNED_TO]-(p:Person) RETURN p.name AS assignedTo"
+#       }
+#     },
+#     {
+#       "User Question": "What is the color of the sky?",
+#       "Your EXACT Response": {
+#         "status": "unable_to_generate",
+#         "query": "无法生成Cypher查询."
+#       }
+#     }
+#   ]
+# }
+# """
 
 LLM_API_URL = os.getenv("SGLANG_API_URL", "http://localhost:8088/v1/chat/completions")
 
@@ -221,51 +249,51 @@ async def call_llm_via_openai_api_local_only( # 改个名字以示区分
     await log_interaction_data(log_success_data)
     return raw_llm_output_text
 
-async def generate_cypher_query(user_question: str) -> Optional[str]: # kg_schema_description 参数可以移除了，因为它已包含在新的prompt函数中
-    llm_py_logger.info(f"Attempting to generate Cypher query (template-based) for: '{user_question}' via local service.")
+# async def generate_cypher_query(user_question: str) -> Optional[str]: # kg_schema_description 参数可以移除了，因为它已包含在新的prompt函数中
+#     llm_py_logger.info(f"Attempting to generate Cypher query (template-based) for: '{user_question}' via local service.")
 
-    messages_for_llm = get_cypher_generation_messages_with_templates(user_question)
+#     messages_for_llm = get_cypher_generation_messages_with_templates(user_question)
 
-    cypher_stop_sequences = ['<|im_end|>', '```'] # 如果输出包含markdown的json块
+#     cypher_stop_sequences = ['<|im_end|>', '```'] # 如果输出包含markdown的json块
 
-    llm_response_json_str = await call_llm_via_openai_api_local_only( 
-        prompt=messages_for_llm,
-        temperature=0.0, # 对于精确的JSON和Cypher生成，温度设为0
-        max_new_tokens=1024, # 允许足够的空间输出JSON和Cypher
-        stop_sequences=cypher_stop_sequences,
-        task_type="cypher_generation_template_based_local_service",
-        user_query_for_log=user_question,
-        model_name_for_log="qwen3_gguf_cypher_template_local"
-    )
+#     llm_response_json_str = await call_llm_via_openai_api_local_only( 
+#         prompt=messages_for_llm,
+#         temperature=0.0, # 对于精确的JSON和Cypher生成，温度设为0
+#         max_new_tokens=1024, # 允许足够的空间输出JSON和Cypher
+#         stop_sequences=cypher_stop_sequences,
+#         task_type="cypher_generation_template_based_local_service",
+#         user_query_for_log=user_question,
+#         model_name_for_log="qwen3_gguf_cypher_template_local"
+#     )
 
-    if not llm_response_json_str:
-        llm_py_logger.warning(f"LLM call for Cypher (template-based) returned None or empty. User question: '{user_question}'")
-        return json.dumps({"status": "unable_to_generate", "query": "无法生成Cypher查询."}) # 始终返回JSON字符串
+#     if not llm_response_json_str:
+#         llm_py_logger.warning(f"LLM call for Cypher (template-based) returned None or empty. User question: '{user_question}'")
+#         return json.dumps({"status": "unable_to_generate", "query": "无法生成Cypher查询."}) # 始终返回JSON字符串
 
-    cleaned_json_str = llm_response_json_str.strip()
-    if cleaned_json_str.startswith("```json"):
-        cleaned_json_str = cleaned_json_str[len("```json"):].strip()
-    if cleaned_json_str.endswith("```"):
-        cleaned_json_str = cleaned_json_str[:-len("```")].strip()
+#     cleaned_json_str = llm_response_json_str.strip()
+#     if cleaned_json_str.startswith("```json"):
+#         cleaned_json_str = cleaned_json_str[len("```json"):].strip()
+#     if cleaned_json_str.endswith("```"):
+#         cleaned_json_str = cleaned_json_str[:-len("```")].strip()
 
-    try:
+#     try:
 
-        parsed_for_validation = json.loads(cleaned_json_str)
-        if isinstance(parsed_for_validation, dict) and \
-           "status" in parsed_for_validation and \
-           "query" in parsed_for_validation:
-            llm_py_logger.info(f"LLM returned valid JSON for Cypher (template-based): {cleaned_json_str}")
-            return cleaned_json_str
-        else:
-            llm_py_logger.warning(f"LLM output for Cypher (template-based) was JSON but not expected structure: {cleaned_json_str}")
-            return json.dumps({"status": "unable_to_generate", "query": "LLM输出JSON结构错误."})
-    except json.JSONDecodeError:
-        llm_py_logger.error(f"Failed to parse JSON response for Cypher (template-based): '{cleaned_json_str}'", exc_info=True)
-        # 如果不是有效的JSON，但包含"MATCH"，可能LLM直接输出了Cypher，尝试包装它
-        if "MATCH" in cleaned_json_str.upper() or "RETURN" in cleaned_json_str.upper():
-             llm_py_logger.warning("LLM output for Cypher (template-based) was not JSON but looks like Cypher, wrapping it.")
-             return json.dumps({"status": "success", "query": cleaned_json_str})
-        return json.dumps({"status": "unable_to_generate", "query": "LLM输出非JSON格式."})
+#         parsed_for_validation = json.loads(cleaned_json_str)
+#         if isinstance(parsed_for_validation, dict) and \
+#            "status" in parsed_for_validation and \
+#            "query" in parsed_for_validation:
+#             llm_py_logger.info(f"LLM returned valid JSON for Cypher (template-based): {cleaned_json_str}")
+#             return cleaned_json_str
+#         else:
+#             llm_py_logger.warning(f"LLM output for Cypher (template-based) was JSON but not expected structure: {cleaned_json_str}")
+#             return json.dumps({"status": "unable_to_generate", "query": "LLM输出JSON结构错误."})
+#     except json.JSONDecodeError:
+#         llm_py_logger.error(f"Failed to parse JSON response for Cypher (template-based): '{cleaned_json_str}'", exc_info=True)
+#         # 如果不是有效的JSON，但包含"MATCH"，可能LLM直接输出了Cypher，尝试包装它
+#         if "MATCH" in cleaned_json_str.upper() or "RETURN" in cleaned_json_str.upper():
+#              llm_py_logger.warning("LLM output for Cypher (template-based) was not JSON but looks like Cypher, wrapping it.")
+#              return json.dumps({"status": "success", "query": cleaned_json_str})
+#         return json.dumps({"status": "unable_to_generate", "query": "LLM输出非JSON格式."})
 
 async def generate_answer_from_context(
     user_query: str,
@@ -302,110 +330,30 @@ async def generate_answer_from_context(
         llm_py_logger.warning("Answer generation returned None or empty string. Falling back to default no-answer phrase.")
         return NO_ANSWER_PHRASE_ANSWER_CLEAN
 
-async def generate_simulated_kg_query_response(user_query: str, kg_schema_description: str, kg_data_summary_for_prompt: str) -> Optional[str]:
-    prompt_str = f"""<|im_start|>system
-你是一个知识图谱查询助手。你的任务是根据用户提出的问题、知识图谱Schema描述和图谱中的数据摘要，直接抽取出与问题最相关的1-2个事实片段作为答案。
-只输出事实片段，不要解释，不要生成Cypher语句，不要包含任何额外对话或标记。
-如果找不到直接相关的事实，请**直接且完整地**回答：“{NO_ANSWER_PHRASE_KG_WITH_STOP_TOKEN}”<|im_end|>
-<|im_start|>user
-知识图谱Schema描述:
-{kg_schema_description}
+# async def generate_simulated_kg_query_response(user_query: str, kg_schema_description: str, kg_data_summary_for_prompt: str) -> Optional[str]:
+#     prompt_str = f"""<|im_start|>system
+# 你是一个知识图谱查询助手。你的任务是根据用户提出的问题、知识图谱Schema描述和图谱中的数据摘要，直接抽取出与问题最相关的1-2个事实片段作为答案。
+# 只输出事实片段，不要解释，不要生成Cypher语句，不要包含任何额外对话或标记。
+# 如果找不到直接相关的事实，请**直接且完整地**回答：“{NO_ANSWER_PHRASE_KG_WITH_STOP_TOKEN}”<|im_end|>
+# <|im_start|>user
+# 知识图谱Schema描述:
+# {kg_schema_description}
 
-知识图谱数据摘要: 
-{kg_data_summary_for_prompt}
+# 知识图谱数据摘要: 
+# {kg_data_summary_for_prompt}
 
-用户问题: {user_query}<|im_end|>
-<|im_start|>assistant
-"""
-    stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN]
-    return await call_llm_via_openai_api_local_only(
-        prompt=prompt_str,
-        temperature=0.5,
-        max_new_tokens=256,
-        stop_sequences=stop_sequences,
-        task_type="simulated_kg_query_response",
-        user_query_for_log=user_query
-    )
-
-# --- 新增：为查询扩展结果定义一个缓存 ---
-# 使用 TTLCache，例如缓存1小时，最多缓存100个不同的原始查询的扩展结果
-# TTL (time-to-live) in seconds. 3600 seconds = 1 hour.
-# maxsize is the maximum number of items the cache will hold.
-_expanded_queries_cache = TTLCache(maxsize=100, ttl=3600)
-_expanded_queries_cache_lock = asyncio.Lock() # 用于异步环境下的锁
-# --- 缓存定义结束 ---
-
-
-async def generate_expanded_queries(original_query: str) -> List[str]:
-    
-    # --- 添加：缓存检查 ---
-    async with _expanded_queries_cache_lock:
-        if original_query in _expanded_queries_cache:
-            llm_py_logger.info(f"Expanded queries CACHE HIT for original query: '{original_query[:50]}...'")
-            return _expanded_queries_cache[original_query]
-    llm_py_logger.info(f"Expanded queries CACHE MISS for original query: '{original_query[:50]}...'. Generating new expanded queries.")
-    # --- 缓存检查结束 ---
-
-    prompt_str = f"""<|im_start|>system
-你是一个专家查询分析师。根据用户提供的查询，生成3个不同但相关的子问题，以探索原始查询的不同方面。这些子问题将用于检索更全面的信息。
-你的回答必须是一个JSON数组（列表），其中每个元素是一个字符串（子问题）。
-只输出JSON数组，不要包含任何其他解释、对话标记或代码块。
-
-示例:
-用户查询: "公司年度财务报告和未来一年的预算规划"
-助手:
-[
-  "公司最近的年度财务报告总结是什么？",
-  "未来一年的详细预算规划有哪些主要构成？",
-  "对比往年，公司财务状况有何显著变化？"
-]<|im_end|>
-<|im_start|>user
-原始查询: {original_query}<|im_end|>
-<|im_start|>assistant
-"""
-    stop_sequences = ["<|im_end|>"]
-    
-    llm_py_logger.info(f"调用LLM API进行查询扩展 (Prompt长度: {len(prompt_str)} 字符)...")
-    llm_output = await call_llm_via_openai_api_local_only(
-        prompt=prompt_str,
-        temperature=0.1,
-        max_new_tokens=512,
-        stop_sequences=stop_sequences,
-        task_type="query_expansion",
-        user_query_for_log=original_query
-    )
-    expanded_queries = []
-    if llm_output:
-        try:
-            json_str = llm_output.strip()
-            if json_str.startswith("```json"):
-                json_str = json_str[len("```json"):].strip()
-            if json_str.endswith("```"):
-                json_str = json_str[:-len("```")].strip()
-            
-            parsed_queries = json.loads(json_str)
-            if isinstance(parsed_queries, list) and all(isinstance(q, str) for q in parsed_queries):
-                expanded_queries = parsed_queries
-                llm_py_logger.info(f"LLM成功生成 {len(expanded_queries)} 个扩展查询。")
-            else:
-                llm_py_logger.warning(f"LLM生成的扩展查询JSON格式不符合预期 (不是字符串列表): {llm_output[:200]}...")
-        except json.JSONDecodeError as e:
-            llm_py_logger.error(f"解析LLM扩展查询JSON失败: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
-        except Exception as e:
-            llm_py_logger.error(f"处理LLM扩展查询时发生未知错误: {e}. 原始输出: {llm_output[:200]}...", exc_info=True)
-    else:
-        llm_py_logger.warning("LLM未能生成扩展查询。")
-
-    # Always include the original query
-    if original_query not in expanded_queries:
-        expanded_queries.append(original_query)
-    # --- 添加：存储到缓存 ---
-    async with _expanded_queries_cache_lock:
-        _expanded_queries_cache[original_query] = expanded_queries
-        llm_py_logger.info(f"CACHED {len(expanded_queries)} expanded queries for original query: '{original_query[:50]}...'")
-    # --- 缓存存储结束 ---
-
-    return expanded_queries
+# 用户问题: {user_query}<|im_end|>
+# <|im_start|>assistant
+# """
+#     stop_sequences = ["<|im_end|>", UNIQUE_STOP_TOKEN]
+#     return await call_llm_via_openai_api_local_only(
+#         prompt=prompt_str,
+#         temperature=0.5,
+#         max_new_tokens=256,
+#         stop_sequences=stop_sequences,
+#         task_type="simulated_kg_query_response",
+#         user_query_for_log=user_query
+#     )
 
 
 async def generate_clarification_question(original_query: str, uncertainty_reason: str) -> Optional[str]:
@@ -771,39 +719,20 @@ async def generate_intent_classification(user_query: str) -> Dict[str, Any]:
         return None
     
 
-# 新的LLM调用函数，用于create_completion和GBNF
 async def call_local_llm_with_gbnf(
     full_prompt: str,
     grammar_str: str, # GBNF语法字符串
     temperature: float = 0.1,
     max_tokens: int = 1024,
-    repeat_penalty: float = 1.2, # 从您的成功脚本中获取
+    repeat_penalty: float = 1.2,
     stop_sequences: Optional[List[str]] = None,
     task_type: str = "gbnf_constrained_generation",
-    user_query_for_log: Optional[str] = None, # 用于日志记录
+    user_query_for_log: Optional[str] = None,
     model_name_for_log: str = "local_qwen_gguf_gbnf",
     application_version_for_log: str = "0.1.0_gbnf"
 ) -> Optional[str]:
     llm_py_logger.info(f"Calling LOCAL LLM with GBNF for task: {task_type}. Prompt length: {len(full_prompt)}")
 
-    # 获取模型路径 (与 test_gbnf_extraction.py 逻辑类似)
-    # 注意: 这里的模型加载是临时的，理想情况下 LocalModelHandler 应该能处理这个
-    # 但为了快速集成您的成功方案，我们先在这里直接加载。
-    # 后续可以考虑将 create_completion 与 GBNF 的能力集成到 LocalModelHandler 中。
-    model_path_from_env = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
-    if not model_path_from_env or not os.path.exists(model_path_from_env):
-        llm_py_logger.error(f"LLM model path not found or not set in .env for GBNF call: {model_path_from_env}")
-        # 记录错误日志
-        log_error_data = {
-            "interaction_id": str(uuid.uuid4()), "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": task_type + "_model_load_error", "user_query_for_task": user_query_for_log,
-            "llm_input_prompt": full_prompt[:500] + "...", # 截断长prompt
-            "error_details": "LLM model path not configured or invalid.",
-            "application_version": application_version_for_log
-        }
-        await log_interaction_data(log_error_data) # 确保 log_interaction_data 已导入并可用
-        return None
-    
     raw_llm_output_text = None
     error_info = None
     
@@ -811,13 +740,9 @@ async def call_local_llm_with_gbnf(
         # 编译GBNF语法
         compiled_grammar = LlamaGrammar.from_string(grammar_str)
 
-        # 初始化Llama模型实例 (每次调用都初始化可能效率不高，后续优化点)
-        llm_instance = Llama(
-            model_path=model_path_from_env,
-            n_gpu_layers=int(os.getenv("LLM_N_GPU_LAYERS", 0)),
-            n_ctx=int(os.getenv("LLM_N_CTX", 4096)),
-            verbose=False
-        )
+        # 获取共享的、已加载的LLM实例 (性能优化)
+        async with _llm_gbnf_instance_lock:
+            llm_instance = await asyncio.to_thread(_get_gbnf_llm_instance)
 
         def _blocking_llm_call(): # 封装阻塞操作
             response = llm_instance.create_completion(
@@ -826,7 +751,7 @@ async def call_local_llm_with_gbnf(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 repeat_penalty=repeat_penalty,
-                stop=stop_sequences
+                stop=stop_sequences or [] # 确保 stop 是列表
             )
             return response['choices'][0]['text']
 
@@ -856,6 +781,7 @@ async def call_local_llm_with_gbnf(
     }
     await log_interaction_data(log_success_data)
     return raw_llm_output_text
+
 
 async def generate_query_plan(user_query: str) -> Optional[RagQueryPlan]:
     """
@@ -994,41 +920,75 @@ async def generate_actionable_suggestion(user_query: str, failure_reason: str) -
     
     return "您可以尝试换个问法，或检查相关文档是否已在知识库中。" # 默认的兜底建议
 
+
 async def generate_expanded_queries(original_query: str) -> List[str]:
     """
     Expands a single user query into multiple related sub-queries to enhance retrieval coverage.
-    Uses GBNF to ensure the output is a valid JSON list of strings.
+    Uses GBNF for reliable JSON output and caches the results.
+    V2: Enhanced parsing to handle malformed JSON from the LLM.
     """
-    llm_py_logger.info(f"Generating expanded queries for: '{original_query}'")
+    llm_py_logger.info(f"Attempting to generate expanded queries for: '{original_query}'")
     
-    from .rag_prompts import V2_PLANNING_GBNF_SCHEMA # 我们复用这个经过验证的通用JSON Schema
+    from .rag_prompts import get_query_expansion_messages, V2_PLANNING_GBNF_SCHEMA 
 
     messages = get_query_expansion_messages(original_query)
     
+    full_prompt = "".join([f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages])
+    full_prompt += "<|im_start|>assistant\n"
+
     llm_response_str = await call_local_llm_with_gbnf(
-        full_prompt=messages[1]['content'], # 对于简单任务，直接传递user content可能更高效
+        full_prompt=full_prompt,
         grammar_str=V2_PLANNING_GBNF_SCHEMA,
-        temperature=0.6, # 扩展需要一些创造性
+        temperature=0.6,
         max_tokens=1024,
-        task_type="query_expansion",
+        task_type="query_expansion_gbnf",
         user_query_for_log=original_query
     )
 
     expanded_queries = []
     if llm_response_str:
+        cleaned_response = llm_response_str.strip()
         try:
-            parsed_queries = json.loads(llm_response_str)
-            if isinstance(parsed_queries, list) and all(isinstance(q, str) for q in parsed_queries):
-                expanded_queries = parsed_queries
-                llm_py_logger.info(f"Successfully generated {len(expanded_queries)} expanded queries.")
-        except json.JSONDecodeError:
-            llm_py_logger.error(f"Failed to decode JSON for query expansion: {llm_response_str}")
+            parsed_data = json.loads(cleaned_response)
+            
+            if isinstance(parsed_data, list):
+                expanded_queries = [q for q in parsed_data if isinstance(q, str)]
+            elif isinstance(parsed_data, dict):
+                # --- 新增的“特种手术”解析逻辑 ---
+                # 尝试将字典的键作为JSON数组进行解析
+                for key, value in parsed_data.items():
+                    if isinstance(key, str) and key.strip().startswith('[') and key.strip().endswith(']'):
+                        try:
+                            # 找到了! 那个作为键的JSON数组字符串
+                            potential_queries = json.loads(key)
+                            if isinstance(potential_queries, list):
+                                expanded_queries = [q for q in potential_queries if isinstance(q, str)]
+                                llm_py_logger.info(f"Successfully extracted queries from a malformed JSON dictionary key.")
+                                break # 找到就跳出循环
+                        except json.JSONDecodeError:
+                            continue # 这个键不是有效的JSON，继续检查下一个
+                
+                # 如果上述方法失败，尝试从常见的键中提取
+                if not expanded_queries:
+                    for key_option in ["queries", "sub_queries", "expanded_queries", "result"]:
+                        if key_option in parsed_data and isinstance(parsed_data[key_option], list):
+                            expanded_queries = parsed_data[key_option]
+                            break
+            
+            if not expanded_queries:
+                llm_py_logger.warning(f"Could not extract a list of strings from the parsed JSON: {parsed_data}")
 
-    # 无论如何，都将原始查询作为第一个，确保它总被执行
-    if original_query not in expanded_queries:
-        expanded_queries.insert(0, original_query)
+        except (json.JSONDecodeError, TypeError) as e:
+            llm_py_logger.error(f"Failed to decode JSON for query expansion: {cleaned_response}. Error: {e}")
+
+    # 确保原始查询总是第一个
+    final_queries = [original_query]
+    for q in expanded_queries:
+        # 确保不添加重复的查询
+        if q.strip() and q.strip() not in final_queries:
+            final_queries.append(q.strip())
     
-    # 去重并保持顺序
-    final_queries = list(dict.fromkeys(expanded_queries))
-    
+    llm_py_logger.info(f"Final list of queries ({len(final_queries)} total, deduplicated): {final_queries}")
     return final_queries
+
+#### 
