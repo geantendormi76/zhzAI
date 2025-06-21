@@ -270,11 +270,51 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, user_query=query_request.query)
         sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, original_query=query_request.query)
         unique_queries = list(dict.fromkeys([query_plan.query] + sub_queries if query_plan else sub_queries))
-        metadata_filter = query_plan.metadata_filter if query_plan else {}
-        if metadata_filter and ("$and" in metadata_filter) and len(metadata_filter["$and"]) == 1:
-            metadata_filter = metadata_filter["$and"][0]
-        
-        retrieval_tasks = [app_ctx.chroma_retriever.retrieve(q, query_request.top_k_vector, metadata_filter or None) for q in unique_queries]
+
+        # --- START: V2 核心修正：构建符合 ChromaDB 规范的过滤器 ---
+        user_filter_conditions = query_request.filters.get("must", []) if query_request.filters else []
+        llm_filter = query_plan.metadata_filter if query_plan else {}
+
+        all_conditions = []
+
+        # 1. 处理用户提供的过滤器
+        for condition in user_filter_conditions:
+            key = condition.get("key")
+            match = condition.get("match")
+            if key and match and "value" in match:
+                # 转换为 ChromaDB 的 $eq (等于) 操作符
+                all_conditions.append({key: {"$eq": match["value"]}})
+
+        # 2. 处理LLM生成的过滤器 (它已经是ChromaDB格式)
+        if llm_filter:
+            if "$and" in llm_filter:
+                all_conditions.extend(llm_filter["$and"])
+            elif llm_filter: # 避免添加空字典
+                all_conditions.append(llm_filter)
+
+        # 3. 构建最终的 where 子句
+        final_metadata_filter = {}
+        if all_conditions:
+             # 去重
+            unique_conditions_as_strings = {json.dumps(c, sort_keys=True) for c in all_conditions}
+            unique_conditions = [json.loads(s) for s in unique_conditions_as_strings]
+
+            if len(unique_conditions) == 1:
+                final_metadata_filter = unique_conditions[0]
+            else:
+                final_metadata_filter = {"$and": unique_conditions}
+
+        api_logger.info(f"Final ChromaDB-compliant metadata filter: {final_metadata_filter}")
+        # --- END: V2 核心修正 ---
+
+        retrieval_tasks = [
+            app_ctx.chroma_retriever.retrieve(
+                query_text=q,
+                n_results=query_request.top_k_vector,
+                where_filter=final_metadata_filter or None
+            ) for q in unique_queries
+        ]
+
         all_child_chunks_results = await asyncio.gather(*retrieval_tasks)
         all_parent_ids = {chunk['metadata']['parent_id'] for chunk_list in all_child_chunks_results for chunk in chunk_list if 'parent_id' in chunk.get('metadata', {})}
         parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
@@ -300,25 +340,45 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         else:
             # Table expert logic is still prioritized
             is_single_table_context = (len(reranked_docs) == 1 and reranked_docs[0].metadata.get("paragraph_type") == "table")
+            
             if is_single_table_context:
                 api_logger.info("Dispatching to Table QA Hybrid Expert.")
                 table_doc = reranked_docs[0]
                 try:
                     df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
-                    df.columns = [col.strip() for col in df.columns]
-                    index_col_name = df.columns[0]
-                    df = df.set_index(index_col_name)
+                    
+                    # 1. 清洗列名和数据中的空格
+                    df.columns = [col.replace(" ", "").strip() for col in df.columns]
+
+                    # --- 新代码：使用 .map 替换已弃用的 .applymap ---
+                    for col in df.columns:
+                        df[col] = df[col].map(lambda x: x.replace(" ", "").strip() if isinstance(x, str) else x)
+
+                    # 2. 不再设置ID为索引，而是找到用于查找的关键列
+                    if len(df.columns) < 2:
+                        raise ValueError("Table must have at least two columns for key-value lookup.")
+                    
+                    key_column_for_lookup = df.columns[1] # 假设第二列是我们要按名称查找的列，即“产品名称”
+
                     instruction = await generate_table_lookup_instruction(
+                        llm_instance=app_ctx.llm_gbnf_instance,
                         user_query=query_request.query,
-                        table_column_names=[index_col_name] + df.columns.tolist()
+                        table_column_names=df.columns.tolist() # 将所有列名传给LLM
                     )
+
                     if instruction and "row_identifier" in instruction and "column_identifier" in instruction:
-                        row_id, col_id = instruction.get("row_identifier"), instruction.get("column_identifier")
-                        if row_id in df.index and col_id in df.columns:
-                            value = df.at[row_id, col_id]
+                        row_id = instruction.get("row_identifier", "").replace(" ", "")
+                        col_id = instruction.get("column_identifier", "").replace(" ", "")
+
+                        # 3. 在关键列中查找，而不是在索引中查找
+                        result_series = df.loc[df[key_column_for_lookup] == row_id, col_id]
+                        
+                        if not result_series.empty:
+                            value = result_series.iloc[0] # 获取第一个匹配项的值
                             final_answer = f"根据查找到的表格信息，{row_id}的{col_id}是{value}。"
                         else:
-                            failure_reason = f"模型指令无法执行：在表格中未能同时找到行'{row_id}'和列'{col_id}'。"
+                             failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id}'，或在表头中未能找到列'{col_id}'。"
+                    # --- END: 最终核心修正 ---
                     else:
                         failure_reason = "模型未能从问题中生成有效的表格查询指令。"
                 except Exception as e_pandas:
@@ -326,7 +386,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 
                 if failure_reason:
                     api_logger.warning(f"Table QA Expert failed: {failure_reason}. Downgrading to Fusion Expert.")
-            
+
             if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
                 # --- 分步合成开始 ---
                 # 1. 并行生成所有文档的摘要

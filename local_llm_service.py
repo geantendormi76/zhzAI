@@ -6,18 +6,29 @@ import traceback
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional, Union
 import json
+import os
+import sys
+from dotenv import load_dotenv
+
+# --- START: Explicitly load .env file from project root ---
+# The script is in the project root, so we can find the .env file here.
+project_root = os.path.dirname(os.path.abspath(__file__))
+dotenv_path = os.path.join(project_root, '.env')
+
+if os.path.exists(dotenv_path):
+    print(f"--- Loading environment variables from: {dotenv_path} ---")
+    load_dotenv(dotenv_path=dotenv_path)
+else:
+    print(f"--- WARNING: .env file not found at {dotenv_path}. Using system environment variables. ---")
+# --- END: Explicitly load .env file ---
 
 # --- START: 添加 HardwareManager 导入 ---
 try:
-    # 假设 hardware_manager.py 在 zhz_agent/utils/ 目录下
-    from utils.hardware_manager import HardwareManager
+    # 根据项目结构，从 zhz_rag 包中导入
+    from zhz_rag.utils.hardware_manager import HardwareManager
 except ImportError:
-    # 如果 utils 不在 zhz_agent 的直接子目录，或者PYTHONPATH设置问题，可能需要调整导入路径
-    # 例如，如果 zhz_agent 是项目根目录，且 utils 是根目录下的文件夹：
-    # from utils.hardware_manager import HardwareManager
-    # 如果 hardware_manager.py 与 local_llm_service.py 在同一目录（不推荐）：
-    # from hardware_manager import HardwareManager
-    print("ERROR: Failed to import HardwareManager. Ensure it's in the correct path and PYTHONPATH is set.")
+    print("ERROR: Failed to import HardwareManager from zhz_rag.utils. Ensure it's in the correct path and PYTHONPATH is set.")
+    traceback.print_exc()
     # 定义一个占位符，以便服务至少能尝试启动（尽管功能会受限）
     HardwareManager = None
 # --- END: 添加 HardwareManager 导入 ---
@@ -56,14 +67,13 @@ N_GPU_LAYERS: int = INITIAL_N_GPU_LAYERS
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global llama_model, model_path_global, failure_phrase_token_ids, logit_bias_for_failure_phrase
-    # 声明我们要修改全局变量 N_GPU_LAYERS
     global N_GPU_LAYERS
 
     print("--- Local LLM Service: Lifespan startup (with GBNF and logit_bias prep) ---")
 
     # --- START: HardwareManager 集成 ---
-    final_n_gpu_layers_to_use = INITIAL_N_GPU_LAYERS  # 默认使用初始值
-    if HardwareManager:  # 确保导入成功
+    final_n_gpu_layers_to_use = INITIAL_N_GPU_LAYERS
+    if HardwareManager:
         try:
             print("Initializing HardwareManager for dynamic configuration...")
             hw_manager = HardwareManager()
@@ -71,21 +81,16 @@ async def lifespan(app: FastAPI):
 
             if hw_info:
                 print(f"Detected Hardware: {hw_info}")
-                # Qwen3-1.7B 模型参数
-                model_total_layers = 28  # 根据你的模型实际层数调整
-                model_size_on_disk_gb = 1.8  # Qwen3-1.7B-Q8_0.gguf 约 1.7-1.8 GB
-                context_length_tokens = N_CTX  # 使用当前配置的上下文长度
+                model_total_layers = 28
+                model_size_on_disk_gb = 1.8
+                context_length_tokens = N_CTX
 
-                # 从 HardwareManager 获取推荐的GPU层数
                 recommended_layers = hw_manager.recommend_llm_gpu_layers(
                     model_total_layers=model_total_layers,
                     model_size_on_disk_gb=model_size_on_disk_gb,
                     context_length_tokens=context_length_tokens
-                    # 可以按需传递 kv_cache_gb_per_1k_ctx 和 safety_buffer_vram_gb
                 )
                 print(f"HardwareManager recommended n_gpu_layers: {recommended_layers}")
-
-                # 应用推荐值（优雅降级已在 recommend_llm_gpu_layers 内部处理）
                 final_n_gpu_layers_to_use = recommended_layers
 
                 if final_n_gpu_layers_to_use == 0 and hw_info.gpu_available:
@@ -103,44 +108,36 @@ async def lifespan(app: FastAPI):
     else:
         print("WARNING: HardwareManager class not available. Using initial n_gpu_layers value.")
 
-    N_GPU_LAYERS = final_n_gpu_layers_to_use  # 更新全局变量
+    N_GPU_LAYERS = final_n_gpu_layers_to_use
     print(f"Final n_gpu_layers to be used for Llama model: {N_GPU_LAYERS}")
     # --- END: HardwareManager 集成 ---
 
-    model_file_to_load = MODEL_FILENAME
-    if not model_file_to_load:
-        print(f"MODEL_FILENAME environment variable not set. Attempting to auto-detect GGUF file in {MODEL_DIR}...")
-        try:
-            gguf_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf")]
-            if not gguf_files:
-                error_msg = f"No GGUF models found in directory: {MODEL_DIR}"
-                print(f"ERROR: {error_msg}")
-                app.state.cypher_path_grammar = None  # Ensure state variable exists even on error
-                raise RuntimeError(error_msg)
-            if len(gguf_files) > 1:
-                print(f"Warning: Multiple GGUF models found in {MODEL_DIR}. Using the first one: {gguf_files[0]}")
-            model_file_to_load = gguf_files[0]
-            print(f"Auto-detected GGUF file: {model_file_to_load}")
-        except FileNotFoundError:
-            error_msg = f"Model directory not found: {MODEL_DIR}"
-            print(f"ERROR: {error_msg}")
-            app.state.cypher_path_grammar = None
-            raise RuntimeError(error_msg)
-        except Exception as e_find_model:
-            error_msg = f"Error auto-detecting GGUF file: {e_find_model}"
-            print(f"ERROR: {error_msg}")
-            app.state.cypher_path_grammar = None
-            raise RuntimeError(error_msg)
+    # --- START: 重构模型加载逻辑 ---
+    # 直接从环境变量获取完整的模型文件路径
+    model_path_from_env = os.getenv("LOCAL_LLM_GGUF_MODEL_PATH")
 
-    model_path_global = os.path.join(MODEL_DIR, model_file_to_load)
-    print(f"Attempting to load Llama model from: {model_path_global}")
-    # 这里确保使用更新后的 N_GPU_LAYERS
+    if not model_path_from_env:
+        error_msg = "FATAL: LOCAL_LLM_GGUF_MODEL_PATH environment variable is not set. Please define it in your .env file."
+        print(error_msg)
+        app.state.cypher_path_grammar = None
+        raise ValueError(error_msg)
+
+    if not os.path.exists(model_path_from_env):
+        error_msg = f"FATAL: Model file not found at the path specified by LOCAL_LLM_GGUF_MODEL_PATH: {model_path_from_env}"
+        print(error_msg)
+        app.state.cypher_path_grammar = None
+        raise FileNotFoundError(error_msg)
+
+    model_path_global = model_path_from_env
+    print(f"Attempting to load Llama model directly from: {model_path_global}")
+    # --- END: 重构模型加载逻辑 ---
+    
     print(f"Parameters: n_gpu_layers={N_GPU_LAYERS}, n_ctx={N_CTX}, n_batch={N_BATCH}")
 
     try:
         llama_model = Llama(
             model_path=model_path_global,
-            n_gpu_layers=N_GPU_LAYERS,  # <--- 确保这里使用的是更新后的 N_GPU_LAYERS
+            n_gpu_layers=N_GPU_LAYERS,
             n_ctx=N_CTX,
             n_batch=N_BATCH,
             verbose=True
@@ -151,10 +148,7 @@ async def lifespan(app: FastAPI):
         failure_phrase_str = "无法生成Cypher查询."
         if llama_model:
             try:
-                # add_bos=False, special=False (通常用于非起始的、纯文本的词元化)
                 failure_phrase_token_ids = llama_model.tokenize(failure_phrase_str.encode("utf-8"), add_bos=False, special=False)
-                # 为这些 token ID 设置正向偏置，例如 10.0 (可以调整)
-                # 避免偏置 EOS token (如果它意外地出现在短语的词元化结果中)
                 eos_token_id = llama_model.token_eos()
                 logit_bias_for_failure_phrase = {
                     token_id: 10.0 for token_id in failure_phrase_token_ids if token_id != eos_token_id
@@ -184,7 +178,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"FATAL: Failed to load Llama model or prepare GBNF/logit_bias: {e}")
         app.state.cypher_path_grammar = None
-        logit_bias_for_failure_phrase = None  # Ensure this is also cleared
+        logit_bias_for_failure_phrase = None
 
     yield
     print("--- Local LLM Service: Lifespan shutdown ---")
@@ -508,7 +502,13 @@ async def list_models():
 
 
 if __name__ == "__main__":
+    # --- 旧代码 ---
+    # print(f"--- Starting Local LLM FastAPI Service on {SERVICE_HOST}:{SERVICE_PORT} ---")
+    # print(f"--- Model will be loaded from DIR: {MODEL_DIR}, FILE: {MODEL_FILENAME or 'Auto-detected GGUF'} ---")
+    # print(f"--- GBNF Grammar for Cypher/Unable output will be loaded from: {GBNF_FILE_PATH} ---")
+    
+    # --- 新代码 (更简洁) ---
     print(f"--- Starting Local LLM FastAPI Service on {SERVICE_HOST}:{SERVICE_PORT} ---")
-    print(f"--- Model will be loaded from DIR: {MODEL_DIR}, FILE: {MODEL_FILENAME or 'Auto-detected GGUF'} ---")
-    print(f"--- GBNF Grammar for Cypher/Unable output will be loaded from: {GBNF_FILE_PATH} ---")
+    print(f"--- For model path and other configs, check log messages during startup ---")
+
     uvicorn.run("local_llm_service:app", host=SERVICE_HOST, port=SERVICE_PORT, reload=False)

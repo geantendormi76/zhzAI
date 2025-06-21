@@ -4,6 +4,7 @@ from markdown_it import MarkdownIt
 import logging
 from typing import List, Dict, Any, Optional, Union, Literal 
 from bs4 import BeautifulSoup
+import pandas as pd
 
 # --- 添加 Unstructured 的导入 ---
 try:
@@ -385,17 +386,76 @@ def parse_pdf_to_structured_output(file_path: str, original_metadata: Dict[str, 
         return {"parsed_text":text_content, "elements":elements, "original_metadata":original_metadata} # type: ignore
 
 def parse_xlsx_to_structured_output(file_path: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
-    logger.info(f"Parsing XLSX: {file_path} (Not yet fully implemented in document_parsers.py)")
-    # Here you would integrate the pandas logic from your PoC
-    text_content = f"[Placeholder: XLSX content for {os.path.basename(file_path)}]"
-    elements = []
-    if _PYDANTIC_MODELS_AVAILABLE_PARSERS:
-        elements.append(NarrativeTextElement(text=text_content)) # Or TableElement
-        return ParsedDocumentOutput(parsed_text=text_content, elements=elements, original_metadata=original_metadata)
-    else:
-        elements.append({"element_type":"narrative_text", "text":text_content})
-        return {"parsed_text":text_content, "elements":elements, "original_metadata":original_metadata} # type: ignore
+    """
+    Parses an XLSX file using pandas, converts each sheet to a Markdown table,
+    and enriches metadata with filename and sheet name.
+    """
+    logger.info(f"Parsing XLSX with pandas: {file_path}")
+    
+    try:
+        xls = pd.ExcelFile(file_path)
+        all_elements: List[DocumentElementType] = [] # type: ignore
+        full_text_representation = ""
+
+        # --- 核心修正：确保filename在元数据中 ---
+        # 无论上游是否提供，我们在这里都以文件路径为准，强制添加/覆盖
+        base_metadata = original_metadata.copy()
+        base_metadata['filename'] = os.path.basename(file_path)
+
+        for sheet_name in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                # 过滤掉完全为空的行和列，避免无效的Markdown输出
+                df.dropna(how='all', axis=0, inplace=True)
+                df.dropna(how='all', axis=1, inplace=True)
+
+                if df.empty:
+                    logger.info(f"  Skipping empty sheet: {sheet_name}")
+                    continue
+                
+                # 将DataFrame转换为Markdown格式的字符串
+                markdown_table = df.to_markdown(index=False)
+                
+                # 为每个工作表创建一个标题和一个表格元素
+                sheet_title_text = f"Sheet: {sheet_name}"
+                full_text_representation += f"## {sheet_title_text}\n\n{markdown_table}\n\n"
+                
+                # 为工作表标题创建元素
+                all_elements.append(TitleElement(
+                    text=sheet_title_text,
+                    level=2,
+                    metadata=DocumentElementMetadata(page_number=xls.sheet_names.index(sheet_name) + 1)
+                ))
+                
+                # 为表格本身创建元素
+                sheet_meta = base_metadata.copy()
+                sheet_meta['sheet_name'] = sheet_name
+                
+                all_elements.append(TableElement(
+                    markdown_representation=markdown_table,
+                    metadata=DocumentElementMetadata(**sheet_meta) # 传递特定于工作表的元数据
+                ))
+                logger.info(f"  Successfully parsed sheet: {sheet_name}")
+
+            except Exception as e_sheet:
+                logger.error(f"  Failed to parse sheet '{sheet_name}' in file '{file_path}': {e_sheet}", exc_info=True)
+                continue
+
+        if not all_elements:
+            logger.warning(f"No data parsed from any sheet in XLSX file: {file_path}")
+            return None
         
+        # 返回包含所有工作表内容的单个 ParsedDocumentOutput
+        return ParsedDocumentOutput(
+            parsed_text=full_text_representation,
+            elements=all_elements,
+            original_metadata=base_metadata # 返回包含正确filename的文档级元数据
+        )
+
+    except Exception as e:
+        logger.error(f"Error parsing XLSX file '{file_path}': {e}", exc_info=True)
+        return None
+
 def parse_html_to_structured_output(html_content_str: str, original_metadata: Dict[str, Any]) -> Optional[ParsedDocumentOutput]:
     """
     Parses an HTML string using BeautifulSoup, extracts meaningful elements,

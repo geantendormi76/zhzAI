@@ -8,6 +8,9 @@ import uuid
 # --- RAG Models ---
 class QueryRequest(BaseModel):
     query: str
+    # --- START: 新增 filters 字段 ---
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata filter to apply during retrieval.")
+    # --- END: 新增 filters 字段 ---
     # --- 修改：为所有 top_k 参数提供默认值，使其变为可选 ---
     top_k_vector: int = Field(default=3, description="Number of results to retrieve from vector search.")
     top_k_bm25: int = Field(default=3, description="Number of results to retrieve from BM25 search.")
@@ -19,6 +22,7 @@ class QueryRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "query": "What are the main objectives of the project?",
+                "filters": {"must": [{"key": "filename", "match": {"value": "report.docx"}}]}, # <-- 更新示例
                 "top_k_vector": 3,
                 "top_k_bm25": 3,
                 "top_k_kg": 2,

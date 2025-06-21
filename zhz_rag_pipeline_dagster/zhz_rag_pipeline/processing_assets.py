@@ -325,16 +325,27 @@ def clean_chunk_text_asset(
     all_chunks: List[ChunkOutput] = []
 
     for doc_idx, parsed_doc in enumerate(parsed_documents):
-        # 1. 从原始文档元数据中提取关键信息（采用更健壮的方式）
+        # --- START: 核心修正 - 统一提取并传递文档级元数据 ---
         doc_meta = parsed_doc.original_metadata
         # 兼容 "filename" 和 "file_name" 两种常见键名
         doc_filename = doc_meta.get("filename") or doc_meta.get("file_name") or f"doc_{doc_idx}"
         # 兼容多种可能的日期键名
         doc_creation_date = doc_meta.get("creation_date") or doc_meta.get("creation_datetime")
         doc_last_modified = doc_meta.get("last_modified") or doc_meta.get("last_modified_datetime")
-        doc_author = doc_meta.get("author") or doc_meta.get("authors") # 兼容单数和复数
+        doc_author = doc_meta.get("author") or doc_meta.get("authors")
+
+        # 将所有文档级别的元数据打包成一个字典
+        document_level_metadata = {
+            "filename": doc_filename,
+            "creation_date": doc_creation_date,
+            "last_modified": doc_last_modified,
+            "author": doc_author,
+        }
+        # 清理掉值为None的键
+        document_level_metadata = {k: v for k, v in document_level_metadata.items() if v is not None}
         
         context.log.info(f"Processing document for chunking: {doc_filename}")
+        # --- END: 核心修正 ---
 
         current_title_hierarchy: Dict[int, str] = {}
         doc_internal_chunk_counter = 0
@@ -342,18 +353,16 @@ def clean_chunk_text_asset(
         for element_idx, element in enumerate(parsed_doc.elements):
             parent_id = str(uuid.uuid4())
             
-            # 2. 准备基础元数据
+            # 2. 准备基础元数据 - 现在从打包好的文档级元数据开始
+            base_chunk_meta = document_level_metadata.copy() # 每个块都继承文档级元数据
+            
+            # 添加元素级元数据
             element_type_str = getattr(element, 'element_type', type(element).__name__)
-            base_chunk_meta = {
+            base_chunk_meta.update({
                 "parent_id": parent_id,
                 "paragraph_type": element_type_str,
                 "source_element_index": element_idx,
-                "filename": doc_filename, # 统一使用 'filename'
-                "creation_date": doc_creation_date,
-                "last_modified": doc_last_modified,
-                "author": doc_author,
-            }
-            base_chunk_meta = {k: v for k, v in base_chunk_meta.items() if v is not None}
+            })
 
             if isinstance(element, TitleElement):
                  title_level = getattr(element, 'level', 1)
@@ -373,20 +382,24 @@ def clean_chunk_text_asset(
             # 3. 对不同类型的元素进行分块
             sub_chunks: List[Dict[str, Any]] = []
             
-            # 优先使用新的辅助函数提取文本
             text_content = _get_element_text(element, context)
             
-            if not text_content: # 如果没有提取到任何有效文本，则跳过此元素
+            if not text_content:
                 context.log.debug(f"Skipping element {element_idx} in {doc_filename} due to empty content.")
                 continue
 
-            if element_type_str == "TableElement":
+            # --- START: 对XLSX等文件解析出的Table文本进行特殊处理 ---
+            # 假设非TableElement的表格内容会被解析为包含'|'和换行符的普通文本
+            is_likely_table_text = '|' in text_content and '\n' in text_content
+
+            if element_type_str == "TableElement" or is_likely_table_text:
+                 # 无论元素类型是什么，只要内容像表格，就用表格分割器
+                 base_chunk_meta["paragraph_type"] = "table" # 强制将类型标准化为'table'
                  sub_chunks = split_markdown_table_by_rows(text_content, config.target_sentence_split_chunk_size, config.max_merged_chunk_size, context)
+            # --- END: 特殊处理 ---
             else:
-                # 对普通文本，如果过长，则使用句子分割器
                 if len(text_content) > config.max_element_text_length_before_split:
                     sentences = split_text_into_sentences(text_content)
-                    # (未来可以加入更复杂的句子合并逻辑，现在简单地每个句子一块)
                     for sent in sentences:
                         if sent.strip():
                             sub_chunks.append({"text": sent.strip()})
@@ -411,6 +424,7 @@ def clean_chunk_text_asset(
 
     context.log.info(f"Chunking process finished. Total chunks generated: {len(all_chunks)}")
     if all_chunks:
+        # 强制打印最后一个块的元数据，看filename是否存在
         context.log.info(f"Sample final chunk metadata: {all_chunks[-1].chunk_metadata}")
     
     context.add_output_metadata(metadata={"total_chunks_generated": len(all_chunks)})
