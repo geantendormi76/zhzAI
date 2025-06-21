@@ -9,7 +9,7 @@ from sentence_transformers import CrossEncoder
 from zhz_rag.config.pydantic_models import RetrievedDocument
 
 class FusionEngine:
-    def __init__(self, logger: Optional[logging.Logger] = None, rrf_k: int = 60):
+    def __init__(self, logger: Optional[logging.Logger] = None, rrf_k: int = 60, enable_reranker: bool = True):
         if logger:
             self.logger = logger
         else:
@@ -24,8 +24,11 @@ class FusionEngine:
         self.rrf_k = rrf_k
         self.cross_encoder: Optional[CrossEncoder] = None # 明确类型
         
-        # --- 在初始化时就调用加载 ---
-        self._initialize_reranker()
+        # --- 根据标志决定是否加载再排序器 ---
+        if enable_reranker:
+            self._initialize_reranker()
+        else:
+            self.logger.warning("Reranker is explicitly disabled by configuration. Reranking will be skipped.")
 
     def _initialize_reranker(self):
         """

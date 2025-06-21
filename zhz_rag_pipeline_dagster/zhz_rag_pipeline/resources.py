@@ -55,28 +55,30 @@ class GGUFEmbeddingResource(dg.ConfigurableResource):
     _dimension: Optional[int] = PrivateAttr(default=None)
     _batch_size: int = PrivateAttr(default=128) # 提供一个保守的默认值
 
-    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
-        self._logger = context.log
-        self._client = httpx.AsyncClient(base_url=self.api_url, timeout=600.0) # 延长超时以适应大批量
+    def setup_for_execution(self, context: Optional[dg.InitResourceContext] = None) -> None:
+        """
+        初始化资源。现在可以接受一个可选的Dagster上下文。
+        如果context为None（在FastAPI等非Dagster环境中使用），则使用默认配置。
+        """
+        self._logger = context.log if context else logging.getLogger("GGUFEmbeddingResource")
+        self._client = httpx.AsyncClient(base_url=self.api_url, timeout=600.0)
         self._logger.info(f"GGUFEmbeddingResource configured to use API at: {self.api_url}")
-        
+
         # 动态计算批处理大小
         try:
-            # 假设SystemResource在依赖中，可以这样访问
-            if "system_resource" in context.resources_by_key:
+            # 检查是否在Dagster上下文中，并尝试获取system_resource
+            if context and hasattr(context, 'resources_by_key') and "system_resource" in context.resources_by_key:
                 system_resource = context.resources_by_key["system_resource"]
-                # 基于CPU核心数推荐一个批处理大小
-                # 这是一个启发式规则：物理核心越多，可以支持的并行处理能力越强
-                # 假设每个核心可以轻松处理32-64个嵌入任务
                 physical_cores = system_resource._hw_info.cpu_physical_cores if system_resource._hw_info else 4
-                self._batch_size = max(128, physical_cores * 64) 
-                self._logger.info(f"Dynamically set embedding batch size to {self._batch_size} based on {physical_cores} physical cores.")
+                self._batch_size = max(128, physical_cores * 64)
+                self._logger.info(f"Dynamically set embedding batch size to {self._batch_size} based on {physical_cores} physical cores (from Dagster context).")
             else:
-                self._logger.warning("SystemResource not found in context, using default batch size of 128.")
-
+                # 在非Dagster环境中，使用默认值
+                self._logger.warning("Running outside of full Dagster context or SystemResource not available. Using default batch size of 128.")
+                self._batch_size = 128
         except Exception as e:
             self._logger.error(f"Failed to dynamically set batch size: {e}. Using default 128.", exc_info=True)
-
+            self._batch_size = 128
         # 健康检查
         try:
             response = httpx.get(f"{self.api_url}/health")

@@ -949,6 +949,7 @@ async def generate_expanded_queries(llm_instance: Llama, original_query: str) ->
         user_query_for_log=original_query
     )
 
+
     expanded_queries = []
     if llm_response_str:
         cleaned_response = llm_response_str.strip()
@@ -985,6 +986,7 @@ async def generate_expanded_queries(llm_instance: Llama, original_query: str) ->
         except (json.JSONDecodeError, TypeError) as e:
             llm_py_logger.error(f"Failed to decode JSON for query expansion: {cleaned_response}. Error: {e}")
 
+
     # 确保原始查询总是第一个
     final_queries = [original_query]
     for q in expanded_queries:
@@ -1015,9 +1017,13 @@ async def generate_document_summary(llm_instance: Llama, user_query: str, docume
     )
 
     if summary and summary.strip().lower() != "irrelevant":
+        llm_py_logger.info("Successfully generated a relevant summary.")
         return summary.strip()
     
-    return "" # 返回空字符串表示不相关或生成失败
+    # --- 核心降级逻辑 ---
+    llm_py_logger.warning("Summary generation failed or returned irrelevant. "
+                        "Falling back to using a snippet of the original document content.")
+    # 返回原始文档内容的前N个字符作为后备摘要
+    return document_content[:500] + "..."
 
-
-#### 
+###

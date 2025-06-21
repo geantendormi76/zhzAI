@@ -405,6 +405,13 @@ def parse_xlsx_to_structured_output(file_path: str, original_metadata: Dict[str,
         for sheet_name in xls.sheet_names:
             try:
                 df = pd.read_excel(xls, sheet_name=sheet_name)
+
+                # --- 新增：在处理前，清洗所有字符串类型单元格的前后空格 ---
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        df[col] = df[col].str.strip()
+                # --- 新增结束 ---
+
                 # 过滤掉完全为空的行和列，避免无效的Markdown输出
                 df.dropna(how='all', axis=0, inplace=True)
                 df.dropna(how='all', axis=1, inplace=True)

@@ -10,7 +10,7 @@ from .llm_interface import (
     generate_expanded_queries,
     generate_intent_classification, # 这个现在直接用 litellm 调用 Gemini
     generate_clarification_question,
-    generate_clarification_options,
+    generate_clarification_options,  # <--- 问题在这里
     NO_ANSWER_PHRASE_ANSWER_CLEAN,
     # NO_ANSWER_PHRASE_KG_CLEAN # 已停用
 )
