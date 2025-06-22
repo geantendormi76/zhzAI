@@ -35,16 +35,27 @@ else:
     load_dotenv()
 
 # --- 导入我们自己的模块 ---
-from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
+from zhz_rag.config.pydantic_models import (
+    QueryRequest,
+    HybridRAGResponse,
+    RetrievedDocument,
+    PendingTaskSuggestion,
+    AutoScheduledTaskConfirmation,
+    UserIntent,                     # <--- 新增导入
+    IntentType                      # <--- 新增导入
+)
 from zhz_rag.llm.llm_interface import (
     generate_answer_from_context,
     generate_query_plan,
     generate_table_lookup_instruction,
     generate_actionable_suggestion,
     generate_expanded_queries,
-    generate_document_summary, 
+    generate_document_summary,
+    extract_task_from_dialogue,
+    classify_user_intent,           # <--- 新增导入
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
+
 from zhz_rag.utils.hardware_manager import HardwareManager
 
 from zhz_rag.llm.rag_prompts import get_answer_generation_messages, get_table_qa_messages, get_fusion_messages
@@ -331,21 +342,64 @@ app = FastAPI(
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     """
-    处理RAG查询请求，执行混合检索、文档重排和答案生成。
+    V4.2: Handles RAG queries with an intent-dispatching mechanism.
+    处理RAG查询请求，执行混合检索、文档重排和答案生成，并根据用户意图进行分派。
 
     Args:
         request: FastAPI请求对象。
         query_request: 包含用户查询和检索参数的请求体。
 
     Returns:
-        HybridRAGResponse: 包含生成的答案和检索到的源文档。
+        HybridRAGResponse: 包含生成的答案和检索到的源文档，以及可能的行动建议。
     """
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
-    if not app_ctx or not app_ctx.llm_gbnf_instance or not app_ctx.fusion_engine:
+    if not app_ctx or not app_ctx.llm_gbnf_instance:
         raise HTTPException(status_code=503, detail="RAG service or its core components are not initialized.")
 
     interaction_id_for_log = str(uuid.uuid4())
+    
+    # --- 1. 意图分类 ---
+    # 首先对用户查询进行意图分类，判断是纯粹的任务创建、RAG问答还是混合意图
+    user_intent = await classify_user_intent(app_ctx.llm_gbnf_instance, query_request.query)
+
+    if not user_intent:
+        # 如果意图分类失败，降级为标准的RAG查询流程
+        api_logger.warning("Intent classification failed. Defaulting to RAG_QUERY intent.")
+        user_intent = UserIntent(intent=IntentType.RAG_QUERY, reasoning="Classification failed, fallback.")
+
+    # --- 2. 意图分派 ---
+    
+    # 场景 A: 纯任务创建
+    # 如果意图是纯任务创建，则跳过所有RAG步骤，直接进行任务提取
+    if user_intent.intent == IntentType.TASK_CREATION:
+        api_logger.info("Intent classified as TASK_CREATION. Skipping RAG.")
+        # 直接提取任务，不进行RAG
+        task_info = await extract_task_from_dialogue(app_ctx.llm_gbnf_instance, query_request.query, "")
+        if task_info and task_info.get("task_found"):
+            # TODO: 未来这里应该调用task_manager API来实际创建任务
+            # 目前，我们只返回一个确认信息
+            return HybridRAGResponse(
+                original_query=query_request.query,
+                answer=f"好的，已为您记录待办事项：‘{task_info.get('title')}’，截止日期为 {task_info.get('due_date')}。",
+                retrieved_sources=[],
+                actionable_suggestion=None # 因为已经直接处理了
+            )
+        else:
+            return HybridRAGResponse(
+                original_query=query_request.query,
+                answer="抱歉，我理解您想创建一个任务，但未能成功提取任务信息。",
+                retrieved_sources=[],
+                actionable_suggestion=None
+            )
+
+    # 场景 B & C: RAG问答 或 混合意图
+    # 对于这两种意图，我们都需要执行完整的RAG流程
+    api_logger.info(f"Intent classified as {user_intent.intent.value}. Executing full RAG pipeline.")
+    
+    final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+    failure_reason = ""
+    reranked_docs = []
     exception_occurred: Optional[Exception] = None
     response_to_return: Optional[HybridRAGResponse] = None
 
@@ -356,21 +410,23 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         if cached_response is not None:
             return cached_response
 
+        # --- RAG 核心流程开始 (与之前版本类似) ---
         # 1. 查询规划与扩展
         query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, query_request.query)
         
-        # --- 智能查询扩展策略 ---
-        # 只有在查询计划没有生成具体的元数据过滤器时，才执行查询扩展。
+        # 智能查询扩展策略: 只有在查询计划没有生成具体的元数据过滤器时，才执行查询扩展。
         # 这可以防止在精确查找（如表格问答）时，通用扩展查询干扰检索结果。
         if not query_plan.metadata_filter:
             api_logger.info("No specific metadata filter found in plan. Performing query expansion.")
             sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, query_request.query)
             unique_queries = list(dict.fromkeys([query_plan.query] + sub_queries))
+
+            api_logger.info(f"DEBUG: Expanded queries generated: {unique_queries}")
+            
         else:
             api_logger.info("Metadata filter found in plan. Skipping query expansion to ensure precision.")
             unique_queries = [query_plan.query]
 
-            
         # --- 构建元数据过滤器 ---
         user_filter_conditions = query_request.filters.get("must", []) if query_request.filters else []
         llm_filter = query_plan.metadata_filter if query_plan else {}
@@ -412,7 +468,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 ) for q in unique_queries
             ]
         else:
-            pass
+            pass # BM25检索器未初始化，跳过关键词检索
 
         # 等待所有检索任务完成
         all_retrieval_results = await asyncio.gather(*(vector_retrieval_tasks + keyword_retrieval_tasks))
@@ -429,18 +485,14 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
         valid_parent_docs = [doc for doc in parent_docs if doc]
 
-        # --- 后续步骤（重排、生成答案等）保持不变，但使用融合后的结果 ---
-        # Stage 3: Reranking
+        # Stage 3: Reranking (重排)
         reranked_docs = await app_ctx.fusion_engine.rerank_documents(
             query=query_request.query,
             documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="fused_retrieval") for doc in valid_parent_docs],
             top_n=5
         )
 
-        # --- Stage 4: Step-by-Step Synthesis ---
-        final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
-        failure_reason = ""
-        
+        # Stage 4: Step-by-Step Synthesis (逐步合成答案)
         if not reranked_docs:
             failure_reason = "知识库中未能找到任何与您问题相关的信息。"
         else:
@@ -448,7 +500,9 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             
             if is_table_query_top_ranked:
                 table_doc = reranked_docs[0]
+                key_column_for_lookup = None  # <--- 在try块外初始化
                 try:
+                    # 读取CSV格式的表格内容，处理空格和列名
                     df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
                     df.columns = [col.replace(" ", "").strip() for col in df.columns]
                     # 清洗所有单元格数据中的空格
@@ -459,7 +513,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     if len(df.columns) < 2:
                         raise ValueError("Table must have at least two columns for key-value lookup.")
                     
-                    key_column_for_lookup = df.columns[1]
+                    # 生成表格查找指令
                     instruction = await generate_table_lookup_instruction(
                         llm_instance=app_ctx.llm_gbnf_instance,
                         user_query=query_request.query,
@@ -482,15 +536,16 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                             value = result_series.iloc[0]
                             final_answer = f"根据查找到的表格信息，{row_id_raw}的{col_id_raw}是{value}。"
                         else:
-                             failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id_raw}'，或在表头中未能找到列'{col_id_raw}'。"
+                            failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id_raw}'，或在表头中未能找到列'{col_id_raw}'。"
                     else:
                         failure_reason = "模型未能从问题中生成有效的表格查询指令。"
                 except Exception as e_pandas:
                     failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
                 
-                if failure_reason:
+                if failure_reason: # 如果表格处理失败，则回退到文档摘要生成
                     pass
 
+            # 如果表格处理未成功生成答案，或不是表格查询，则进行文档摘要生成
             if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
                 summary_tasks = [generate_document_summary(app_ctx.llm_gbnf_instance, user_query=query_request.query, document_content=doc.content) for doc in reranked_docs]
                 summaries = await asyncio.gather(*summary_tasks)
@@ -507,14 +562,59 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     fusion_context = "\n\n".join(relevant_summaries)
                     final_answer = await generate_answer_from_context(user_query=query_request.query, context_str=fusion_context, prompt_builder=lambda q, c: get_fusion_messages(q, c))
             
+        # 如果最终答案仍为空或包含“未找到答案”短语，则尝试生成行动建议
         if not final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in final_answer:
             if not failure_reason: failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
             suggestion = await generate_actionable_suggestion(app_ctx.llm_gbnf_instance, user_query=query_request.query, failure_reason=failure_reason)
             final_answer = f"{failure_reason} {suggestion}" if suggestion else failure_reason
+        
+        # --- RAG 核心流程结束 ---
 
-        response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=reranked_docs)
+        # --- 3. 任务提取 (针对RAG问答和混合意图) ---
+        # 无论RAG流程是否成功，都尝试提取任务
+        actionable_suggestion_response = None
+        task_info = await extract_task_from_dialogue(
+            llm_instance=app_ctx.llm_gbnf_instance,
+            user_query=query_request.query,
+            llm_answer=final_answer
+        )
+        if task_info and task_info.get("task_found"):
+            title = task_info.get("title")
+            due_date = task_info.get("due_date")
+            reminder_offset = task_info.get("reminder_offset_minutes")
+
+            if title and due_date:
+                if reminder_offset is not None:
+                    # 用户明确指定了提醒时间 -> 自动创建并返回确认信息
+                    # TODO: 此处未来应调用 task_manager API 来实际创建任务
+                    confirmation_msg = f"已为您自动创建任务“{title}”，并将在截止时间前 {reminder_offset} 分钟提醒您。"
+                    actionable_suggestion_response = AutoScheduledTaskConfirmation(
+                        title=title,
+                        due_date=due_date,
+                        reminder_offset_minutes=reminder_offset,
+                        confirmation_message=confirmation_msg
+                    )
+                    api_logger.info(f"Generated AutoScheduledTaskConfirmation for the user.")
+                else:
+                    # 用户未指定提醒时间 -> 返回待确认建议
+                    actionable_suggestion_response = PendingTaskSuggestion(
+                        title=title,
+                        due_date=due_date
+                    )
+                    api_logger.info(f"Generated PendingTaskSuggestion for the user.")
+
+        # --- 4. 构建最终响应 ---
+        response_to_return = HybridRAGResponse(
+            answer=final_answer,
+            original_query=query_request.query,
+            retrieved_sources=reranked_docs,
+            actionable_suggestion=actionable_suggestion_response # <--- 使用新构建的、结构化的响应
+        )
+
+        # 如果没有发生错误且答案有效，则将响应缓存起来
         if not failure_reason and NO_ANSWER_PHRASE_ANSWER_CLEAN not in final_answer:
             app_ctx.answer_cache[cache_key] = response_to_return
+
     except Exception as e:
         exception_occurred = e
         response_to_return = HybridRAGResponse(answer=f"An internal server error occurred: {e}", original_query=query_request.query, retrieved_sources=[])
@@ -522,17 +622,19 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         log_data_for_finally = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "rag_query_processing_v8_0_hybrid_search",
+            "task_type": "rag_query_processing_v8_0_hybrid_search_with_intent_dispatch", # 更新任务类型以反映意图分派
             "original_user_query": query_request.query,
             "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
             "final_context_docs_full": [doc.model_dump() for doc in response_to_return.retrieved_sources] if response_to_return else [],
             "retrieval_parameters": query_request.model_dump(),
-            "processing_time_seconds": round(processing_time_seconds, 3)
+            "processing_time_seconds": round(processing_time_seconds, 3),
+            "user_intent_classified": user_intent.intent.value if user_intent else "N/A", # 添加意图分类结果
+            "user_intent_reasoning": user_intent.reasoning if user_intent else "N/A"
         }
         if exception_occurred:
             log_data_for_finally["error_details"] = f"{type(exception_occurred).__name__}: {str(exception_occurred)}"
             log_data_for_finally["error_traceback"] = traceback.format_exc()
-        
+            
         await log_queue.put(log_data_for_finally)
         
         if exception_occurred:
@@ -542,6 +644,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             response_to_return = HybridRAGResponse(answer="An unexpected error occurred during response generation.", original_query=query_request.query, retrieved_sources=[])
         
         return response_to_return
+    
     
 if __name__ == "__main__":
     uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=False)

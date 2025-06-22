@@ -1,6 +1,9 @@
-from typing import List, Dict, Any
 # from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
+# from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+# ... (文件的其余部分保持不变)
 
 # 可以将 NO_ANSWER_PHRASE_ANSWER_CLEAN 也移到这里，或者从 constants.py 导入
 NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # 保持与 llm_interface.py 一致
@@ -225,6 +228,7 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
 #     return messages
 
 
+
 # =================================================================================================
 # V2 - RAG Query Planner with Metadata Filtering Prompts
 # =================================================================================================
@@ -379,6 +383,8 @@ def get_query_expansion_messages(original_query: str) -> List[Dict[str, str]]:
     ]
     return messages
 
+
+
 def get_fusion_messages(original_query: str, fusion_context: str) -> List[Dict[str, str]]:
     """
     构建用于将多个子答案融合成一个最终报告的LLM输入messages。
@@ -457,6 +463,134 @@ irrelevant
 
     messages = [
         {"role": "system", "content": system_prompt_for_summary},
+        {"role": "user", "content": user_content}
+    ]
+    return messages
+
+
+def get_task_extraction_messages(user_query: str, llm_answer: str) -> List[Dict[str, str]]:
+    """
+    V4.4: Final refinement for task extraction prompt.
+    Adds explicit rules to prevent misinterpreting simple queries as tasks.
+    """
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    system_prompt = f"""
+你是超精准的任务信息提取AI。你的任务是分析【用户问题】和【AI的回答】，并参考【当前日期】，判断其中是否包含明确的、未来需要执行的待办事项。
+
+**当前日期**: {today_str}
+
+**核心规则:**
+1.  **识别行动意图**: 仅当对话明确指向一个**未来**的、**具体**的行动时（如“提醒我...”、“...需要提交”、“记得...做某事”），才视为任务。
+2.  **【排除规则 - 非常重要】**: 如果用户问题只是一个**单纯的查询或提问**（例如“...是什么？”、“...有多少？”、“...在哪里？”），即使它包含了时间状语（如“明天”），也**不应被视为待办任务**。查询的本质是获取信息，而非安排行动。
+3.  **提取任务细节**: 如果确定是任务，则提取`title`, `due_date`, `reminder_offset_minutes`。
+
+**输出格式:**
+你的回答**必须**是一个JSON对象。
+- **如果识别出任务**: `{{"task_found": true, "title": "任务标题", "due_date": "YYYY-MM-DD HH:MM:SS", "reminder_offset_minutes": <integer_minutes | null>}}`
+- **如果没有任务**: `{{"task_found": false, "title": null, "due_date": null, "reminder_offset_minutes": null}}`
+
+**示例:**
+
+<example>
+  <user_query>提醒我下午4点去参加项目Alpha的周会</user_query>
+  <llm_answer></llm_answer>
+  <assistant_json_output>
+  {{"task_found": true, "title": "参加项目Alpha的周会", "due_date": "{today_str} 16:00:00", "reminder_offset_minutes": null}}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>明天需要向领导汇报一下笔记本电脑的库存情况，你能帮我查一下吗？</user_query>
+  <llm_answer>笔记本电脑的库存是50台。</llm_answer>
+  <assistant_json_output>
+  {{"task_found": true, "title": "向领导汇报笔记本电脑的库存情况", "due_date": "{datetime.now().date() + timedelta(days=1)} 13:00:00", "reminder_offset_minutes": null}}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>办公椅C的库存是多少？</user_query>
+  <llm_answer>办公椅C的库存是65。</llm_answer>
+  <assistant_json_output>
+  {{"task_found": false, "title": null, "due_date": null, "reminder_offset_minutes": null}}
+  </assistant_json_output>
+</example>
+"""
+    
+    user_content = f"""
+【用户问题】: "{user_query}"
+【AI的回答】: "{llm_answer}"
+
+请根据以上对话和规则，提取任务信息并输出JSON。
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    return messages
+
+
+INTENT_CLASSIFICATION_GBNF_SCHEMA = r'''
+root   ::= object
+object ::= "{" ws "\"intent\"" ws ":" ws intent-enum ws "," ws "\"reasoning\"" ws ":" ws string ws "}"
+intent-enum ::= "\"rag_query\"" | "\"task_creation\"" | "\"mixed_intent\""
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\""
+ws ::= ([ \t\n\r])*
+'''
+
+
+def get_intent_classification_messages(user_query: str) -> List[Dict[str, str]]:
+    """
+    V4.2: Builds the LLM input messages for classifying the user's primary intent.
+    """
+    system_prompt = """
+You are a highly intelligent and efficient user intent classifier. Your sole purpose is to analyze the user's query and classify it into one of three categories: `rag_query`, `task_creation`, or `mixed_intent`.
+
+**Category Definitions:**
+- **`rag_query`**: The user is primarily asking for information, seeking knowledge, or requesting a summary from existing documents. These are classic "question answering" tasks.
+- **`task_creation`**: The user is primarily giving a command to remember something, set a reminder, or schedule a future action. This intent does not require information retrieval from the knowledge base.
+- **`mixed_intent`**: The user's query contains BOTH an informational question AND a task/reminder command.
+
+**Your Output MUST be a valid JSON object with the following structure:**
+```json
+{
+  "intent": "string, one of [rag_query, task_creation, mixed_intent]",
+  "reasoning": "string, a brief explanation for your classification choice."
+}
+```
+**No other text, explanations, or markdown formatting outside of this JSON object.**
+
+**Examples:**
+
+<example>
+  <user_query>What are the key financial highlights from the NVIDIA 2024 annual report?</user_query>
+  <assistant_json_output>
+  {"intent": "rag_query", "reasoning": "The user is asking for specific information (financial highlights) from a document (NVIDIA 2024 report)."}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>Remind me to call the finance department at 4 PM today.</user_query>
+  <assistant_json_output>
+  {"intent": "task_creation", "reasoning": "The user is giving a direct command to set a reminder for a future action, without asking for information."}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>Can you find the project summary for 'Project Alpha' and also remind me to review it tomorrow morning?</user_query>
+  <assistant_json_output>
+  {"intent": "mixed_intent", "reasoning": "The user is both asking for information (find project summary) and requesting a future action (remind me to review)."}
+  </assistant_json_output>
+</example>
+"""
+    user_content = f"""
+Analyze the following user query and provide your classification in the required JSON format.
+
+User Query: "{user_query}"
+"""
+    messages = [
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
     return messages

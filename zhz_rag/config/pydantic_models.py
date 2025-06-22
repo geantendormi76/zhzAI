@@ -1,6 +1,6 @@
 # /home/zhz/zhz_agent/zhz_rag/config/pydantic_models.py
 from pydantic import BaseModel, Field, root_validator
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union, Literal
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -38,10 +38,51 @@ class RetrievedDocument(BaseModel):
     score: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
 
+# --- V4.1: Actionable Suggestion Models ---
+class PendingTaskSuggestion(BaseModel):
+    """
+    当用户未指定提醒时间时，返回此结构，由前端引导用户确认。
+    """
+    suggestion_type: Literal["pending_confirmation"] = "pending_confirmation"
+    title: str = Field(description="The suggested title for the task.")
+    due_date: str = Field(description="The suggested due date for the task in 'YYYY-MM-DD HH:MM:SS' format.")
+    default_reminder_options: List[int] = Field(default=[10, 30, 60], description="Default reminder offsets in minutes for the UI to display.")
+
+class AutoScheduledTaskConfirmation(BaseModel):
+    """
+    当用户已明确指定提醒时间时，返回此结构，告知用户任务已自动创建。
+    """
+    suggestion_type: Literal["auto_scheduled"] = "auto_scheduled"
+    title: str = Field(description="The title of the task that was automatically created.")
+    due_date: str = Field(description="The due date of the task in 'YYYY-MM-DD HH:MM:SS' format.")
+    reminder_offset_minutes: int = Field(description="The specific reminder offset in minutes that was set based on user's request.")
+    confirmation_message: str = Field(description="A user-friendly message confirming the action.")
+
+
+# --- V4.2: User Intent Classification Models ---
+class IntentType(str, Enum):
+    """Enumeration for the classified user intent."""
+    RAG_QUERY = "rag_query"
+    TASK_CREATION = "task_creation"
+    MIXED_INTENT = "mixed_intent"
+
+class UserIntent(BaseModel):
+    """
+    Represents the classified intent of the user's query.
+    """
+    intent: IntentType = Field(description="The primary intent classified by the LLM.")
+    reasoning: str = Field(description="A brief explanation from the LLM on why it chose this intent.")
+
+
+
 class HybridRAGResponse(BaseModel):
     original_query: str
     answer: str
     retrieved_sources: List[RetrievedDocument]
+    actionable_suggestion: Optional[Union[PendingTaskSuggestion, AutoScheduledTaskConfirmation]] = Field(
+        default=None, 
+        description="An actionable task extracted from the dialogue, if any. The structure depends on whether user input is needed."
+    )
     debug_info: Optional[Dict[str, Any]] = None
 
 
@@ -77,7 +118,6 @@ class TaskModel(BaseModel):
 
     class Config:
         use_enum_values = True
-        # Pydantic v2 推荐使用 from_attributes 替代 orm_mode
         from_attributes = True
 
 
@@ -154,3 +194,4 @@ class RagQueryPlan(BaseModel):
         default_factory=dict,
         description="A ChromaDB-compatible 'where' filter for metadata-based pre-filtering of document chunks."
     )
+
