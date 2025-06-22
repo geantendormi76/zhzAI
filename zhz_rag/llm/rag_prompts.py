@@ -241,6 +241,10 @@ V2_PLANNING_PROMPT_TEMPLATE = """
 2.  `metadata_filter` (JSON对象): 一个用于ChromaDB的`where`过滤器。
     - 可用字段: `filename`, `page_number`, `paragraph_type` ('text', 'table', 'title'), `author`。
 
+## 【【【核心规则 - 必须严格遵守】】】
+1.  **文件名提取规则**: 只有当用户在问题中**明确**提到了一个带引号的文件名（例如 “年度报告.docx”）或带有文件扩展名（.pdf, .xlsx等）的文件时，你才可以在`metadata_filter`中设置`filename`字段。
+2.  **严禁猜测**: 对于所有其他情况，**严禁**猜测或编造任何文件名。如果用户没有明确提及文件名，`metadata_filter`中就**不能**包含`filename`字段，或者`filename`字段的值必须为空。
+
 ## 示例
 ### 示例 1: 普通内容查询
 用户提问: "RAG框架的核心优势是什么？"
@@ -250,6 +254,7 @@ AI输出:
     "query": "RAG框架的核心优势",
     "metadata_filter": {{}}
 }}
+```
 ### 示例 2: 带文件名和内容类型的复杂查询
 用户提问: "给我看看'年度报告.pdf'第二章关于销售分析的表格"
 AI输出:
@@ -263,7 +268,7 @@ AI输出:
         ]
     }}
 }}
-### 示例 3: 纯元数据查询 (新！)
+### 示例 3: 纯元数据查询
 用户提问: "complex_layout.docx的作者是谁？"
 AI输出:
 {{
@@ -272,11 +277,21 @@ AI输出:
         "filename": {{"$eq": "complex_layout.docx"}}
     }}
 }}
+### 示例 4: 暗示性查询 (无明确文件名)
+用户提问: "关于笔记本电脑的库存情况"
+AI输出:
+```json
+{{
+    "query": "笔记本电脑 库存",
+    "metadata_filter": {{}}
+}}
+```
 ### 用户问题
-现在，请根据以下用户提问，生成对应的JSON对象。
+现在，请根据以下用户提问和上述所有规则，生成对应的JSON对象。
 用户提问: "{user_query}"
 AI输出:
 """
+
 
 
 # 用于约束规划器输出的GBNF Schema
@@ -359,23 +374,40 @@ def get_suggestion_generation_messages(user_query: str, failure_reason: str) -> 
 
 def get_query_expansion_messages(original_query: str) -> List[Dict[str, str]]:
     """
-    构建用于将原始查询扩展为多个子问题的LLM输入messages。
+    V2: 构建用于将原始查询扩展为多个子问题的LLM输入messages。
+    此版本经过优化，旨在生成更多样化的查询，特别是简洁的关键词组合，以提升BM25检索效果。
     """
     system_prompt_for_expansion = """
-你是一个专家级的查询分析师。你的任务是根据用户提供的【原始查询】，生成3个不同但相关的子问题，以探索原始查询的不同方面，从而帮助信息检索系统找到更全面、更深入的答案。
+你是一个专家级的查询分析师。你的任务是根据用户提供的【原始查询】，生成3个不同但相关的子问题或关键词组合，以探索原始查询的不同方面，从而帮助信息检索系统找到更全面、更深入的答案。
 
-**输出要求:**
-*   你的回答【必须】是一个JSON数组（列表），其中只包含字符串（子问题）。
-*   【绝对禁止】输出任何除了这个JSON数组之外的文本、解释、对话标记或代码块。
+**生成要求:**
+1.  **多样性**: 生成的查询应涵盖不同角度，包括但不限于：
+    *   对原始问题的直接改写。
+    *   从原始问题中提取出的核心【实体】和【属性】的简洁关键词组合（例如：“笔记本电脑 库存”、“项目Alpha 状态”）。这对于关键词检索至关重要。
+    *   基于用户意图推断出的相关探索性问题。
+2.  **输出格式**: 你的回答【必须】是一个JSON对象，该对象只包含一个键`"queries"`，其值是一个包含字符串（子问题或关键词组合）的JSON数组。
+3.  **严格约束**: 【绝对禁止】输出任何除了这个JSON对象之外的文本、解释、对话标记或代码块。
 
 **示例:**
 【原始查询】: "介绍一下RAG技术及其在金融领域的应用"
 【你的JSON输出】:
-[
-  "RAG技术的基本原理和核心组件是什么？",
-  "RAG相比传统的模型微调有哪些优势和劣势？",
-  "在金融领域，RAG技术有哪些具体的应用案例，例如风险评估或智能投顾？"
-]
+```json
+{
+  "queries": [
+    "RAG技术基本原理",
+    "RAG金融领域应用案例",
+    "检索增强生成与传统微调的对比"
+  ]
+}
+【原始查询】: "笔记本电脑的库存还有多少？"
+【你的JSON输出】:
+{
+  "queries": [
+    "笔记本电脑 库存 数量",
+    "所有电脑的库存列表",
+    "如何查询电子产品库存"
+  ]
+}
 """
     messages = [
         {"role": "system", "content": system_prompt_for_expansion},
@@ -594,3 +626,13 @@ User Query: "{user_query}"
         {"role": "user", "content": user_content}
     ]
     return messages
+
+
+# --- 新增：专门用于查询扩展的GBNF Schema ---
+QUERY_EXPANSION_GBNF_SCHEMA = r'''
+root   ::= object
+object ::= "{" ws "\"queries\"" ws ":" ws array ws "}"
+array  ::= "[" ws ( string ("," ws string)* )? ws "]"
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\""
+ws ::= ([ \t\n\r])*
+'''

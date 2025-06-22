@@ -23,7 +23,7 @@ import json
 from langchain.storage import InMemoryStore
 from langchain.docstore.document import Document as LangchainDocument
 from dataclasses import dataclass, field
-
+import re
 
 # --- .env 文件加载 ---
 _current_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -339,10 +339,12 @@ app = FastAPI(
 )
 
 
+
+
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     """
-    V4.2: Handles RAG queries with an intent-dispatching mechanism.
+    V5.2: Handles RAG queries with a robust Table QA dispatch mechanism and result hydration.
     处理RAG查询请求，执行混合检索、文档重排和答案生成，并根据用户意图进行分派。
 
     Args:
@@ -358,75 +360,66 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         raise HTTPException(status_code=503, detail="RAG service or its core components are not initialized.")
 
     interaction_id_for_log = str(uuid.uuid4())
-    
-    # --- 1. 意图分类 ---
-    # 首先对用户查询进行意图分类，判断是纯粹的任务创建、RAG问答还是混合意图
-    user_intent = await classify_user_intent(app_ctx.llm_gbnf_instance, query_request.query)
-
-    if not user_intent:
-        # 如果意图分类失败，降级为标准的RAG查询流程
-        api_logger.warning("Intent classification failed. Defaulting to RAG_QUERY intent.")
-        user_intent = UserIntent(intent=IntentType.RAG_QUERY, reasoning="Classification failed, fallback.")
-
-    # --- 2. 意图分派 ---
-    
-    # 场景 A: 纯任务创建
-    # 如果意图是纯任务创建，则跳过所有RAG步骤，直接进行任务提取
-    if user_intent.intent == IntentType.TASK_CREATION:
-        api_logger.info("Intent classified as TASK_CREATION. Skipping RAG.")
-        # 直接提取任务，不进行RAG
-        task_info = await extract_task_from_dialogue(app_ctx.llm_gbnf_instance, query_request.query, "")
-        if task_info and task_info.get("task_found"):
-            # TODO: 未来这里应该调用task_manager API来实际创建任务
-            # 目前，我们只返回一个确认信息
-            return HybridRAGResponse(
-                original_query=query_request.query,
-                answer=f"好的，已为您记录待办事项：‘{task_info.get('title')}’，截止日期为 {task_info.get('due_date')}。",
-                retrieved_sources=[],
-                actionable_suggestion=None # 因为已经直接处理了
-            )
-        else:
-            return HybridRAGResponse(
-                original_query=query_request.query,
-                answer="抱歉，我理解您想创建一个任务，但未能成功提取任务信息。",
-                retrieved_sources=[],
-                actionable_suggestion=None
-            )
-
-    # 场景 B & C: RAG问答 或 混合意图
-    # 对于这两种意图，我们都需要执行完整的RAG流程
-    api_logger.info(f"Intent classified as {user_intent.intent.value}. Executing full RAG pipeline.")
-    
-    final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
-    failure_reason = ""
-    reranked_docs = []
-    exception_occurred: Optional[Exception] = None
-    response_to_return: Optional[HybridRAGResponse] = None
+    user_intent: Optional[UserIntent] = None # 初始化用户意图
 
     try:
+        # --- 1. 意图分类 ---
+        # 首先对用户查询进行意图分类，判断是纯粹的任务创建、RAG问答还是混合意图
+        user_intent = await classify_user_intent(app_ctx.llm_gbnf_instance, query_request.query)
+
+        if not user_intent:
+            # 如果意图分类失败，降级为标准的RAG查询流程
+            api_logger.warning("Intent classification failed. Defaulting to RAG_QUERY intent.")
+            user_intent = UserIntent(intent=IntentType.RAG_QUERY, reasoning="Classification failed, fallback.")
+
+        # --- 2. 意图分派 ---
+        
+        # 场景 A: 纯任务创建
+        # 如果意图是纯任务创建，则跳过所有RAG步骤，直接进行任务提取
+        if user_intent.intent == IntentType.TASK_CREATION:
+            api_logger.info("Intent classified as TASK_CREATION. Skipping RAG.")
+            # 直接提取任务，不进行RAG
+            task_info = await extract_task_from_dialogue(app_ctx.llm_gbnf_instance, query_request.query, "")
+            if task_info and task_info.get("task_found"):
+                # TODO: 未来这里应该调用task_manager API来实际创建任务
+                # 目前，我们只返回一个确认信息
+                return HybridRAGResponse(
+                    original_query=query_request.query,
+                    answer=f"好的，已为您记录待办事项：‘{task_info.get('title')}’，截止日期为 {task_info.get('due_date')}。",
+                    retrieved_sources=[],
+                    actionable_suggestion=None # 因为已经直接处理了
+                )
+            else:
+                return HybridRAGResponse(
+                    original_query=query_request.query,
+                    answer="抱歉，我理解您想创建一个任务，但未能成功提取任务信息。",
+                    retrieved_sources=[],
+                    actionable_suggestion=None
+                )
+
+        # 场景 B & C: RAG问答 或 混合意图
+        # 对于这两种意图，我们都需要执行完整的RAG流程
+        api_logger.info(f"Intent classified as {user_intent.intent.value}. Executing full RAG pipeline.")
+        
+        final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+        failure_reason = ""
+        reranked_docs = []
+        exception_occurred: Optional[Exception] = None
+        response_to_return: Optional[HybridRAGResponse] = None
+
         # 缓存逻辑
         cache_key = hashlib.md5(query_request.model_dump_json().encode('utf-8')).hexdigest()
-        cached_response = app_ctx.answer_cache.get(cache_key)
-        if cached_response is not None:
+        if (cached_response := app_ctx.answer_cache.get(cache_key)) is not None:
             return cached_response
 
-        # --- RAG 核心流程开始 (与之前版本类似) ---
+        # --- RAG 核心流程开始 ---
         # 1. 查询规划与扩展
         query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, query_request.query)
         
         # 智能查询扩展策略: 只有在查询计划没有生成具体的元数据过滤器时，才执行查询扩展。
         # 这可以防止在精确查找（如表格问答）时，通用扩展查询干扰检索结果。
-        if not query_plan.metadata_filter:
-            api_logger.info("No specific metadata filter found in plan. Performing query expansion.")
-            sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, query_request.query)
-            unique_queries = list(dict.fromkeys([query_plan.query] + sub_queries))
-
-            api_logger.info(f"DEBUG: Expanded queries generated: {unique_queries}")
-            
-        else:
-            api_logger.info("Metadata filter found in plan. Skipping query expansion to ensure precision.")
-            unique_queries = [query_plan.query]
-
+        unique_queries = [query_plan.query]
+        
         # --- 构建元数据过滤器 ---
         user_filter_conditions = query_request.filters.get("must", []) if query_request.filters else []
         llm_filter = query_plan.metadata_filter if query_plan else {}
@@ -474,110 +467,173 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         all_retrieval_results = await asyncio.gather(*(vector_retrieval_tasks + keyword_retrieval_tasks))
         
         # 分离结果
-        vector_results = all_retrieval_results[:len(vector_retrieval_tasks)]
-        keyword_results = all_retrieval_results[len(vector_retrieval_tasks):]
+        vector_results_nested = all_retrieval_results[:len(vector_retrieval_tasks)]
+        keyword_results_nested = all_retrieval_results[len(vector_retrieval_tasks):]
         
-        # --- 使用RRF融合结果 ---
-        fused_child_chunks = _fuse_results_rrf(vector_results, keyword_results)
-        
-        # --- 从融合后的子块中提取父文档 ---
-        all_parent_ids = {chunk['metadata']['parent_id'] for chunk in fused_child_chunks if 'parent_id' in chunk.get('metadata', {})}
-        parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
-        valid_parent_docs = [doc for doc in parent_docs if doc]
+        # --- 【【【新增的核心修改：结果填充】】】 ---
+        # 在融合前，为所有仅有ID的检索结果（主要是BM25）从ChromaDB中填充完整的content和metadata
+        all_retrieved_ids = set()
+        for sublist in keyword_results_nested:
+            for chunk in sublist:
+                all_retrieved_ids.add(chunk['id'])
+        # 向量检索的结果也可能不完整，也需要收集ID进行填充
+        for sublist in vector_results_nested:
+            for chunk in sublist:
+                all_retrieved_ids.add(chunk['id'])
 
-        # Stage 3: Reranking (重排)
-        reranked_docs = await app_ctx.fusion_engine.rerank_documents(
-            query=query_request.query,
-            documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="fused_retrieval") for doc in valid_parent_docs],
-            top_n=5
-        )
-
-        # Stage 4: Step-by-Step Synthesis (逐步合成答案)
-        if not reranked_docs:
-            failure_reason = "知识库中未能找到任何与您问题相关的信息。"
-        else:
-            is_table_query_top_ranked = (reranked_docs and reranked_docs[0].metadata.get("paragraph_type") == "table")
+        if all_retrieved_ids:
+            api_logger.info(f"Hydrating {len(all_retrieved_ids)} unique chunk IDs from ChromaDB...")
+            hydrated_docs_map = {}
+            # 从ChromaDB批量获取所有需要的数据
+            chroma_get_results = app_ctx.chroma_retriever._collection.get(
+                ids=list(all_retrieved_ids),
+                include=["metadatas", "documents"]
+            )
+            for i, doc_id in enumerate(chroma_get_results['ids']):
+                hydrated_docs_map[doc_id] = {
+                    "content": chroma_get_results['documents'][i],
+                    "metadata": chroma_get_results['metadatas'][i]
+                }
             
-            if is_table_query_top_ranked:
-                table_doc = reranked_docs[0]
-                key_column_for_lookup = None  # <--- 在try块外初始化
-                try:
-                    # 读取CSV格式的表格内容，处理空格和列名
-                    df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
-                    df.columns = [col.replace(" ", "").strip() for col in df.columns]
-                    # 清洗所有单元格数据中的空格
-                    for col in df.columns:
-                        if df[col].dtype == 'object': 
-                            df[col] = df[col].str.strip()
+            # 填充 BM25 结果
+            for sublist in keyword_results_nested:
+                for chunk in sublist:
+                    if chunk['id'] in hydrated_docs_map:
+                        chunk.update(hydrated_docs_map[chunk['id']])
+            
+            # 填充 Vector 结果 (以防万一它也没有完整数据)
+            for sublist in vector_results_nested:
+                for chunk in sublist:
+                    if chunk['id'] in hydrated_docs_map:
+                        chunk.update(hydrated_docs_map[chunk['id']])
+        # --- 【【【新增结束】】】 ---
 
-                    if len(df.columns) < 2:
-                        raise ValueError("Table must have at least two columns for key-value lookup.")
-                    
-                    # 生成表格查找指令
-                    instruction = await generate_table_lookup_instruction(
-                        llm_instance=app_ctx.llm_gbnf_instance,
-                        user_query=query_request.query,
-                        table_column_names=df.columns.tolist()
-                    )
 
-                    if instruction and "row_identifier" in instruction and "column_identifier" in instruction:
-                        row_id_raw = instruction.get("row_identifier", "")
-                        col_id_raw = instruction.get("column_identifier", "")
+        # --- 使用RRF融合结果 ---
+        fused_child_chunks = _fuse_results_rrf(vector_results_nested, keyword_results_nested)
+        
+        # --- 智能问答分派 ---
+        
+        # 3.1 直接从融合后的子块中寻找表格
+        table_chunk_candidate = None
+        for chunk in fused_child_chunks:
+            # 检查元数据中是否有 'table' 类型的标记
+            if chunk.get('metadata', {}).get('paragraph_type') == 'table':
+                table_chunk_candidate = chunk
+                api_logger.info(f"Found a table chunk candidate with ID {chunk.get('id')} from fused results.")
+                break # 找到第一个就优先处理
 
-                        # 尝试完全匹配
-                        result_series = df.loc[df[key_column_for_lookup] == row_id_raw, col_id_raw]
+        # 3.2 如果找到表格块，则优先执行表格问答流程
+        if table_chunk_candidate:
+            api_logger.info("Prioritizing Table QA based on a directly retrieved table chunk.")
+            # 将这个表格块作为我们唯一的上下文来源
+            table_doc = RetrievedDocument(
+                source_type=table_chunk_candidate.get("source_type", "table_chunk"),
+                content=table_chunk_candidate.get("content", ""),
+                score=table_chunk_candidate.get("score", 1.0), # 既然选中了，给个高分
+                metadata=table_chunk_candidate.get("metadata", {})
+            )
+            reranked_docs = [table_doc]
 
-                        # 如果完全匹配失败，尝试忽略大小写和空格进行模糊匹配
-                        if result_series.empty:
-                            match_condition = df[key_column_for_lookup].str.strip().str.lower().str.contains(row_id_raw.strip().lower(), na=False)
-                            result_series = df.loc[match_condition, col_id_raw]
-
-                        if not result_series.empty:
-                            value = result_series.iloc[0]
-                            final_answer = f"根据查找到的表格信息，{row_id_raw}的{col_id_raw}是{value}。"
-                        else:
-                            failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id_raw}'，或在表头中未能找到列'{col_id_raw}'。"
-                    else:
-                        failure_reason = "模型未能从问题中生成有效的表格查询指令。"
-                except Exception as e_pandas:
-                    failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
+            try:
+                # 表格内容预处理 (逻辑不变)
+                table_content_lines = table_doc.content.strip().split('\n')
+                processed_lines = [line for line in table_content_lines if not re.match(r'^\s*\|?(:?-+:?\|)+(:?-+:?)?\s*$', line)]
+                processed_table_content = "\n".join(processed_lines)
                 
-                if failure_reason: # 如果表格处理失败，则回退到文档摘要生成
-                    pass
+                api_logger.info(f"Preprocessed table content for pandas:\n{processed_table_content}")
 
-            # 如果表格处理未成功生成答案，或不是表格查询，则进行文档摘要生成
-            if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
+                df = pd.read_csv(io.StringIO(processed_table_content), sep='|', skipinitialspace=True).dropna(axis=1, how='all')
+                
+                df.columns = [str(col).strip() for col in df.iloc[0]]
+                df = df[1:].reset_index(drop=True)
+
+                for col in df.columns:
+                    if df[col].dtype == 'object': 
+                        df[col] = df[col].str.strip()
+
+                if len(df.columns) < 2: 
+                    raise ValueError("Table for QA must have at least two columns after processing.")
+                
+                key_column_for_lookup = df.columns[0]
+                api_logger.info(f"Using '{key_column_for_lookup}' as the key column for table lookup.")
+                
+                # --- 【【核心修复】】在进行字符串操作前，强制转换类型 ---
+                # 确保用于模糊匹配的键列是字符串类型，避免AttributeError
+                df[key_column_for_lookup] = df[key_column_for_lookup].astype(str)
+                # --- 【【修复结束】】 ---
+                
+                instruction = await generate_table_lookup_instruction(
+                    llm_instance=app_ctx.llm_gbnf_instance,
+                    user_query=query_request.query,
+                    table_column_names=df.columns.tolist()
+                )
+
+                if instruction and "row_identifier" in instruction and "column_identifier" in instruction:
+                    row_id_raw = instruction.get("row_identifier", "")
+                    col_id_raw = instruction.get("column_identifier", "")
+                    
+                    target_column = next((c for c in df.columns if col_id_raw.lower() in c.lower() or c.lower() in col_id_raw.lower()), None)
+                    if not target_column: 
+                        raise ValueError(f"Column '{col_id_raw}' not found in table.")
+
+                    # 现在可以安全地使用 .str.contains
+                    match_condition = df[key_column_for_lookup].str.contains(row_id_raw, case=False, na=False)
+                    result_series = df.loc[match_condition, target_column]
+
+                    if not result_series.empty:
+                        value = result_series.iloc[0]
+                        matched_row_name = df.loc[match_condition, key_column_for_lookup].iloc[0]
+                        final_answer = f"根据查找到的表格信息，'{matched_row_name}'的'{target_column}'是'{value}'。"
+                    else:
+                        failure_reason = f"在表格的'{key_column_for_lookup}'列中未能找到与'{row_id_raw}'相关的行。"
+                else:
+                    failure_reason = "模型未能从问题中生成有效的表格查询指令。"
+            except Exception as e_pandas:
+                failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
+                api_logger.error(failure_reason, exc_info=True)
+            
+            if failure_reason: # 如果表格处理失败，清空答案，让后续流程处理
+                final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+
+        # 3.3 如果没有表格或表格问答失败，则执行通用文档问答流程
+        if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
+            api_logger.info("No table answer generated. Proceeding with general document synthesis.")
+            
+            # 从融合后的子块中提取父文档
+            all_parent_ids = {chunk['metadata']['parent_id'] for chunk in fused_child_chunks if 'parent_id' in chunk.get('metadata', {})}
+            parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
+            valid_parent_docs = [doc for doc in parent_docs if doc]
+
+            # 重排所有召回的父文档
+            reranked_docs = await app_ctx.fusion_engine.rerank_documents(
+                query=query_request.query,
+                documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="fused_retrieval") for doc in valid_parent_docs],
+                top_n=5
+            )
+
+            if not reranked_docs:
+                failure_reason = "知识库中未能找到任何与您问题相关的信息。"
+            else:
                 summary_tasks = [generate_document_summary(app_ctx.llm_gbnf_instance, user_query=query_request.query, document_content=doc.content) for doc in reranked_docs]
                 summaries = await asyncio.gather(*summary_tasks)
                 
-                relevant_summaries = []
-                for doc, summary in zip(reranked_docs, summaries):
-                    if summary:
-                        filename = doc.metadata.get('filename', '未知文档')
-                        relevant_summaries.append(f"根据文档《{filename}》的信息：{summary}")
+                relevant_summaries = [f"根据文档《{doc.metadata.get('filename', '未知文档')}》的信息：{summary}" for doc, summary in zip(reranked_docs, summaries) if summary]
                 
                 if not relevant_summaries:
                     failure_reason = "虽然检索到了相关文档，但无法从中提炼出与您问题直接相关的核心信息。"
                 else:
                     fusion_context = "\n\n".join(relevant_summaries)
                     final_answer = await generate_answer_from_context(user_query=query_request.query, context_str=fusion_context, prompt_builder=lambda q, c: get_fusion_messages(q, c))
-            
-        # 如果最终答案仍为空或包含“未找到答案”短语，则尝试生成行动建议
+
+        # --- 4. 后续处理 (生成建议、提取任务等) ---
         if not final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in final_answer:
             if not failure_reason: failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
             suggestion = await generate_actionable_suggestion(app_ctx.llm_gbnf_instance, user_query=query_request.query, failure_reason=failure_reason)
             final_answer = f"{failure_reason} {suggestion}" if suggestion else failure_reason
-        
-        # --- RAG 核心流程结束 ---
 
-        # --- 3. 任务提取 (针对RAG问答和混合意图) ---
-        # 无论RAG流程是否成功，都尝试提取任务
         actionable_suggestion_response = None
-        task_info = await extract_task_from_dialogue(
-            llm_instance=app_ctx.llm_gbnf_instance,
-            user_query=query_request.query,
-            llm_answer=final_answer
-        )
+        task_info = await extract_task_from_dialogue(app_ctx.llm_gbnf_instance, user_query=query_request.query, llm_answer=final_answer)
         if task_info and task_info.get("task_found"):
             title = task_info.get("title")
             due_date = task_info.get("due_date")
@@ -608,7 +664,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             answer=final_answer,
             original_query=query_request.query,
             retrieved_sources=reranked_docs,
-            actionable_suggestion=actionable_suggestion_response # <--- 使用新构建的、结构化的响应
+            actionable_suggestion=actionable_suggestion_response
         )
 
         # 如果没有发生错误且答案有效，则将响应缓存起来
@@ -621,7 +677,8 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     finally:
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         log_data_for_finally = {
-            "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "interaction_id": interaction_id_for_log,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "task_type": "rag_query_processing_v8_0_hybrid_search_with_intent_dispatch", # 更新任务类型以反映意图分派
             "original_user_query": query_request.query,
             "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
@@ -633,7 +690,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         }
         if exception_occurred:
             log_data_for_finally["error_details"] = f"{type(exception_occurred).__name__}: {str(exception_occurred)}"
-            log_data_for_finally["error_traceback"] = traceback.format_exc()
+            log_data_for_finally["error_traceback"] = traceback.format_exc() # 确保 traceback 模块已导入
             
         await log_queue.put(log_data_for_finally)
         
@@ -644,7 +701,6 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             response_to_return = HybridRAGResponse(answer="An unexpected error occurred during response generation.", original_query=query_request.query, retrieved_sources=[])
         
         return response_to_return
-    
     
 if __name__ == "__main__":
     uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=False)

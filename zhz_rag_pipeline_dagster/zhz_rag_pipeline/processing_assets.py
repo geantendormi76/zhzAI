@@ -325,27 +325,32 @@ def clean_chunk_text_asset(
     all_chunks: List[ChunkOutput] = []
 
     for doc_idx, parsed_doc in enumerate(parsed_documents):
-        # --- START: 核心修正 - 统一提取并传递文档级元数据 ---
+        # --- START: 核心修正 - 统一提取并传递文档级元数据 (逻辑保持不变) ---
         doc_meta = parsed_doc.original_metadata
-        # 兼容 "filename" 和 "file_name" 两种常见键名
         doc_filename = doc_meta.get("filename") or doc_meta.get("file_name") or f"doc_{doc_idx}"
-        # 兼容多种可能的日期键名
         doc_creation_date = doc_meta.get("creation_date") or doc_meta.get("creation_datetime")
         doc_last_modified = doc_meta.get("last_modified") or doc_meta.get("last_modified_datetime")
         doc_author = doc_meta.get("author") or doc_meta.get("authors")
 
-        # 将所有文档级别的元数据打包成一个字典
         document_level_metadata = {
             "filename": doc_filename,
             "creation_date": doc_creation_date,
             "last_modified": doc_last_modified,
             "author": doc_author,
         }
-        # 清理掉值为None的键
         document_level_metadata = {k: v for k, v in document_level_metadata.items() if v is not None}
         
         context.log.info(f"Processing document for chunking: {doc_filename}")
         # --- END: 核心修正 ---
+
+        # --- 【【【新增的核心修改】】】构建元数据前缀 ---
+        # 将关键元数据（如文件名）格式化为一个字符串，将附加到每个块的文本内容之前。
+        # 这使得BM25等关键词检索器也能“看到”这些元数据。
+        metadata_prefix_for_text = f"[Source Document: {doc_filename}] "
+        # 还可以添加其他你认为对检索重要的元数据
+        if doc_author:
+            metadata_prefix_for_text += f"[Author: {doc_author}] "
+        # --- 【【【新增结束】】】 ---
 
         current_title_hierarchy: Dict[int, str] = {}
         doc_internal_chunk_counter = 0
@@ -353,10 +358,8 @@ def clean_chunk_text_asset(
         for element_idx, element in enumerate(parsed_doc.elements):
             parent_id = str(uuid.uuid4())
             
-            # 2. 准备基础元数据 - 现在从打包好的文档级元数据开始
-            base_chunk_meta = document_level_metadata.copy() # 每个块都继承文档级元数据
+            base_chunk_meta = document_level_metadata.copy()
             
-            # 添加元素级元数据
             element_type_str = getattr(element, 'element_type', type(element).__name__)
             base_chunk_meta.update({
                 "parent_id": parent_id,
@@ -379,7 +382,6 @@ def clean_chunk_text_asset(
                 if page_num is not None:
                     base_chunk_meta['page_number'] = page_num + 1
 
-            # 3. 对不同类型的元素进行分块
             sub_chunks: List[Dict[str, Any]] = []
             
             text_content = _get_element_text(element, context)
@@ -388,15 +390,10 @@ def clean_chunk_text_asset(
                 context.log.debug(f"Skipping element {element_idx} in {doc_filename} due to empty content.")
                 continue
 
-            # --- START: 对XLSX等文件解析出的Table文本进行特殊处理 ---
-            # 假设非TableElement的表格内容会被解析为包含'|'和换行符的普通文本
-            is_likely_table_text = '|' in text_content and '\n' in text_content
-
-            if element_type_str == "TableElement" or is_likely_table_text:
-                 # 无论元素类型是什么，只要内容像表格，就用表格分割器
-                 base_chunk_meta["paragraph_type"] = "table" # 强制将类型标准化为'table'
+            # --- 【【【修正的判断逻辑】】】 ---
+            if element_type_str == "TableElement":
+                 base_chunk_meta["paragraph_type"] = "table"
                  sub_chunks = split_markdown_table_by_rows(text_content, config.target_sentence_split_chunk_size, config.max_merged_chunk_size, context)
-            # --- END: 特殊处理 ---
             else:
                 if len(text_content) > config.max_element_text_length_before_split:
                     sentences = split_text_into_sentences(text_content)
@@ -406,7 +403,6 @@ def clean_chunk_text_asset(
                 else:
                     sub_chunks.append({"text": text_content})
 
-            # 4. 为所有生成的块创建 ChunkOutput 对象
             for sub_chunk_data in sub_chunks:
                 doc_internal_chunk_counter += 1
                 chunk_meta_final = base_chunk_meta.copy()
@@ -416,20 +412,23 @@ def clean_chunk_text_asset(
                     chunk_meta_final["table_original_start_row"] = sub_chunk_data["start_row_index"]
                     chunk_meta_final["table_original_end_row"] = sub_chunk_data["end_row_index"]
 
+                # --- 【【【新增的核心修改】】】将元数据前缀和块文本内容结合 ---
+                final_chunk_text = metadata_prefix_for_text + sub_chunk_data["text"]
+
                 all_chunks.append(ChunkOutput(
-                    chunk_text=sub_chunk_data["text"],
+                    chunk_text=final_chunk_text, # <--- 使用结合后的文本
                     source_document_id=doc_filename,
                     chunk_metadata=chunk_meta_final
                 ))
 
     context.log.info(f"Chunking process finished. Total chunks generated: {len(all_chunks)}")
     if all_chunks:
-        # 强制打印最后一个块的元数据，看filename是否存在
-        context.log.info(f"Sample final chunk metadata: {all_chunks[-1].chunk_metadata}")
+        # 强制打印最后一个块的元数据和文本，看filename是否存在
+        context.log.info(f"Sample final chunk TEXT: {all_chunks[-1].chunk_text[:300]}...")
+        context.log.info(f"Sample final chunk METADATA: {all_chunks[-1].chunk_metadata}")
     
     context.add_output_metadata(metadata={"total_chunks_generated": len(all_chunks)})
     return all_chunks
-
 
 @dg.asset(
     name="text_embeddings",

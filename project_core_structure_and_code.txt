@@ -4974,7 +4974,7 @@ NEW_KG_SCHEMA_DESCRIPTION = """
 ``` py
 # /home/zhz/zhz_agent/zhz_rag/config/pydantic_models.py
 from pydantic import BaseModel, Field, root_validator
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union, Literal
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -5012,10 +5012,51 @@ class RetrievedDocument(BaseModel):
     score: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
 
+# --- V4.1: Actionable Suggestion Models ---
+class PendingTaskSuggestion(BaseModel):
+    """
+    当用户未指定提醒时间时，返回此结构，由前端引导用户确认。
+    """
+    suggestion_type: Literal["pending_confirmation"] = "pending_confirmation"
+    title: str = Field(description="The suggested title for the task.")
+    due_date: str = Field(description="The suggested due date for the task in 'YYYY-MM-DD HH:MM:SS' format.")
+    default_reminder_options: List[int] = Field(default=[10, 30, 60], description="Default reminder offsets in minutes for the UI to display.")
+
+class AutoScheduledTaskConfirmation(BaseModel):
+    """
+    当用户已明确指定提醒时间时，返回此结构，告知用户任务已自动创建。
+    """
+    suggestion_type: Literal["auto_scheduled"] = "auto_scheduled"
+    title: str = Field(description="The title of the task that was automatically created.")
+    due_date: str = Field(description="The due date of the task in 'YYYY-MM-DD HH:MM:SS' format.")
+    reminder_offset_minutes: int = Field(description="The specific reminder offset in minutes that was set based on user's request.")
+    confirmation_message: str = Field(description="A user-friendly message confirming the action.")
+
+
+# --- V4.2: User Intent Classification Models ---
+class IntentType(str, Enum):
+    """Enumeration for the classified user intent."""
+    RAG_QUERY = "rag_query"
+    TASK_CREATION = "task_creation"
+    MIXED_INTENT = "mixed_intent"
+
+class UserIntent(BaseModel):
+    """
+    Represents the classified intent of the user's query.
+    """
+    intent: IntentType = Field(description="The primary intent classified by the LLM.")
+    reasoning: str = Field(description="A brief explanation from the LLM on why it chose this intent.")
+
+
+
 class HybridRAGResponse(BaseModel):
     original_query: str
     answer: str
     retrieved_sources: List[RetrievedDocument]
+    actionable_suggestion: Optional[Union[PendingTaskSuggestion, AutoScheduledTaskConfirmation]] = Field(
+        default=None, 
+        description="An actionable task extracted from the dialogue, if any. The structure depends on whether user input is needed."
+    )
     debug_info: Optional[Dict[str, Any]] = None
 
 
@@ -5051,7 +5092,6 @@ class TaskModel(BaseModel):
 
     class Config:
         use_enum_values = True
-        # Pydantic v2 推荐使用 from_attributes 替代 orm_mode
         from_attributes = True
 
 
@@ -6949,6 +6989,12 @@ class FileBM25Retriever:
 ```
 
     |-- rag_eval_data/
+    |-- 1.py
+
+``` py
+
+```
+
     |-- __init__.py
 
 ``` py
@@ -7536,7 +7582,7 @@ from pydantic import ValidationError
 from zhz_rag.utils.interaction_logger import log_interaction_data # 导入修复后的健壮日志函数
 from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION # <--- 确保导入这个常量
 
-from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, RagQueryPlan
+from zhz_rag.config.pydantic_models import ExtractedEntitiesAndRelationIntent, RagQueryPlan, UserIntent # <--- 新增导入
 # 提示词导入
 from llama_cpp import Llama, LlamaGrammar 
 from zhz_rag.llm.rag_prompts import (
@@ -7546,9 +7592,11 @@ from zhz_rag.llm.rag_prompts import (
     get_suggestion_generation_messages,
     get_fusion_messages,
     get_document_summary_messages,
-    get_task_extraction_messages,  # <--- 新增导入
+    get_task_extraction_messages,
     V2_PLANNING_PROMPT_TEMPLATE,
-    V2_PLANNING_GBNF_SCHEMA      # <--- 新增导入
+    V2_PLANNING_GBNF_SCHEMA,
+    get_intent_classification_messages,   
+    INTENT_CLASSIFICATION_GBNF_SCHEMA   
 )
 import logging
 import re
@@ -8308,6 +8356,43 @@ async def call_local_llm_with_gbnf(
     return raw_llm_output_text
 
 
+
+async def classify_user_intent(llm_instance: Llama, user_query: str) -> Optional[UserIntent]:
+    """
+    V4.2: Classifies the user's intent using a dedicated prompt and GBNF schema.
+    """
+    llm_py_logger.info(f"Classifying intent for query: '{user_query[:100]}...'")
+
+    messages = get_intent_classification_messages(user_query)
+    full_prompt = "".join([f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages])
+    full_prompt += "<|im_start|>assistant\n"
+
+    llm_response_str = await call_local_llm_with_gbnf(
+        llm_instance=llm_instance,
+        full_prompt=full_prompt,
+        grammar_str=INTENT_CLASSIFICATION_GBNF_SCHEMA,
+        temperature=0.0,
+        max_tokens=256,
+        task_type="intent_classification",
+        user_query_for_log=user_query
+    )
+
+    if not llm_response_str:
+        llm_py_logger.warning("LLM call for intent classification returned no response.")
+        return None
+
+    try:
+        parsed_data = json.loads(llm_response_str.strip())
+        intent_obj = UserIntent(**parsed_data)
+        llm_py_logger.info(f"Successfully classified intent: {intent_obj.intent.value}")
+        return intent_obj
+    except (json.JSONDecodeError, ValidationError) as e:
+        llm_py_logger.error(f"Failed to parse or validate intent classification JSON. Error: {e}. Raw: '{llm_response_str}'", exc_info=True)
+        return None
+
+
+
+
 async def generate_query_plan(llm_instance: Llama, user_query: str) -> Optional[RagQueryPlan]:
     """
     Analyzes the user query and generates a structured plan for retrieval,
@@ -8553,6 +8638,60 @@ async def generate_document_summary(llm_instance: Llama, user_query: str, docume
     return document_content[:500] + "..."
 
 
+
+async def extract_task_from_dialogue(
+    llm_instance: Llama,
+    user_query: str,
+    llm_answer: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Analyzes a user query and the system's answer to extract a potential actionable task.
+    Uses GBNF for reliable JSON output.
+
+    Args:
+        llm_instance: An initialized Llama model instance for GBNF-constrained generation.
+        user_query: The original query from the user.
+        llm_answer: The final answer generated by the RAG system.
+
+    Returns:
+        A dictionary containing the task information (e.g., {"task_found": true, "title": ..., "due_date": ...})
+        or None if an error occurs.
+    """
+    llm_py_logger.info(f"Attempting to extract actionable task from dialogue...")
+
+    # 1. 使用 prompt 模板构建完整的 prompt
+    messages = get_task_extraction_messages(user_query, llm_answer)
+    # 将 messages 列表转换为单个字符串 prompt
+    full_prompt = "".join([f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages])
+    full_prompt += "<|im_start|>assistant\n"
+
+    # 2. 调用 GBNF 约束的 LLM
+    llm_response_str = await call_local_llm_with_gbnf(
+        llm_instance=llm_instance,
+        full_prompt=full_prompt,
+        grammar_str=V2_PLANNING_GBNF_SCHEMA,  # <--- 核心修正：使用正确的、已导入的Schema
+        temperature=0.0,
+        max_tokens=256,
+        task_type="task_extraction_from_dialogue",
+        user_query_for_log=user_query
+    )
+
+    if not llm_response_str:
+        llm_py_logger.warning("LLM call for task extraction returned no response.")
+        return None
+
+    # 3. 解析 JSON 结果
+    try:
+        task_data = json.loads(llm_response_str.strip())
+        if isinstance(task_data, dict) and "task_found" in task_data:
+            llm_py_logger.info(f"Task extraction result: {task_data}")
+            return task_data
+        else:
+            llm_py_logger.warning(f"Task extraction JSON is malformed: {task_data}")
+            return None
+    except json.JSONDecodeError:
+        llm_py_logger.error(f"Failed to decode JSON from task extraction LLM output: '{llm_response_str}'")
+        return None
 ```
 
     |-- local_model_handler.py
@@ -8676,9 +8815,12 @@ class LlamaCppEmbeddingFunction: # 这个类将作为 "model_handler"
     |-- rag_prompts.py
 
 ``` py
-from typing import List, Dict, Any
 # from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
+# from zhz_rag.config.constants import NEW_KG_SCHEMA_DESCRIPTION
+# ... (文件的其余部分保持不变)
 
 # 可以将 NO_ANSWER_PHRASE_ANSWER_CLEAN 也移到这里，或者从 constants.py 导入
 NO_ANSWER_PHRASE_ANSWER_CLEAN = "根据目前提供的资料，我无法找到关于您问题的明确信息。" # 保持与 llm_interface.py 一致
@@ -8903,6 +9045,7 @@ def get_clarification_question_messages(original_query: str, uncertainty_reason:
 #     return messages
 
 
+
 # =================================================================================================
 # V2 - RAG Query Planner with Metadata Filtering Prompts
 # =================================================================================================
@@ -9057,6 +9200,8 @@ def get_query_expansion_messages(original_query: str) -> List[Dict[str, str]]:
     ]
     return messages
 
+
+
 def get_fusion_messages(original_query: str, fusion_context: str) -> List[Dict[str, str]]:
     """
     构建用于将多个子答案融合成一个最终报告的LLM输入messages。
@@ -9139,46 +9284,52 @@ irrelevant
     ]
     return messages
 
+
 def get_task_extraction_messages(user_query: str, llm_answer: str) -> List[Dict[str, str]]:
     """
-    构建用于从对话中提取待办任务信息的LLM输入消息。
-
-    Args:
-        user_query: 用户的原始查询。
-        llm_answer: RAG系统生成的最终答案。
-
-    Returns:
-        一个符合OpenAI聊天格式的消息列表。
+    V4.4: Final refinement for task extraction prompt.
+    Adds explicit rules to prevent misinterpreting simple queries as tasks.
     """
-    system_prompt = """
-你是一个精准的任务信息提取AI。你的任务是分析【用户问题】和【AI的回答】，判断其中是否包含一个明确的、未来需要执行的待办事项或截止日期。
+    today_str = datetime.now().strftime('%Y-%m-%d')
 
-**提取规则:**
-1.  **识别行动意图**: 只有当对话内容明确指向一个**未来**的、**具体**的行动时（如“提交报告”、“回电话”、“准备会议”），才视为一个任务。
-2.  **提取任务标题 (title)**: 从对话中提炼出一个简洁、明确的任务标题。
-3.  **提取截止日期 (due_date)**: 如果对话中提到了明确的日期或时间（如“明天下午3点”、“7月31日”），请将其提取出来，并转换为 `YYYY-MM-DD HH:MM:SS` 的标准格式。如果只提到了日期，时间部分可以用 `09:00:00`（上午9点）作为默认。
-4.  **无任务情况**: 如果对话内容只是信息查询、事实陈述或已完成的事件，则不应提取任何任务。
+    system_prompt = f"""
+你是超精准的任务信息提取AI。你的任务是分析【用户问题】和【AI的回答】，并参考【当前日期】，判断其中是否包含明确的、未来需要执行的待办事项。
+
+**当前日期**: {today_str}
+
+**核心规则:**
+1.  **识别行动意图**: 仅当对话明确指向一个**未来**的、**具体**的行动时（如“提醒我...”、“...需要提交”、“记得...做某事”），才视为任务。
+2.  **【排除规则 - 非常重要】**: 如果用户问题只是一个**单纯的查询或提问**（例如“...是什么？”、“...有多少？”、“...在哪里？”），即使它包含了时间状语（如“明天”），也**不应被视为待办任务**。查询的本质是获取信息，而非安排行动。
+3.  **提取任务细节**: 如果确定是任务，则提取`title`, `due_date`, `reminder_offset_minutes`。
 
 **输出格式:**
 你的回答**必须**是一个JSON对象。
-- 如果识别出任务，JSON结构为: `{"task_found": true, "title": "任务标题", "due_date": "YYYY-MM-DD HH:MM:SS"}`
-- 如果没有识别出任何任务，JSON结构为: `{"task_found": false, "title": null, "due_date": null}`
+- **如果识别出任务**: `{{"task_found": true, "title": "任务标题", "due_date": "YYYY-MM-DD HH:MM:SS", "reminder_offset_minutes": <integer_minutes | null>}}`
+- **如果没有任务**: `{{"task_found": false, "title": null, "due_date": null, "reminder_offset_minutes": null}}`
 
 **示例:**
 
 <example>
-  <user_query>项目Alpha的报告什么时候要交？</user_query>
-  <llm_answer>项目Alpha的报告需要在下周五（2025年6月28日）之前提交。</llm_answer>
+  <user_query>提醒我下午4点去参加项目Alpha的周会</user_query>
+  <llm_answer></llm_answer>
   <assistant_json_output>
-  {"task_found": true, "title": "提交项目Alpha的报告", "due_date": "2025-06-28 09:00:00"}
+  {{"task_found": true, "title": "参加项目Alpha的周会", "due_date": "{today_str} 16:00:00", "reminder_offset_minutes": null}}
   </assistant_json_output>
 </example>
 
 <example>
-  <user_query>去年我们公司的销售额是多少？</user_query>
-  <llm_answer>去年我们公司的总销售额是500万元。</llm_answer>
+  <user_query>明天需要向领导汇报一下笔记本电脑的库存情况，你能帮我查一下吗？</user_query>
+  <llm_answer>笔记本电脑的库存是50台。</llm_answer>
   <assistant_json_output>
-  {"task_found": false, "title": null, "due_date": null}
+  {{"task_found": true, "title": "向领导汇报笔记本电脑的库存情况", "due_date": "{datetime.now().date() + timedelta(days=1)} 13:00:00", "reminder_offset_minutes": null}}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>办公椅C的库存是多少？</user_query>
+  <llm_answer>办公椅C的库存是65。</llm_answer>
+  <assistant_json_output>
+  {{"task_found": false, "title": null, "due_date": null, "reminder_offset_minutes": null}}
   </assistant_json_output>
 </example>
 """
@@ -9187,7 +9338,7 @@ def get_task_extraction_messages(user_query: str, llm_answer: str) -> List[Dict[
 【用户问题】: "{user_query}"
 【AI的回答】: "{llm_answer}"
 
-请根据以上对话，提取任务信息并输出JSON。
+请根据以上对话和规则，提取任务信息并输出JSON。
 """
 
     messages = [
@@ -9196,6 +9347,70 @@ def get_task_extraction_messages(user_query: str, llm_answer: str) -> List[Dict[
     ]
     return messages
 
+
+INTENT_CLASSIFICATION_GBNF_SCHEMA = r'''
+root   ::= object
+object ::= "{" ws "\"intent\"" ws ":" ws intent-enum ws "," ws "\"reasoning\"" ws ":" ws string ws "}"
+intent-enum ::= "\"rag_query\"" | "\"task_creation\"" | "\"mixed_intent\""
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\""
+ws ::= ([ \t\n\r])*
+'''
+
+
+def get_intent_classification_messages(user_query: str) -> List[Dict[str, str]]:
+    """
+    V4.2: Builds the LLM input messages for classifying the user's primary intent.
+    """
+    system_prompt = """
+You are a highly intelligent and efficient user intent classifier. Your sole purpose is to analyze the user's query and classify it into one of three categories: `rag_query`, `task_creation`, or `mixed_intent`.
+
+**Category Definitions:**
+- **`rag_query`**: The user is primarily asking for information, seeking knowledge, or requesting a summary from existing documents. These are classic "question answering" tasks.
+- **`task_creation`**: The user is primarily giving a command to remember something, set a reminder, or schedule a future action. This intent does not require information retrieval from the knowledge base.
+- **`mixed_intent`**: The user's query contains BOTH an informational question AND a task/reminder command.
+
+**Your Output MUST be a valid JSON object with the following structure:**
+```json
+{
+  "intent": "string, one of [rag_query, task_creation, mixed_intent]",
+  "reasoning": "string, a brief explanation for your classification choice."
+}
+```
+**No other text, explanations, or markdown formatting outside of this JSON object.**
+
+**Examples:**
+
+<example>
+  <user_query>What are the key financial highlights from the NVIDIA 2024 annual report?</user_query>
+  <assistant_json_output>
+  {"intent": "rag_query", "reasoning": "The user is asking for specific information (financial highlights) from a document (NVIDIA 2024 report)."}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>Remind me to call the finance department at 4 PM today.</user_query>
+  <assistant_json_output>
+  {"intent": "task_creation", "reasoning": "The user is giving a direct command to set a reminder for a future action, without asking for information."}
+  </assistant_json_output>
+</example>
+
+<example>
+  <user_query>Can you find the project summary for 'Project Alpha' and also remind me to review it tomorrow morning?</user_query>
+  <assistant_json_output>
+  {"intent": "mixed_intent", "reasoning": "The user is both asking for information (find project summary) and requesting a future action (remind me to review)."}
+  </assistant_json_output>
+</example>
+"""
+    user_content = f"""
+Analyze the following user query and provide your classification in the required JSON format.
+
+User Query: "{user_query}"
+"""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    return messages
 
 ```
 
@@ -10044,6 +10259,7 @@ if __name__ == "__main__":
         |-- rag_interactions_20250619.jsonl
         |-- rag_interactions_20250620.jsonl
         |-- rag_interactions_20250621.jsonl
+        |-- rag_interactions_20250622.jsonl
         |-- eval_results_answer_gemini_flash_20250621.jsonl
         |-- abef57e9-85f2-45a6-88f2-96578bb2b80f/
         |-- chroma.sqlite3
@@ -11833,16 +12049,27 @@ else:
     load_dotenv()
 
 # --- 导入我们自己的模块 ---
-from zhz_rag.config.pydantic_models import QueryRequest, HybridRAGResponse, RetrievedDocument
+from zhz_rag.config.pydantic_models import (
+    QueryRequest,
+    HybridRAGResponse,
+    RetrievedDocument,
+    PendingTaskSuggestion,
+    AutoScheduledTaskConfirmation,
+    UserIntent,                     # <--- 新增导入
+    IntentType                      # <--- 新增导入
+)
 from zhz_rag.llm.llm_interface import (
     generate_answer_from_context,
     generate_query_plan,
     generate_table_lookup_instruction,
     generate_actionable_suggestion,
     generate_expanded_queries,
-    generate_document_summary, 
+    generate_document_summary,
+    extract_task_from_dialogue,
+    classify_user_intent,           # <--- 新增导入
     NO_ANSWER_PHRASE_ANSWER_CLEAN
 )
+
 from zhz_rag.utils.hardware_manager import HardwareManager
 
 from zhz_rag.llm.rag_prompts import get_answer_generation_messages, get_table_qa_messages, get_fusion_messages
@@ -12129,21 +12356,64 @@ app = FastAPI(
 @app.post("/api/v1/rag/query", response_model=HybridRAGResponse)
 async def query_rag_endpoint(request: Request, query_request: QueryRequest):
     """
-    处理RAG查询请求，执行混合检索、文档重排和答案生成。
+    V4.2: Handles RAG queries with an intent-dispatching mechanism.
+    处理RAG查询请求，执行混合检索、文档重排和答案生成，并根据用户意图进行分派。
 
     Args:
         request: FastAPI请求对象。
         query_request: 包含用户查询和检索参数的请求体。
 
     Returns:
-        HybridRAGResponse: 包含生成的答案和检索到的源文档。
+        HybridRAGResponse: 包含生成的答案和检索到的源文档，以及可能的行动建议。
     """
     start_time_total = datetime.now(timezone.utc)
     app_ctx: RAGAppContext = request.app.state.rag_context
-    if not app_ctx or not app_ctx.llm_gbnf_instance or not app_ctx.fusion_engine:
+    if not app_ctx or not app_ctx.llm_gbnf_instance:
         raise HTTPException(status_code=503, detail="RAG service or its core components are not initialized.")
 
     interaction_id_for_log = str(uuid.uuid4())
+    
+    # --- 1. 意图分类 ---
+    # 首先对用户查询进行意图分类，判断是纯粹的任务创建、RAG问答还是混合意图
+    user_intent = await classify_user_intent(app_ctx.llm_gbnf_instance, query_request.query)
+
+    if not user_intent:
+        # 如果意图分类失败，降级为标准的RAG查询流程
+        api_logger.warning("Intent classification failed. Defaulting to RAG_QUERY intent.")
+        user_intent = UserIntent(intent=IntentType.RAG_QUERY, reasoning="Classification failed, fallback.")
+
+    # --- 2. 意图分派 ---
+    
+    # 场景 A: 纯任务创建
+    # 如果意图是纯任务创建，则跳过所有RAG步骤，直接进行任务提取
+    if user_intent.intent == IntentType.TASK_CREATION:
+        api_logger.info("Intent classified as TASK_CREATION. Skipping RAG.")
+        # 直接提取任务，不进行RAG
+        task_info = await extract_task_from_dialogue(app_ctx.llm_gbnf_instance, query_request.query, "")
+        if task_info and task_info.get("task_found"):
+            # TODO: 未来这里应该调用task_manager API来实际创建任务
+            # 目前，我们只返回一个确认信息
+            return HybridRAGResponse(
+                original_query=query_request.query,
+                answer=f"好的，已为您记录待办事项：‘{task_info.get('title')}’，截止日期为 {task_info.get('due_date')}。",
+                retrieved_sources=[],
+                actionable_suggestion=None # 因为已经直接处理了
+            )
+        else:
+            return HybridRAGResponse(
+                original_query=query_request.query,
+                answer="抱歉，我理解您想创建一个任务，但未能成功提取任务信息。",
+                retrieved_sources=[],
+                actionable_suggestion=None
+            )
+
+    # 场景 B & C: RAG问答 或 混合意图
+    # 对于这两种意图，我们都需要执行完整的RAG流程
+    api_logger.info(f"Intent classified as {user_intent.intent.value}. Executing full RAG pipeline.")
+    
+    final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
+    failure_reason = ""
+    reranked_docs = []
     exception_occurred: Optional[Exception] = None
     response_to_return: Optional[HybridRAGResponse] = None
 
@@ -12154,21 +12424,23 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         if cached_response is not None:
             return cached_response
 
+        # --- RAG 核心流程开始 (与之前版本类似) ---
         # 1. 查询规划与扩展
         query_plan = await generate_query_plan(app_ctx.llm_gbnf_instance, query_request.query)
         
-        # --- 智能查询扩展策略 ---
-        # 只有在查询计划没有生成具体的元数据过滤器时，才执行查询扩展。
+        # 智能查询扩展策略: 只有在查询计划没有生成具体的元数据过滤器时，才执行查询扩展。
         # 这可以防止在精确查找（如表格问答）时，通用扩展查询干扰检索结果。
         if not query_plan.metadata_filter:
             api_logger.info("No specific metadata filter found in plan. Performing query expansion.")
             sub_queries = await generate_expanded_queries(app_ctx.llm_gbnf_instance, query_request.query)
             unique_queries = list(dict.fromkeys([query_plan.query] + sub_queries))
+
+            api_logger.info(f"DEBUG: Expanded queries generated: {unique_queries}")
+            
         else:
             api_logger.info("Metadata filter found in plan. Skipping query expansion to ensure precision.")
             unique_queries = [query_plan.query]
 
-            
         # --- 构建元数据过滤器 ---
         user_filter_conditions = query_request.filters.get("must", []) if query_request.filters else []
         llm_filter = query_plan.metadata_filter if query_plan else {}
@@ -12210,7 +12482,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                 ) for q in unique_queries
             ]
         else:
-            pass
+            pass # BM25检索器未初始化，跳过关键词检索
 
         # 等待所有检索任务完成
         all_retrieval_results = await asyncio.gather(*(vector_retrieval_tasks + keyword_retrieval_tasks))
@@ -12227,18 +12499,14 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         parent_docs = app_ctx.docstore.mget(list(all_parent_ids))
         valid_parent_docs = [doc for doc in parent_docs if doc]
 
-        # --- 后续步骤（重排、生成答案等）保持不变，但使用融合后的结果 ---
-        # Stage 3: Reranking
+        # Stage 3: Reranking (重排)
         reranked_docs = await app_ctx.fusion_engine.rerank_documents(
             query=query_request.query,
             documents=[RetrievedDocument(content=doc.page_content, metadata=doc.metadata, score=0.0, source_type="fused_retrieval") for doc in valid_parent_docs],
             top_n=5
         )
 
-        # --- Stage 4: Step-by-Step Synthesis ---
-        final_answer = NO_ANSWER_PHRASE_ANSWER_CLEAN
-        failure_reason = ""
-        
+        # Stage 4: Step-by-Step Synthesis (逐步合成答案)
         if not reranked_docs:
             failure_reason = "知识库中未能找到任何与您问题相关的信息。"
         else:
@@ -12246,7 +12514,9 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             
             if is_table_query_top_ranked:
                 table_doc = reranked_docs[0]
+                key_column_for_lookup = None  # <--- 在try块外初始化
                 try:
+                    # 读取CSV格式的表格内容，处理空格和列名
                     df = pd.read_csv(io.StringIO(table_doc.content), sep='|', skipinitialspace=True).dropna(axis=1, how='all').iloc[1:]
                     df.columns = [col.replace(" ", "").strip() for col in df.columns]
                     # 清洗所有单元格数据中的空格
@@ -12257,7 +12527,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     if len(df.columns) < 2:
                         raise ValueError("Table must have at least two columns for key-value lookup.")
                     
-                    key_column_for_lookup = df.columns[1]
+                    # 生成表格查找指令
                     instruction = await generate_table_lookup_instruction(
                         llm_instance=app_ctx.llm_gbnf_instance,
                         user_query=query_request.query,
@@ -12280,15 +12550,16 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                             value = result_series.iloc[0]
                             final_answer = f"根据查找到的表格信息，{row_id_raw}的{col_id_raw}是{value}。"
                         else:
-                             failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id_raw}'，或在表头中未能找到列'{col_id_raw}'。"
+                            failure_reason = f"模型指令无法执行：在表格的'{key_column_for_lookup}'列中未能找到行'{row_id_raw}'，或在表头中未能找到列'{col_id_raw}'。"
                     else:
                         failure_reason = "模型未能从问题中生成有效的表格查询指令。"
                 except Exception as e_pandas:
                     failure_reason = f"处理表格数据时遇到代码错误: {e_pandas}"
                 
-                if failure_reason:
+                if failure_reason: # 如果表格处理失败，则回退到文档摘要生成
                     pass
 
+            # 如果表格处理未成功生成答案，或不是表格查询，则进行文档摘要生成
             if final_answer == NO_ANSWER_PHRASE_ANSWER_CLEAN:
                 summary_tasks = [generate_document_summary(app_ctx.llm_gbnf_instance, user_query=query_request.query, document_content=doc.content) for doc in reranked_docs]
                 summaries = await asyncio.gather(*summary_tasks)
@@ -12305,14 +12576,59 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
                     fusion_context = "\n\n".join(relevant_summaries)
                     final_answer = await generate_answer_from_context(user_query=query_request.query, context_str=fusion_context, prompt_builder=lambda q, c: get_fusion_messages(q, c))
             
+        # 如果最终答案仍为空或包含“未找到答案”短语，则尝试生成行动建议
         if not final_answer or NO_ANSWER_PHRASE_ANSWER_CLEAN in final_answer:
             if not failure_reason: failure_reason = "根据检索到的上下文信息，无法直接回答您的问题。"
             suggestion = await generate_actionable_suggestion(app_ctx.llm_gbnf_instance, user_query=query_request.query, failure_reason=failure_reason)
             final_answer = f"{failure_reason} {suggestion}" if suggestion else failure_reason
+        
+        # --- RAG 核心流程结束 ---
 
-        response_to_return = HybridRAGResponse(answer=final_answer, original_query=query_request.query, retrieved_sources=reranked_docs)
+        # --- 3. 任务提取 (针对RAG问答和混合意图) ---
+        # 无论RAG流程是否成功，都尝试提取任务
+        actionable_suggestion_response = None
+        task_info = await extract_task_from_dialogue(
+            llm_instance=app_ctx.llm_gbnf_instance,
+            user_query=query_request.query,
+            llm_answer=final_answer
+        )
+        if task_info and task_info.get("task_found"):
+            title = task_info.get("title")
+            due_date = task_info.get("due_date")
+            reminder_offset = task_info.get("reminder_offset_minutes")
+
+            if title and due_date:
+                if reminder_offset is not None:
+                    # 用户明确指定了提醒时间 -> 自动创建并返回确认信息
+                    # TODO: 此处未来应调用 task_manager API 来实际创建任务
+                    confirmation_msg = f"已为您自动创建任务“{title}”，并将在截止时间前 {reminder_offset} 分钟提醒您。"
+                    actionable_suggestion_response = AutoScheduledTaskConfirmation(
+                        title=title,
+                        due_date=due_date,
+                        reminder_offset_minutes=reminder_offset,
+                        confirmation_message=confirmation_msg
+                    )
+                    api_logger.info(f"Generated AutoScheduledTaskConfirmation for the user.")
+                else:
+                    # 用户未指定提醒时间 -> 返回待确认建议
+                    actionable_suggestion_response = PendingTaskSuggestion(
+                        title=title,
+                        due_date=due_date
+                    )
+                    api_logger.info(f"Generated PendingTaskSuggestion for the user.")
+
+        # --- 4. 构建最终响应 ---
+        response_to_return = HybridRAGResponse(
+            answer=final_answer,
+            original_query=query_request.query,
+            retrieved_sources=reranked_docs,
+            actionable_suggestion=actionable_suggestion_response # <--- 使用新构建的、结构化的响应
+        )
+
+        # 如果没有发生错误且答案有效，则将响应缓存起来
         if not failure_reason and NO_ANSWER_PHRASE_ANSWER_CLEAN not in final_answer:
             app_ctx.answer_cache[cache_key] = response_to_return
+
     except Exception as e:
         exception_occurred = e
         response_to_return = HybridRAGResponse(answer=f"An internal server error occurred: {e}", original_query=query_request.query, retrieved_sources=[])
@@ -12320,17 +12636,19 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
         processing_time_seconds = (datetime.now(timezone.utc) - start_time_total).total_seconds()
         log_data_for_finally = {
             "interaction_id": interaction_id_for_log, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "task_type": "rag_query_processing_v8_0_hybrid_search",
+            "task_type": "rag_query_processing_v8_0_hybrid_search_with_intent_dispatch", # 更新任务类型以反映意图分派
             "original_user_query": query_request.query,
             "final_answer_from_llm": response_to_return.answer if response_to_return else "N/A",
             "final_context_docs_full": [doc.model_dump() for doc in response_to_return.retrieved_sources] if response_to_return else [],
             "retrieval_parameters": query_request.model_dump(),
-            "processing_time_seconds": round(processing_time_seconds, 3)
+            "processing_time_seconds": round(processing_time_seconds, 3),
+            "user_intent_classified": user_intent.intent.value if user_intent else "N/A", # 添加意图分类结果
+            "user_intent_reasoning": user_intent.reasoning if user_intent else "N/A"
         }
         if exception_occurred:
             log_data_for_finally["error_details"] = f"{type(exception_occurred).__name__}: {str(exception_occurred)}"
             log_data_for_finally["error_traceback"] = traceback.format_exc()
-        
+            
         await log_queue.put(log_data_for_finally)
         
         if exception_occurred:
@@ -12340,6 +12658,7 @@ async def query_rag_endpoint(request: Request, query_request: QueryRequest):
             response_to_return = HybridRAGResponse(answer="An unexpected error occurred during response generation.", original_query=query_request.query, retrieved_sources=[])
         
         return response_to_return
+    
     
 if __name__ == "__main__":
     uvicorn.run("zhz_rag.api.rag_api_service:app", host="0.0.0.0", port=8081, reload=False)

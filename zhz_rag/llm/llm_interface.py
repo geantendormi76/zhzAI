@@ -882,6 +882,10 @@ TABLE_QA_INSTRUCTION_PROMPT_TEMPLATE = """
 # 指令
 你是一个专门从用户问题中提取表格查询指令的AI。你的唯一任务是分析【用户问题】和【表格列名】，然后输出一个包含`row_identifier`和`column_identifier`的JSON对象。
 
+## 规则
+- `row_identifier`: 必须是用户问题中提到的、用于定位**某一行**的具体名称或值。
+- `column_identifier`: 必须是用户问题中提到的、用于定位**某一列**的列名。
+
 ## 表格信息
 【表格列名】: {column_names}
 
@@ -895,7 +899,13 @@ TABLE_QA_INSTRUCTION_PROMPT_TEMPLATE = """
   "row_identifier": "string, 用户问题中提到的具体行名",
   "column_identifier": "string, 用户问题中提到的具体列名"
 }}
-```
+示例
+用户问题: "笔记本电脑A的库存是多少？"
+你的JSON输出:
+{{
+  "row_identifier": "笔记本电脑A",
+  "column_identifier": "库存"
+}}
 你的JSON输出:
 """
 # 使用主项目中已验证过的、最健壮的通用JSON GBNF Schema
@@ -968,13 +978,13 @@ async def generate_actionable_suggestion(llm_instance: Llama, user_query: str, f
 
 async def generate_expanded_queries(llm_instance: Llama, original_query: str) -> List[str]:
     """
-    Expands a single user query into multiple related sub-queries to enhance retrieval coverage.
-    Uses GBNF for reliable JSON output and caches the results.
-    V2: Enhanced parsing to handle malformed JSON from the LLM.
+    V3: Expands a single user query into multiple related sub-queries to enhance retrieval coverage.
+    Uses a dedicated, stricter GBNF schema and improved parsing logic.
     """
     llm_py_logger.info(f"Attempting to generate expanded queries for: '{original_query}'")
     
-    from .rag_prompts import get_query_expansion_messages, V2_PLANNING_GBNF_SCHEMA 
+    # --- 修改: 导入新的 Prompt 函数和 GBNF Schema ---
+    from .rag_prompts import get_query_expansion_messages, QUERY_EXPANSION_GBNF_SCHEMA 
 
     messages = get_query_expansion_messages(original_query)
     
@@ -984,13 +994,12 @@ async def generate_expanded_queries(llm_instance: Llama, original_query: str) ->
     llm_response_str = await call_local_llm_with_gbnf(
         llm_instance=llm_instance,
         full_prompt=full_prompt,
-        grammar_str=V2_PLANNING_GBNF_SCHEMA,
+        grammar_str=QUERY_EXPANSION_GBNF_SCHEMA, # <--- 修改: 使用新的、更严格的 GBNF Schema
         temperature=0.6,
         max_tokens=1024,
-        task_type="query_expansion_gbnf",
+        task_type="query_expansion_gbnf_v2", # 更新任务类型
         user_query_for_log=original_query
     )
-
 
     expanded_queries = []
     if llm_response_str:
@@ -998,41 +1007,20 @@ async def generate_expanded_queries(llm_instance: Llama, original_query: str) ->
         try:
             parsed_data = json.loads(cleaned_response)
             
-            if isinstance(parsed_data, list):
-                expanded_queries = [q for q in parsed_data if isinstance(q, str)]
-            elif isinstance(parsed_data, dict):
-                # --- 新增的“特种手术”解析逻辑 ---
-                # 尝试将字典的键作为JSON数组进行解析
-                for key, value in parsed_data.items():
-                    if isinstance(key, str) and key.strip().startswith('[') and key.strip().endswith(']'):
-                        try:
-                            # 找到了! 那个作为键的JSON数组字符串
-                            potential_queries = json.loads(key)
-                            if isinstance(potential_queries, list):
-                                expanded_queries = [q for q in potential_queries if isinstance(q, str)]
-                                llm_py_logger.info(f"Successfully extracted queries from a malformed JSON dictionary key.")
-                                break # 找到就跳出循环
-                        except json.JSONDecodeError:
-                            continue # 这个键不是有效的JSON，继续检查下一个
-                
-                # 如果上述方法失败，尝试从常见的键中提取
-                if not expanded_queries:
-                    for key_option in ["queries", "sub_queries", "expanded_queries", "result"]:
-                        if key_option in parsed_data and isinstance(parsed_data[key_option], list):
-                            expanded_queries = parsed_data[key_option]
-                            break
-            
-            if not expanded_queries:
-                llm_py_logger.warning(f"Could not extract a list of strings from the parsed JSON: {parsed_data}")
+            # --- 修改: 从 {"queries": [...]} 结构中提取列表 ---
+            if isinstance(parsed_data, dict) and "queries" in parsed_data and isinstance(parsed_data["queries"], list):
+                potential_queries = parsed_data["queries"]
+                expanded_queries = [q for q in potential_queries if isinstance(q, str) and q.strip()]
+                llm_py_logger.info(f"Successfully extracted {len(expanded_queries)} queries from LLM response.")
+            else:
+                llm_py_logger.warning(f"LLM response for expansion was valid JSON but not the expected structure: {parsed_data}")
 
         except (json.JSONDecodeError, TypeError) as e:
-            llm_py_logger.error(f"Failed to decode JSON for query expansion: {cleaned_response}. Error: {e}")
-
+            llm_py_logger.error(f"Failed to decode or process JSON for query expansion: '{cleaned_response}'. Error: {e}")
 
     # 确保原始查询总是第一个
     final_queries = [original_query]
     for q in expanded_queries:
-        # 确保不添加重复的查询
         if q.strip() and q.strip() not in final_queries:
             final_queries.append(q.strip())
     
