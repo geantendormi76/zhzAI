@@ -3,8 +3,9 @@
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 [![GitHub issues](https://img.shields.io/github/issues/geantendormi76/zhzAI)](https://github.com/geantendormi76/zhzAI/issues)
-[![GitHub forks](https://img.shields.io/github/forks/your-username/zhzAI)](https://github.com/your-username/zhzAI/network)
-[![GitHub stars](https://img.shields.io/github/stars/your-username/zhzAI)](https://github.com/your-username/zhzAI/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/geantendormi76/zhzAI)](https://github.com/geantendormi76/zhzAI/network)
+[![GitHub stars](https://img.shields.io/github/stars/geantendormi76/zhzAI)](https://github.com/geantendormi76/zhzAI/stargazers)
+
 
 ---
 
@@ -61,7 +62,7 @@
 
 1.  **克隆仓库:**
     ```bash
-    git clone https://github.com/your-username/zhzAI.git
+    git clone https://github.com/geantendormi76/zhzAI.git
     cd zhzAI
     ```
 
@@ -101,7 +102,7 @@
 
 我们非常欢迎任何形式的贡献！
 
-1.  **报告问题 (Issues)**: 如果您在使用中发现任何 Bug，或者有任何功能建议，请通过 [Issues](https://github.com/your-username/zhzAI/issues) 页面提交。
+1.  **报告问题 (Issues)**: 如果您在使用中发现任何 Bug，或者有任何功能建议，请通过 [Issues](https://github.com/geantendormi76/zhzAI/issues) 页面提交。
 2.  **提交代码 (Pull Requests)**:
     *   请先 Fork 本仓库。
     *   在您的 Fork 中创建一个新的分支 (`git checkout -b feature/your-feature-name`)。
