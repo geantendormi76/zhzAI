@@ -1,4 +1,4 @@
-**English** | [中文](./README.md)
+**English** | [中文 (Chinese)](./README.md)
 ***
 # zhzAI - Your Personal, Local AI Brain
 
@@ -72,22 +72,28 @@ My vision is to make **zhzAI** a truly useful AI tool for everyday office worker
 
 **However, I've hit a major roadblock:**
 
-I am not a professional programmer. Although I've used AI to complete the vast majority of the project's core logic and architecture, I'm facing significant difficulties in the final stage: **packaging this complex system into a simple, runnable application for Windows.**
+I only started learning about computers in mid-January 2025 and am not a professional programmer. Although I have used AI to complete the vast majority of the project's core logic and architecture, I'm facing significant difficulties in deploying this complex system to the Windows platform.
 
-I've found that due to the project's high modularity and tight code coupling, external AI assistants often fail to grasp the global context, leading to incorrect or even harmful code suggestions. This has made it impossible for me to efficiently move forward.
+### Specifically, my core difficulties are:
 
-**Specifically, my core difficulties are:**
+*   **Extremely Complex Environment Dependencies**
+    *   The project relies on libraries like `torch`, `llama-cpp-python`, and `duckdb`, which are extremely challenging to compile, package, and isolate on Windows.
+    *   **My Implementation Details**: For performance, I'm not solely relying on `llama-cpp-python`. The LLM inference uses official `llama.cpp` compiled binaries, while the embedding model is implemented through my own compilation of `llama-cpp-python`. This adds to the packaging complexity.
+    *   **Architectural Evolution**: The project has successfully been decoupled from `Dagster`, now featuring a pure Python automated data ingestion pipeline with smart directory monitoring.
 
-*   **Complex Environment Dependencies:** The project relies on libraries like `torch`, `llama-cpp-python`, and `duckdb`, which are extremely challenging to compile, package, and isolate on Windows.
-*   **Deployment & Configuration:** Simplifying the installation process to make it friendly for non-technical users.
-*   **Packaging & Distribution:** I lack the experience with tools like `PyInstaller` or `Nuitka` to package the entire Python project into a single executable file (`.exe`).
-*   **The Core Problem:** Migrating the project to Windows. Without programming expertise, I cannot efficiently handle the migration, and AI tools fail to provide accurate, "pixel-perfect" alignment due to the project's high code similarity, leading to failed tests.
+*   **The Biggest Bottleneck: Packaging & Distribution**
+    *   I lack the experience with tools like `PyInstaller` or `Nuitka` to package the entire Python project into a single executable file (`.exe`).
+    *   **Solutions I've Tried**: I have attempted using `PyInstaller` and `Nuitka`, but they failed to resolve the low-level dependency issues of `llama.cpp`. I have abandoned this path for now and am considering an **embedded Python environment**, which also requires professional engineering experience.
 
-**Code Engineering & Refactoring:**
-- I need experienced developers to help me refactor and decouple some core modules to improve maintainability and extensibility.
-- We need to establish an automated testing pipeline to ensure that code changes do not break existing functionality.
+*   **The "Last Mile" of Windows Platform Migration**
+    *   **The Core Issue Today**: I don't have the programming expertise to efficiently debug and adapt the project for the Windows system.
+    *   **AI Assistance Limitations**: Due to the **high degree of similarity** in the logic and structure of the project's internal modules (like the RAG service, Agent service, LLM interface, etc.), AI-powered tools often get confused by the context and suffer from a high rate of hallucination. They fail to achieve the "pixel-perfect" alignment needed for migration, leading to severely subpar test results on Windows.
 
-I firmly believe this project is mature and powerful, but it's currently stuck on the "last mile" of engineering challenges. I need a partner who can **deeply understand the entire project architecture**, not just modify isolated code snippets.
+*   **Code Engineering & Refactoring**
+    *   I need experienced developers to help me **review and decouple some core modules** to improve maintainability and extensibility.
+    *   We need to establish an **automated testing pipeline** to ensure that code changes do not break existing functionality.
+
+I firmly believe this project is mature and powerful in its functionality and architecture, but it's currently stuck on these critical engineering challenges. I need a partner who can **deeply understand the entire project architecture**, not just modify isolated code snippets. If you are interested in solving these challenges, I eagerly await your help!
 
 ## 🔮 Future Roadmap
 
@@ -100,7 +106,7 @@ Our next steps will revolve around these four core areas:
 This is our highest priority milestone. We will build an **end-to-end, offline long-term memory system** for zhzAI, evolving it from a passive knowledge query tool into a proactive personal assistant that truly understands the user.
 
 *   **Core Capabilities**:
-    *   **Proactive Memory**: Users can ask the assistant to remember any piece of information via natural language (e.g., "Remember that John owes me $20, due next Monday").
+    *   **Proactive Memory**: Users can ask the assistant to remember any piece of information via natural language (e.g., "Remember that John owes me $20, due next Monday"), including but not limited to short texts (2-20 chars), images, and videos.
     *   **Intelligent Extraction & Task-ification**: The system will automatically extract key entities (people, events, times) and recognize intents that require reminders, creating tasks automatically.
     *   **Millisecond-level Feedback**: The memory system's queries and feedback will achieve millisecond-level response times, laying the performance foundation for future voice interaction.
 *   **Open Architectural Challenge**: We are actively exploring whether to build a separate, highly-optimized database architecture for the memory system or to implement a unified but logically isolated solution within the existing RAG architecture. We welcome expert advice from the community on this.
@@ -122,7 +128,7 @@ We will continue to iterate and enhance our core RAG capabilities to make them s
 *   **Interactive Verification & Clarification**: Activate the reserved "interactive verification" interface, allowing the LLM to proactively ask clarifying questions when faced with ambiguous results.
 *   **Hybrid Data Source Support**: Explore the ability to seamlessly integrate structured data (like databases and APIs) with unstructured documents.
 
-### 4. **Empowerment via GBNF for Function Calling**
+### 4. **Utilizing GBNF for Function Calling**
 
 We will further leverage GBNF (GGML-based BNF) grammar constraints to give our small local model more reliable and powerful "hands and feet," enabling it to perform complex tasks stably.
 
@@ -136,7 +142,7 @@ We will further leverage GBNF (GGML-based BNF) grammar constraints to give our s
 
 I am very excited to communicate and collaborate with developers interested in this project. If you have any ideas, suggestions, or are willing to contribute your skills, please feel free to contact me through the following channels:
 
-*   **X (Twitter):** [@geantendormi76](https://twitter.com/geantendormi76)
+*   **X :** [@geantendormi76]
 *   **Email:** geantendormi76@gmail.com
 *   **GitHub Issues:** For specific technical questions or feature suggestions, you are also welcome to start a discussion on our [Issues page](https://github.com/geantendormi76/zhzAI/issues).
 
