@@ -1,75 +1,73 @@
-# /home/zhz/zhz_agent/requirements.txt
-
-# --- Core Application & Agent Framework ---
-pydantic==2.11.5
-crewai==0.121.0  # 您当前使用的版本，假设它兼容 Pydantic 2.11.5
-crewai-tools==0.0.1 # 您当前使用的版本
-
-# --- LLM Interaction & Management ---
-litellm==1.68.0
-openai==1.75.0 # 通常与 LiteLLM 一起使用
-
-# --- Web Framework ---
-fastapi==0.115.12
-uvicorn[standard]==0.34.2 # [standard] 包含 websockets 和 httptools
-
-# --- Data Storage & RAG ---
-chromadb==0.6.3
-sentence-transformers==4.1.0 # 您 freeze 输出中的版本，如果希望更新可以调整
-transformers==4.52.3         # 您 freeze 输出中的版本，如果希望固定为 4.38.2 可以改回
-torch==2.7.0                 # 您 freeze 输出中的版本
-kuzu # 让 uv 选择最新兼容版，或根据 Dagster 需求指定
-portalocker # KuzuDB 可能需要
-unstructured[docx]
-markdownify==0.12.1       # 用于HTML转Markdown
-
-
-# --- Dagster Workflow ---
-dagster==1.10.17             # 您当前使用的版本，假设兼容 Pydantic V2
-dagster-webserver==1.10.17
-dagster-graphql==1.10.17
-dagster-pipes==1.10.17
-dagster_shared==0.26.17
-
-# --- Other Important Libraries from your freeze ---
-aiohttp==3.12.0
-aiosqlite==0.21.0
-APScheduler==3.11.0
-databases[aiosqlite]==0.9.0 # 确保包含 extras
-httpx==0.28.1
-jieba==0.42.1
-langchain==0.3.25 # 这是一个元包，可能拉取很多 langchain-* 组件
-langchain-core==0.3.61
-langchain-community==0.3.24
-langchain-text-splitters==0.3.8
-neo4j==5.28.1
-pandas==2.2.3
-protobuf==5.29.4 # 确保这个版本与 opentelemetry 兼容
-python-dotenv==1.1.0
-pytz==2025.2
-SQLAlchemy==2.0.41
-bm25s==0.2.13
-PyMuPDF
-
-# --- OpenTelemetry (让 crewai 自动拉取，如果还有问题再显式指定) ---
-# opentelemetry-api
-# opentelemetry-sdk
-# opentelemetry-exporter-otlp-proto-http
-# opentelemetry-exporter-otlp-proto-grpc
-# opentelemetry-proto
-# opentelemetry-instrumentation
-# opentelemetry-instrumentation-asgi
-# opentelemetry-instrumentation-fastapi
-# opentelemetry-semantic-conventions
-# opentelemetry-util-http
-
-# --- Potentially problematic or less critical (review if needed) ---
-# 以下是一些在您 freeze 输出中但可能不需要严格固定，或者可以由其他包间接依赖的
-# 如果遇到问题，可以考虑注释掉它们，让 uv 重新解析
-# annotated-types==0.7.0 # 通常由 pydantic 依赖
-# anyio==4.9.0 # 通常由 fastapi/starlette 依赖
-# ... (您可以根据需要审查和删减 freeze 输出中的其他包) ...
-
-# --- Editable local packages (uv pip install -e <path> 来安装) ---
-# -e ./zhz_rag
-# -e ./zhz_rag_pipeline_dagster
+attrs==21.2.0
+Automat==20.2.0
+Babel==2.8.0
+bcrypt==3.2.0
+blinker==1.4
+certifi==2020.6.20
+chardet==4.0.0
+charset-normalizer==3.4.2
+click==8.0.3
+cloud-init==24.4.1
+colorama==0.4.4
+command-not-found==0.3
+configobj==5.0.6
+constantly==15.1.0
+cryptography==3.4.8
+dbus-python==1.2.18
+distro==1.7.0
+distro-info==1.1+ubuntu0.2
+gitingest==0.1.4
+gyp==0.1
+httplib2==0.20.2
+hyperlink==21.0.0
+idna==3.3
+importlib-metadata==4.6.4
+incremental==21.3.0
+jeepney==0.7.1
+Jinja2==3.0.3
+jsonpatch==1.32
+jsonpointer==2.0
+jsonschema==3.2.0
+keyring==23.5.0
+launchpadlib==1.10.16
+lazr.restfulclient==0.14.4
+lazr.uri==1.0.6
+Mako==1.1.3
+Markdown==3.3.6
+MarkupSafe==2.0.1
+more-itertools==8.10.0
+netifaces==0.11.0
+oauthlib==3.2.0
+pyasn1==0.4.8
+pyasn1-modules==0.2.1
+pycryptodomex==3.11.0
+pycurl==7.44.1
+Pygments==2.11.2
+PyGObject==3.42.1
+PyHamcrest==2.0.2
+PyJWT==2.3.0
+pyOpenSSL==21.0.0
+pyparsing==2.4.7
+pyrsistent==0.18.1
+pyserial==3.5
+python-apt==2.4.0+ubuntu4
+pytz==2022.1
+pyxattr==0.7.2
+PyYAML==5.4.1
+regex==2024.11.6
+requests==2.32.3
+SecretStorage==3.3.1
+service-identity==18.1.0
+six==1.17.0
+systemd-python==234
+tiktoken==0.9.0
+tomli==2.2.1
+Twisted==22.1.0
+ubuntu-pro-client==8001
+ufw==0.36.1
+unattended-upgrades==0.1
+urllib3==1.26.5
+wadllib==1.3.6
+youtube-dl==2021.12.17
+zipp==1.0.0
+zope.interface==5.4.0
